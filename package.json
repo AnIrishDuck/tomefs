@@ -3,11 +3,25 @@
   "version": "0.0.1",
   "description": "A bounded, page-cached filesystem layer for PGlite and Emscripten",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "build:harness": "bash scripts/build-harness.sh",
     "test": "vitest run",
     "test:fast": "vitest run --testNamePattern @fast",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.2.5",
