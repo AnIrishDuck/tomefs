@@ -1,4 +1,5 @@
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
+import type { FileMeta } from "./types.js";
 import { pageKeyStr } from "./types.js";
 
 /**
@@ -9,6 +10,7 @@ import { pageKeyStr } from "./types.js";
  */
 export class SyncMemoryBackend implements SyncStorageBackend {
   private pages = new Map<string, Uint8Array>();
+  private meta = new Map<string, FileMeta>();
 
   readPage(path: string, pageIndex: number): Uint8Array | null {
     const key = pageKeyStr(path, pageIndex);
@@ -48,5 +50,21 @@ export class SyncMemoryBackend implements SyncStorageBackend {
         }
       }
     }
+  }
+
+  readMeta(path: string): FileMeta | null {
+    return this.meta.get(path) ?? null;
+  }
+
+  writeMeta(path: string, meta: FileMeta): void {
+    this.meta.set(path, { ...meta });
+  }
+
+  deleteMeta(path: string): void {
+    this.meta.delete(path);
+  }
+
+  listFiles(): string[] {
+    return [...this.meta.keys()];
   }
 }

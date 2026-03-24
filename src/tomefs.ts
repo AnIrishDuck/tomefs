@@ -17,9 +17,16 @@
  */
 
 import { PAGE_SIZE } from "./types.js";
+import type { FileMeta } from "./types.js";
 import { SyncPageCache } from "./sync-page-cache.js";
 import { SyncMemoryBackend } from "./sync-memory-backend.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
+
+/** Mode bit constants for type checking when FS object isn't available. */
+const S_IFMT = 0o170000;
+const S_IFDIR = 0o040000;
+const S_IFREG = 0o100000;
+const S_IFLNK = 0o120000;
 
 /** Options for creating a tomefs instance. */
 export interface TomeFSOptions {
@@ -204,17 +211,26 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // Clean up target's storage if it's a file
       if (FS.isFile(new_node.mode)) {
         pageCache.deleteFile(new_node.storagePath);
+        backend.deleteMeta(new_node.storagePath);
       }
       FS.hashRemoveNode(new_node);
     }
 
+    // Compute old storage path before rewiring
+    const oldStoragePath = FS.isFile(old_node.mode)
+      ? old_node.storagePath
+      : computeStoragePath(old_node.parent, old_node.name);
+
     // Update storage path for file nodes
     if (FS.isFile(old_node.mode)) {
-      const oldStoragePath = old_node.storagePath;
-      // Compute new storage path
       const newStoragePath = computeStoragePath(new_dir, new_name);
       pageCache.renameFile(oldStoragePath, newStoragePath);
       old_node.storagePath = newStoragePath;
+      // Update metadata key
+      backend.deleteMeta(oldStoragePath);
+    } else if (FS.isDir(old_node.mode)) {
+      // Delete old directory metadata
+      backend.deleteMeta(oldStoragePath);
     }
 
     // Rewire the node tree
@@ -234,7 +250,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // Pages are cleaned up when the last fd is closed (see stream_ops.close).
       if (node.openCount === 0) {
         pageCache.deleteFile(node.storagePath);
+        backend.deleteMeta(node.storagePath);
       }
+    } else if (node && FS.isLink(node.mode)) {
+      const sp = computeStoragePath(parent, name);
+      backend.deleteMeta(sp);
     }
     delete parent.contents[name];
     parent.ctime = parent.mtime = Date.now();
@@ -245,6 +265,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     for (const _i in node.contents) {
       throw new FS.ErrnoError(55); // ENOTEMPTY
     }
+    const sp = computeStoragePath(parent, name);
+    backend.deleteMeta(sp);
     delete parent.contents[name];
     parent.ctime = parent.mtime = Date.now();
   }
@@ -354,8 +376,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (FS.isFile(node.mode)) {
         node.openCount--;
         if (node.unlinked && node.openCount === 0) {
-          // Last fd closed on an unlinked file — clean up pages
+          // Last fd closed on an unlinked file — clean up pages + metadata
           pageCache.deleteFile(node.storagePath);
+          backend.deleteMeta(node.storagePath);
         } else {
           pageCache.flushFile(node.storagePath);
         }
@@ -401,6 +424,117 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   };
 
   // ---------------------------------------------------------------
+  // Persistence: save/restore directory tree to/from backend metadata
+  // ---------------------------------------------------------------
+
+  /**
+   * Walk the in-memory node tree and persist all file/directory/symlink
+   * metadata to the storage backend. File page data is flushed via the
+   * page cache. Call this before unmount to ensure durability.
+   */
+  function persistTree(node: any, path: string): void {
+    if (FS.isFile(node.mode)) {
+      pageCache.flushFile(node.storagePath);
+      backend.writeMeta(path, {
+        size: node.usedBytes,
+        mode: node.mode,
+        ctime: node.ctime,
+        mtime: node.mtime,
+        atime: node.atime,
+      });
+    } else if (FS.isLink(node.mode)) {
+      backend.writeMeta(path, {
+        size: 0,
+        mode: node.mode,
+        ctime: node.ctime,
+        mtime: node.mtime,
+        atime: node.atime,
+        link: node.link,
+      });
+    } else if (FS.isDir(node.mode)) {
+      // Persist directory metadata (skip root — it's recreated on mount)
+      if (path !== "/") {
+        backend.writeMeta(path, {
+          size: 0,
+          mode: node.mode,
+          ctime: node.ctime,
+          mtime: node.mtime,
+          atime: node.atime,
+        });
+      }
+      // Recurse into children
+      for (const name of Object.keys(node.contents)) {
+        const childPath = path === "/" ? `/${name}` : `${path}/${name}`;
+        persistTree(node.contents[name], childPath);
+      }
+    }
+  }
+
+  /**
+   * Restore the directory tree from backend metadata.
+   * Creates directories, files, and symlinks from stored metadata.
+   * File page data remains in the backend and is loaded on demand.
+   */
+  function restoreTree(root: any): void {
+    const paths = backend.listFiles();
+    if (paths.length === 0) return;
+
+    // Sort paths by depth so parents are created before children
+    paths.sort((a, b) => {
+      const da = a.split("/").length;
+      const db = b.split("/").length;
+      return da - db || a.localeCompare(b);
+    });
+
+    for (const path of paths) {
+      const meta = backend.readMeta(path);
+      if (!meta) continue;
+
+      // Split path into parent + name
+      const lastSlash = path.lastIndexOf("/");
+      const parentPath = path.substring(0, lastSlash) || "/";
+      const name = path.substring(lastSlash + 1);
+      if (!name) continue; // skip root
+
+      // Find parent node by walking from root
+      const parent = lookupByPath(root, parentPath);
+      if (!parent) continue;
+
+      const typeMode = meta.mode & S_IFMT;
+      if (typeMode === S_IFDIR) {
+        const node = TOMEFS.createNode(parent, name, meta.mode, 0);
+        node.atime = meta.atime ?? meta.mtime;
+        node.mtime = meta.mtime;
+        node.ctime = meta.ctime;
+      } else if (typeMode === S_IFREG) {
+        const node = TOMEFS.createNode(parent, name, meta.mode, 0);
+        node.usedBytes = meta.size;
+        node.atime = meta.atime ?? meta.mtime;
+        node.mtime = meta.mtime;
+        node.ctime = meta.ctime;
+      } else if (typeMode === S_IFLNK) {
+        const node = TOMEFS.createNode(parent, name, meta.mode, 0);
+        node.link = meta.link ?? "";
+        node.atime = meta.atime ?? meta.mtime;
+        node.mtime = meta.mtime;
+        node.ctime = meta.ctime;
+      }
+    }
+  }
+
+  /** Walk from root to find a node at the given internal path. */
+  function lookupByPath(root: any, path: string): any {
+    if (path === "/" || path === "") return root;
+    const parts = path.split("/").filter(Boolean);
+    let node = root;
+    for (const part of parts) {
+      if (!node.contents || !(part in node.contents)) return null;
+      node = node.contents[part];
+    }
+    return node;
+  }
+
+  // ---------------------------------------------------------------
   // Filesystem object
   // ---------------------------------------------------------------
 
@@ -408,8 +542,35 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     /** Expose the page cache for testing and diagnostics. */
     pageCache,
 
+    /** Expose the backend for testing. */
+    backend,
+
     mount(_mount: any) {
-      return TOMEFS.createNode(null, "/", 0o40000 | 0o777, 0);
+      const root = TOMEFS.createNode(null, "/", 0o40000 | 0o777, 0);
+      // Restore directory tree from backend if data exists
+      restoreTree(root);
+      return root;
+    },
+
+    /**
+     * Emscripten syncfs hook. Called by FS.syncfs().
+     * When populate=false: flush all dirty data + persist metadata.
+     * When populate=true: no-op (tree is restored on mount).
+     */
+    syncfs(mount: any, populate: boolean, callback: (err?: Error | null) => void) {
+      try {
+        if (!populate) {
+          pageCache.flushAll();
+          // Clear existing metadata and re-persist the full tree
+          for (const path of backend.listFiles()) {
+            backend.deleteMeta(path);
+          }
+          persistTree(mount.root, "/");
+        }
+        callback(null);
+      } catch (err) {
+        callback(err as Error);
+      }
     },
 
     createNode(parent: any, name: string, mode: number, dev: number) {
