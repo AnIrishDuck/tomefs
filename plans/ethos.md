@@ -47,7 +47,7 @@ tests but passes others. This proves the tests have real discriminating power â€
 they don't just detect "broken" vs "not broken", they pinpoint *what's* broken.
 
 Once there's a critical mass of tests, there should also be a BadFS variant that
-fails every conformance test, while still passing non-conformance tests (e.g.,
+fails every conformance test, while still passing other tests (e.g.,
 "can mount", "can open a file"). This prevents trivially broken variants (like
 throwing on every call) from satisfying the criterion.
 
