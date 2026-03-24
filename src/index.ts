@@ -1,5 +1,7 @@
 export { PageCache } from "./page-cache.js";
 export { MemoryBackend } from "./memory-backend.js";
+export { IdbBackend } from "./idb-backend.js";
+export type { IdbBackendOptions } from "./idb-backend.js";
 export type { StorageBackend } from "./storage-backend.js";
 export { SyncPageCache } from "./sync-page-cache.js";
 export { SyncMemoryBackend } from "./sync-memory-backend.js";
