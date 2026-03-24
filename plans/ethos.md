@@ -49,6 +49,11 @@ that specific test *and* passes some number of other tests. This proves each
 test has real discriminating power — it catches a specific class of bug, not just
 "is the FS totally broken".
 
+Treat conformance tests as holdout specifications: they define correctness
+independently of the implementation. An agent building tomefs should satisfy
+them, not study them to game them. This is the same principle as holdout sets
+in ML — if the model trains on the test set, the evaluation is worthless.
+
 ### 5. No Mocks
 
 From tributary's conventions: **we never use mocks**. We use fakes (like
@@ -68,7 +73,17 @@ tomefs implements the standard Emscripten filesystem interface (`node_ops`,
 `stream_ops`). It registers via `FS.filesystems.tomefs = tomefs` and mounts like
 any other FS. PGlite doesn't need to know about it beyond the mount call.
 
-### 8. Graceful Degradation
+### 8. Workload Scenarios
+
+POSIX conformance tests verify individual operations. Workload scenarios verify
+that tomefs works end-to-end under realistic use. Record or simulate real PGlite
+access patterns — startup, queries, vacuums, WAL replay — and run them as
+integration tests against mounted tomefs. These are the "user stories" of the
+filesystem: they catch interaction bugs that no single POSIX test covers (cache
+thrashing under write-heavy loads, page eviction during sequential scans, dirty
+flush ordering on concurrent streams).
+
+### 9. Graceful Degradation
 
 In environments without SharedArrayBuffer (no COOP/COEP headers), tomefs should
 degrade to a less performant mode that still serves key functional goals — keep
@@ -94,14 +109,17 @@ Look at the repo. Look at what exists. Work down this list:
    implementation. Wire it up to `PageCache` + `MemoryBackend`. Run the
    conformance tests against it. Fix failures until green.
 
-5. **If tomefs passes conformance tests with MemoryBackend** → build the IDB
-   backend and SAB+Atomics sync bridge. See `plans/page-cache-fs-plan.md` for
-   architecture.
+5. **If tomefs passes conformance tests with MemoryBackend** → build workload
+   scenario tests: record or simulate PGlite access patterns and run them
+   against mounted tomefs. Fix interaction bugs the conformance suite misses.
 
-6. **If IDB backend works** → integrate with PGlite in the tributary repo.
+6. **If workload scenarios pass** → build the IDB backend and SAB+Atomics sync
+   bridge. See `plans/page-cache-fs-plan.md` for architecture.
+
+7. **If IDB backend works** → integrate with PGlite in the tributary repo.
    Replace IDBFS mount with tomefs mount. Run PGlite's existing tests.
 
-7. **At any point** → look for new sources of conformance tests beyond the
+8. **At any point** → look for new sources of conformance tests beyond the
    Emscripten suite. Other POSIX test suites, real-world FS edge cases from
    database workloads, filesystem fuzzing results — anything that strengthens
    the test suite is valuable.
@@ -116,6 +134,9 @@ Look at the repo. Look at what exists. Work down this list:
 
 ## Conventions
 
+- Specs are durable, code is disposable. Plans and test suites are the source of
+  truth. Implementation code can be regenerated from them; they cannot be
+  regenerated from implementation code. Invest in spec quality accordingly.
 - Keep it simple. Don't abstract until you need to.
 - Port order matters — foundational operations first (open/read/write/close),
   then metadata, then complex operations (rename, links).
