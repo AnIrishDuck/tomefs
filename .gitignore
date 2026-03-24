@@ -2,3 +2,4 @@ node_modules/
 dist/
 emsdk/
 *.tsbuildinfo
+*.bundle.mjs
