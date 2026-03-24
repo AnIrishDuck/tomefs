@@ -22,6 +22,10 @@ export interface FileMeta {
   mode: number;
   ctime: number;
   mtime: number;
+  /** Access time (optional, defaults to mtime). */
+  atime?: number;
+  /** Symlink target path (only for symlinks). */
+  link?: string;
 }
 
 /** Compound key for page storage: [path, pageIndex]. */
