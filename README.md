@@ -53,7 +53,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 
 ## Status
 
-**Early development.** See [plans/](plans/) for the architecture plan, implementation phases, and design rationale.
+**Core complete.** The filesystem, page cache, IDB backend, SAB bridge, and full-stack integration are tested and working. See [plans/](plans/) for architecture and design rationale.
 
 ### Roadmap
 
@@ -68,6 +68,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 | 2 | IndexedDB backend with compound key storage | Done |
 | 3 | SAB+Atomics sync bridge | Done |
 | 3.5 | Adversarial differential testing | Done |
+| 3.6 | Full-stack integration tests (tomefs + SAB + backend) | Done |
 | 4 | PGlite integration + migration from IDBFS | Planned |
 | 5 | OPFS backend (alternative to IDB) | Future |
 

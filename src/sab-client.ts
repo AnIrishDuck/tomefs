@@ -10,6 +10,7 @@
  */
 
 import type { FileMeta } from "./types.js";
+import type { SyncStorageBackend } from "./sync-storage-backend.js";
 import {
   STATUS_IDLE,
   STATUS_REQUEST,
@@ -25,24 +26,15 @@ import {
 } from "./sab-protocol.js";
 
 /**
- * Synchronous storage interface produced by the SAB bridge.
- * Mirrors StorageBackend but all methods are synchronous.
+ * SAB+Atomics client that implements SyncStorageBackend.
+ *
+ * This is the synchronous side of the bridge: it runs in the PGlite/Emscripten
+ * worker thread, sends requests to the storage worker via SharedArrayBuffer,
+ * and blocks with Atomics.wait() until the response is ready.
+ *
+ * Can be passed directly as the `backend` option to `createTomeFS`.
  */
-export interface SyncStorageClient {
-  readPage(path: string, pageIndex: number): Uint8Array | null;
-  writePage(path: string, pageIndex: number, data: Uint8Array): void;
-  writePages(
-    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
-  ): void;
-  deleteFile(path: string): void;
-  deletePagesFrom(path: string, fromPageIndex: number): void;
-  readMeta(path: string): FileMeta | null;
-  writeMeta(path: string, meta: FileMeta): void;
-  deleteMeta(path: string): void;
-  listFiles(): string[];
-}
-
-export class SabClient implements SyncStorageClient {
+export class SabClient implements SyncStorageBackend {
   private readonly sab: SharedArrayBuffer;
   private readonly controlView: Int32Array;
   private readonly dataView: DataView;
