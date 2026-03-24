@@ -166,7 +166,153 @@ export interface FSHarness {
 }
 
 /**
- * Create a fresh Emscripten module instance with MEMFS mounted.
+ * The mount point where tomefs is mounted when running in tomefs mode.
+ * All absolute test paths (e.g. '/test') are transparently rewritten
+ * to '/tome/test' by the FS wrapper.
+ */
+const TOME_MOUNT = "/tome";
+
+/** System paths that should never be rewritten to the tomefs mount. */
+function isSystemPath(p: string): boolean {
+  return (
+    p.startsWith("/dev") ||
+    p.startsWith("/proc") ||
+    p.startsWith("/tmp")
+  );
+}
+
+/** Rewrite an absolute path to live under the tomefs mount. */
+function rewritePath(p: string): string {
+  if (!p.startsWith("/")) return p;
+  if (p.startsWith(TOME_MOUNT + "/") || p === TOME_MOUNT) return p;
+  if (isSystemPath(p)) return p;
+  if (p === "/") return TOME_MOUNT;
+  return TOME_MOUNT + p;
+}
+
+/** Strip the tomefs mount prefix from a path. */
+function unrewritePath(p: string): string {
+  if (p.startsWith(TOME_MOUNT + "/")) return p.slice(TOME_MOUNT.length);
+  if (p === TOME_MOUNT) return "/";
+  return p;
+}
+
+/**
+ * Create a path-rewriting wrapper around an Emscripten FS.
+ * Allows conformance tests to use absolute paths like '/test'
+ * while transparently operating under the tomefs mount point.
+ */
+function createPathRewritingFS(realFS: any): EmscriptenFS {
+  return {
+    open(path: string, flags: number | string, mode?: number) {
+      return realFS.open(rewritePath(path), flags, mode);
+    },
+    close(stream: EmscriptenStream) {
+      return realFS.close(stream);
+    },
+    read(stream: any, buffer: any, offset: number, length: number, position?: number) {
+      return realFS.read(stream, buffer, offset, length, position);
+    },
+    write(stream: any, buffer: any, offset: number, length: number, position?: number) {
+      return realFS.write(stream, buffer, offset, length, position);
+    },
+    llseek(stream: any, offset: number, whence: number) {
+      return realFS.llseek(stream, offset, whence);
+    },
+    stat(path: string) {
+      return realFS.stat(rewritePath(path));
+    },
+    fstat(fd: number) {
+      return realFS.fstat(fd);
+    },
+    lstat(path: string) {
+      const result = realFS.lstat(rewritePath(path));
+      if (realFS.isLink(result.mode) && result.size > 0) {
+        try {
+          const target = realFS.readlink(rewritePath(path));
+          result.size = unrewritePath(target).length;
+        } catch (_e) {
+          // If readlink fails, leave size as-is
+        }
+      }
+      return result;
+    },
+    chmod(path: string, mode: number) {
+      return realFS.chmod(rewritePath(path), mode);
+    },
+    fchmod(fd: number, mode: number) {
+      return realFS.fchmod(fd, mode);
+    },
+    utime(path: string, atime: number, mtime: number) {
+      return realFS.utime(rewritePath(path), atime, mtime);
+    },
+    truncate(path: string, len: number) {
+      return realFS.truncate(rewritePath(path), len);
+    },
+    ftruncate(fd: number, len: number) {
+      return realFS.ftruncate(fd, len);
+    },
+    mkdir(path: string, mode?: number) {
+      return realFS.mkdir(rewritePath(path), mode);
+    },
+    rmdir(path: string) {
+      return realFS.rmdir(rewritePath(path));
+    },
+    readdir(path: string) {
+      return realFS.readdir(rewritePath(path));
+    },
+    unlink(path: string) {
+      return realFS.unlink(rewritePath(path));
+    },
+    rename(oldPath: string, newPath: string) {
+      return realFS.rename(rewritePath(oldPath), rewritePath(newPath));
+    },
+    symlink(target: string, linkpath: string) {
+      const rTarget = target.startsWith("/") ? rewritePath(target) : target;
+      return realFS.symlink(rTarget, rewritePath(linkpath));
+    },
+    readlink(path: string) {
+      const target = realFS.readlink(rewritePath(path));
+      return unrewritePath(target);
+    },
+    writeFile(path: string, data: string | ArrayBufferView, opts?: { flags?: string }) {
+      return realFS.writeFile(rewritePath(path), data, opts);
+    },
+    readFile(path: string, opts?: { encoding?: string }) {
+      return realFS.readFile(rewritePath(path), opts);
+    },
+    isFile(mode: number) {
+      return realFS.isFile(mode);
+    },
+    isDir(mode: number) {
+      return realFS.isDir(mode);
+    },
+    isLink(mode: number) {
+      return realFS.isLink(mode);
+    },
+    getStream(fd: number) {
+      return realFS.getStream(fd);
+    },
+    dupStream(stream: any, fd?: number) {
+      return realFS.dupStream(stream, fd);
+    },
+    mknod(path: string, mode: number, dev: number) {
+      return realFS.mknod(rewritePath(path), mode, dev);
+    },
+    cwd() {
+      return unrewritePath(realFS.cwd());
+    },
+    chdir(path: string) {
+      return realFS.chdir(rewritePath(path));
+    },
+    ErrnoError: realFS.ErrnoError,
+  } as EmscriptenFS;
+}
+
+/**
+ * Create a fresh Emscripten module instance with the configured filesystem.
+ *
+ * By default uses MEMFS. Set TOMEFS_BACKEND=tomefs to test against tomefs.
  * Each call returns an isolated FS — tests don't share state.
  */
 export async function createFS(): Promise<FSHarness> {
@@ -175,10 +321,26 @@ export async function createFS(): Promise<FSHarness> {
   );
 
   const Module = await createModule();
+  const rawFS = Module.FS;
+  const E = Module.ERRNO_CODES as ErrNoCodes;
+
+  const backendName = process.env.TOMEFS_BACKEND;
+  if (backendName === "tomefs") {
+    const { createTomeFS } = await import("../../src/tomefs.js");
+    const tomefs = createTomeFS(rawFS);
+
+    rawFS.mkdir(TOME_MOUNT);
+    rawFS.mount(tomefs, {}, TOME_MOUNT);
+
+    return {
+      FS: createPathRewritingFS(rawFS),
+      E,
+    };
+  }
 
   return {
-    FS: Module.FS as EmscriptenFS,
-    E: Module.ERRNO_CODES as ErrNoCodes,
+    FS: rawFS as EmscriptenFS,
+    E,
   };
 }
 
