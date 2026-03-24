@@ -40,10 +40,15 @@ smoke tests that run quickly during development iteration.
 
 ### 4. BadFS Validation
 
-After the test suite passes against MEMFS, we build a `BadFS` wrapper that
-injects specific defects (off-by-one reads, missing mtime updates, broken
-symlink resolution, etc). Each defect must cause at least one test to fail. This
-proves the tests actually catch bugs, not just exercise happy paths.
+After the test suite passes against MEMFS, we build `BadFS` wrappers that inject
+specific defects (off-by-one reads, missing mtime updates, broken symlink
+resolution, etc). Each defect must cause at least one conformance test to fail.
+This proves the tests actually catch bugs, not just exercise happy paths.
+
+Rough heuristic: there should be a BadFS variant that fails *every* conformance
+test. Stronger: that variant should still pass one or more non-conformance tests
+(e.g., "can mount", "can open a file"). This prevents trivially broken variants
+(like throwing on every call) from satisfying the criterion.
 
 ### 5. No Mocks
 
@@ -69,8 +74,7 @@ any other FS. PGlite doesn't need to know about it beyond the mount call.
 In environments without SharedArrayBuffer (no COOP/COEP headers), tomefs should
 degrade to a less performant mode that still serves key functional goals — keep
 only some data in memory and page out to storage, just more slowly (e.g.,
-synchronous fallback, smaller cache). Full MEMFS load is a last resort, not the
-first fallback.
+synchronous fallback, smaller cache).
 
 ## How to Pick the Next Task
 
