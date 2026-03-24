@@ -86,6 +86,7 @@ export interface EmscriptenFS {
 
   // Stream/node helpers
   getStream(fd: number): EmscriptenStream | null;
+  dupStream(stream: EmscriptenStream, fd?: number): EmscriptenStream;
   mknod(path: string, mode: number, dev: number): void;
   cwd(): string;
   chdir(path: string): void;
