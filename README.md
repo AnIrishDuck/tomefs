@@ -59,10 +59,12 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 0 | Conformance test suite | In progress |
-| 1 | Page cache core + memory backend | In progress |
+| 0 | Conformance test suite | Done |
+| 0.5 | BadFS validation | Done |
+| 1 | Page cache core + memory backend | Done |
+| 1.5 | tomefs Emscripten FS + page cache integration | Done |
 | 2 | IndexedDB backend with compound key storage | Planned |
-| 3 | tomefs Emscripten FS implementation + SAB+Atomics bridge | Planned |
+| 3 | SAB+Atomics sync bridge | Planned |
 | 4 | PGlite integration + migration from IDBFS | Planned |
 | 5 | OPFS backend (alternative to IDB) | Future |
 

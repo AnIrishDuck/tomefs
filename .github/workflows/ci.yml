@@ -21,4 +21,8 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run test:fast
+      - name: Smoke tests (MEMFS)
+        run: npm run test:fast
+
+      - name: Smoke tests (tomefs)
+        run: TOMEFS_BACKEND=tomefs npm run test:fast

@@ -1,5 +1,10 @@
 export { PageCache } from "./page-cache.js";
 export { MemoryBackend } from "./memory-backend.js";
 export type { StorageBackend } from "./storage-backend.js";
+export { SyncPageCache } from "./sync-page-cache.js";
+export { SyncMemoryBackend } from "./sync-memory-backend.js";
+export type { SyncStorageBackend } from "./sync-storage-backend.js";
+export { createTomeFS } from "./tomefs.js";
+export type { TomeFSOptions } from "./tomefs.js";
 export type { CachedPage, FileMeta, PageKey } from "./types.js";
 export { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
