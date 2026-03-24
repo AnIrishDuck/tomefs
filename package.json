@@ -1,0 +1,17 @@
+{
+  "name": "tomefs",
+  "version": "0.0.1",
+  "description": "A bounded, page-cached filesystem layer for PGlite and Emscripten",
+  "type": "module",
+  "scripts": {
+    "build:harness": "bash scripts/build-harness.sh",
+    "test": "vitest run",
+    "test:fast": "vitest run --testNamePattern @fast",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "license": "MIT"
+}
