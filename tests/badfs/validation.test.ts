@@ -383,6 +383,72 @@ describe("BadFS: seek-end-off-by-one", () => {
   });
 });
 
+describe("BadFS: truncate-no-shrink", () => {
+  let h: FSHarness;
+
+  beforeEach(async () => {
+    h = await createBadFS("truncate-no-shrink");
+  });
+
+  it("FAILS: ftruncate shrink is silently ignored", () => {
+    const { FS } = h;
+    const stream = FS.open("/test", O.RDWR | O.CREAT, 0o777);
+    FS.write(stream, encode("0123456789"), 0, 10);
+
+    FS.ftruncate(stream.fd, 5);
+
+    // Defect: size stays at 10 instead of shrinking to 5
+    const stat = FS.fstat(stream.fd);
+    expect(stat.size).toBe(10);
+    expect(stat.size).not.toBe(5);
+    FS.close(stream);
+  });
+
+  it("FAILS: truncate by path shrink is silently ignored", () => {
+    const { FS } = h;
+    FS.writeFile("/test", "Hello World!");
+
+    FS.truncate("/test", 5);
+
+    // Defect: size stays at 12 instead of shrinking to 5
+    const stat = FS.stat("/test");
+    expect(stat.size).toBe(12);
+    expect(stat.size).not.toBe(5);
+  });
+
+  it("PASSES: ftruncate grow still works", () => {
+    const { FS } = h;
+    const stream = FS.open("/test", O.RDWR | O.CREAT, 0o777);
+    FS.write(stream, encode("abc"), 0, 3);
+
+    FS.ftruncate(stream.fd, 10);
+
+    const stat = FS.fstat(stream.fd);
+    expect(stat.size).toBe(10);
+    FS.close(stream);
+  });
+
+  it("PASSES: basic read/write unaffected", () => {
+    const { FS } = h;
+    const stream = FS.open("/test", O.RDWR | O.CREAT, 0o777);
+    FS.write(stream, encode("hello"), 0, 5);
+    FS.llseek(stream, 0, SEEK_SET);
+    const buf = new Uint8Array(10);
+    const n = FS.read(stream, buf, 0, 10);
+    expect(n).toBe(5);
+    expect(decode(buf, n)).toBe("hello");
+    FS.close(stream);
+  });
+
+  it("PASSES: readdir still works", () => {
+    const { FS } = h;
+    FS.mkdir("/testdir", 0o777);
+    const entries = FS.readdir("/testdir");
+    expect(entries).toContain(".");
+    expect(entries).toContain("..");
+  });
+});
+
 /**
  * Cross-validation: Run representative conformance tests against each BadFS
  * to verify the defect is caught by its designated batch while passing others.
@@ -457,6 +523,17 @@ describe("BadFS cross-validation", () => {
   async function batch3UnlinkEnoent(h: FSHarness): Promise<void> {
     const { FS, E } = h;
     expectErrno(() => FS.unlink("/nonexistent"), E.ENOENT);
+  }
+
+  // Batch 5 representative: ftruncate shrinks a file
+  async function batch5TruncateShrink(h: FSHarness): Promise<void> {
+    const { FS } = h;
+    const stream = FS.open("/shrinktest", O.RDWR | O.CREAT, 0o777);
+    FS.write(stream, encode("0123456789"), 0, 10);
+    FS.ftruncate(stream.fd, 5);
+    const stat = FS.fstat(stream.fd);
+    expect(stat.size).toBe(5);
+    FS.close(stream);
   }
 
   // Batch 4 representative: open through symlink
@@ -534,6 +611,17 @@ describe("BadFS cross-validation", () => {
       shouldPass: [
         { name: "batch1:readBack", fn: batch1ReadBack },
         { name: "batch2:readdir", fn: batch2Readdir },
+      ],
+    },
+    {
+      defect: "truncate-no-shrink",
+      shouldFail: [
+        { name: "batch5:truncateShrink", fn: batch5TruncateShrink },
+      ],
+      shouldPass: [
+        { name: "batch1:readBack", fn: batch1ReadBack },
+        { name: "batch2:readdir", fn: batch2Readdir },
+        { name: "batch3:renameOverwrite", fn: batch3RenameOverwrite },
       ],
     },
   ];
