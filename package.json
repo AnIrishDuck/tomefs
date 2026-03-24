@@ -7,6 +7,7 @@
     "build:harness": "bash scripts/build-harness.sh",
     "test": "vitest run",
     "test:fast": "vitest run --testNamePattern @fast",
+    "test:tomefs": "TOMEFS_BACKEND=tomefs vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {
