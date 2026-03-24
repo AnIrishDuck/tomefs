@@ -24,7 +24,7 @@ Postgres (WASM)
 Emscripten FS layer
   │
   ▼
-PageCacheFS (tomefs)
+tomefs
   ├── LRU Page Cache (bounded, in-memory)
   ├── File Metadata Cache
   └── Storage Backend
@@ -53,17 +53,16 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 
 ## Status
 
-**Phase 1 complete**: Core page cache and memory backend with full test coverage.
-
-See [plans/](plans/) for the full architecture plan, implementation phases, and design rationale.
+**Early development.** See [plans/](plans/) for the architecture plan, implementation phases, and design rationale.
 
 ### Roadmap
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 1 | Page cache core + memory backend | Done |
+| 0 | Conformance test suite | In progress |
+| 1 | Page cache core + memory backend | Planned |
 | 2 | IndexedDB backend with compound key storage | Planned |
-| 3 | Emscripten FS implementation + SAB+Atomics bridge | Planned |
+| 3 | tomefs Emscripten FS implementation + SAB+Atomics bridge | Planned |
 | 4 | PGlite integration + migration from IDBFS | Planned |
 | 5 | OPFS backend (alternative to IDB) | Future |
 

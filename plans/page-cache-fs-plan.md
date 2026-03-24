@@ -34,7 +34,7 @@ Not a PGLite-specific abstraction. The Emscripten filesystem API is well-documen
 - `node_ops` — lookup, create, mkdir, rmdir, unlink, rename, readdir, etc.
 - `stream_ops` — open, close, read, write, llseek, etc.
 
-Register with `FS.filesystems.PageCacheFS = PageCacheFS` and mount. PGLite uses this like any other Emscripten FS.
+Register with `FS.filesystems.tomefs = tomefs` and mount. PGLite uses this like any other Emscripten FS.
 
 ### 2. IDB as the storage backend (with pages, not whole files)
 
@@ -80,7 +80,7 @@ Postgres uses 8 KB pages internally. 1:1 alignment eliminates partial-page handl
 ├─────────────────────────────────────────┤
 │       Emscripten FS layer               │
 │  ┌───────────────────────────────────┐  │
-│  │     PageCacheFS (our code)        │  │
+│  │     tomefs (our code)              │  │
 │  │  ┌─────────────┐ ┌─────────────┐ │  │
 │  │  │  LRU Page   │ │  File Meta  │ │  │
 │  │  │   Cache     │ │   Cache     │ │  │
@@ -169,7 +169,7 @@ A working proof-of-concept that:
 - Test with `fake-indexeddb`
 
 ### Phase 3: Emscripten FS Implementation
-- `PageCacheFS` implementing Emscripten's filesystem interface
+- `tomefs` implementing Emscripten's filesystem interface
 - Wire up page cache + IDB backend via SAB+Atomics bridge
 - PGLite must run in a Web Worker (already supported via `PGliteWorker`)
 - Integration test with real PGLite SQL
@@ -191,7 +191,7 @@ tome/
   src/
     index.ts                  # Public API
     page-cache.ts             # LRU cache with dirty tracking
-    page-cache-fs.ts          # Emscripten FS implementation
+    tomefs.ts                 # Emscripten FS implementation
     storage-backend.ts        # Backend interface
     idb-backend.ts            # IndexedDB backend (pages + metadata)
     types.ts

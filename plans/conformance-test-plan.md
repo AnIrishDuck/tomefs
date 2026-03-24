@@ -203,4 +203,5 @@ After all suites are ported and passing against MEMFS, create a `BadFS` wrapper 
 - All ported tests pass against MEMFS
 - Every BadFS defect is caught by its designated batch
 - No test requires implementation-specific knowledge (pure POSIX/Emscripten FS semantics)
-- Test suite runs in < 30 seconds via `vitest`
+- A `@fast` tagged subset of core smoke tests exists for quick iteration
+- The full suite prioritizes completeness over speed
