@@ -1,3 +1,5 @@
+import type { FileMeta } from "./types.js";
+
 /**
  * Synchronous storage backend interface.
  *
@@ -25,4 +27,16 @@ export interface SyncStorageBackend {
 
   /** Delete pages beyond a given index (for truncation). */
   deletePagesFrom(path: string, fromPageIndex: number): void;
+
+  /** Read file metadata. Returns null if not found. */
+  readMeta(path: string): FileMeta | null;
+
+  /** Write file metadata. */
+  writeMeta(path: string, meta: FileMeta): void;
+
+  /** Delete file metadata. */
+  deleteMeta(path: string): void;
+
+  /** List all paths that have metadata stored. */
+  listFiles(): string[];
 }
