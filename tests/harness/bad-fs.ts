@@ -23,7 +23,8 @@ export type DefectId =
   | "readdir-missing-dot"
   | "symlink-no-resolve"
   | "wrong-errno-enoent"
-  | "seek-end-off-by-one";
+  | "seek-end-off-by-one"
+  | "truncate-no-shrink";
 
 /**
  * Create an FS harness with a specific defect injected.
@@ -55,6 +56,8 @@ function applyDefect(
       return wrongErrnoEnoent(fs, harness);
     case "seek-end-off-by-one":
       return seekEndOffByOne(fs);
+    case "truncate-no-shrink":
+      return truncateNoShrink(fs);
   }
 }
 
@@ -279,6 +282,39 @@ function seekEndOffByOne(fs: EmscriptenFS): EmscriptenFS {
             return fs.llseek(stream, offset + 1, whence);
           }
           return fs.llseek(stream, offset, whence);
+        };
+      }
+      return Reflect.get(target, prop);
+    },
+  });
+}
+
+/**
+ * truncate-no-shrink: ftruncate and truncate silently ignore shrink requests.
+ * The file size never decreases — only grow operations take effect.
+ * Should be caught by Batch 5 (Truncate & Edge Cases) tests.
+ */
+function truncateNoShrink(fs: EmscriptenFS): EmscriptenFS {
+  return new Proxy(fs, {
+    get(target, prop) {
+      if (prop === "ftruncate") {
+        return (fd: number, len: number) => {
+          const stat = fs.fstat(fd);
+          // Only allow grow, silently ignore shrink
+          if (len < stat.size) {
+            return;
+          }
+          fs.ftruncate(fd, len);
+        };
+      }
+      if (prop === "truncate") {
+        return (path: string, len: number) => {
+          const stat = fs.stat(path);
+          // Only allow grow, silently ignore shrink
+          if (len < stat.size) {
+            return;
+          }
+          fs.truncate(path, len);
         };
       }
       return Reflect.get(target, prop);
