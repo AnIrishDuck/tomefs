@@ -83,7 +83,20 @@ filesystem: they catch interaction bugs that no single POSIX test covers (cache
 thrashing under write-heavy loads, page eviction during sequential scans, dirty
 flush ordering on concurrent streams).
 
-### 9. Graceful Degradation
+### 9. Adversarial Differential Testing
+
+Write tests designed to break tomefs specifically — things that pass against
+MEMFS but expose real bugs in the page cache layer. Target the seams: reads
+that span page boundaries, writes during eviction, metadata updates after
+flush, large sequential scans that rotate the entire cache, concurrent streams
+competing for cache slots, truncate/extend races with dirty pages. Think like
+an attacker trying to corrupt a database through its filesystem.
+
+This is lower priority than conformance and workload scenarios, but should run
+continuously once tomefs exists. Every bug found here becomes a new regression
+test.
+
+### 10. Graceful Degradation
 
 In environments without SharedArrayBuffer (no COOP/COEP headers), tomefs should
 degrade to a less performant mode that still serves key functional goals — keep
