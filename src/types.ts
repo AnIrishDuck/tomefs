@@ -1,0 +1,33 @@
+/** Page size in bytes — matches Postgres's internal page size. */
+export const PAGE_SIZE = 8192;
+
+/** Default maximum number of pages in the LRU cache (4096 * 8KB = 32MB). */
+export const DEFAULT_MAX_PAGES = 4096;
+
+/** A single cached page. */
+export interface CachedPage {
+  /** File path this page belongs to. */
+  path: string;
+  /** Zero-based page index within the file. */
+  pageIndex: number;
+  /** The page data (always PAGE_SIZE bytes; trailing bytes zero-filled). */
+  data: Uint8Array;
+  /** Whether this page has been modified since last flush. */
+  dirty: boolean;
+}
+
+/** File metadata stored alongside page data. */
+export interface FileMeta {
+  size: number;
+  mode: number;
+  ctime: number;
+  mtime: number;
+}
+
+/** Compound key for page storage: [path, pageIndex]. */
+export type PageKey = [string, number];
+
+/** Serialize a page key to a string for use in Maps. */
+export function pageKeyStr(path: string, pageIndex: number): string {
+  return `${path}\0${pageIndex}`;
+}
