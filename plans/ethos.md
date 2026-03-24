@@ -42,14 +42,12 @@ smoke tests that run quickly during development iteration.
 
 After the test suite passes against MEMFS, we build `BadFS` wrappers that inject
 specific defects (off-by-one reads, missing mtime updates, broken symlink
-resolution, etc). Each defect should be focused: it fails *some* conformance
-tests but passes others. This proves the tests have real discriminating power —
-they don't just detect "broken" vs "not broken", they pinpoint *what's* broken.
+resolution, etc).
 
-Once there's a critical mass of tests, there should also be a BadFS variant that
-fails every conformance test, while still passing other tests (e.g.,
-"can mount", "can open a file"). This prevents trivially broken variants (like
-throwing on every call) from satisfying the criterion.
+The goal: for every conformance test, there should be a BadFS variant that fails
+that specific test *and* passes some number of other tests. This proves each
+test has real discriminating power — it catches a specific class of bug, not just
+"is the FS totally broken".
 
 ### 5. No Mocks
 
