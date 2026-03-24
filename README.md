@@ -67,6 +67,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 | 1.7 | Persistence (Batch 6) tests | Done |
 | 2 | IndexedDB backend with compound key storage | Done |
 | 3 | SAB+Atomics sync bridge | Done |
+| 3.5 | Adversarial differential testing | Done |
 | 4 | PGlite integration + migration from IDBFS | Planned |
 | 5 | OPFS backend (alternative to IDB) | Future |
 
