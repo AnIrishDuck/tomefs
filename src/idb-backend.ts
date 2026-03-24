@@ -144,22 +144,15 @@ export class IdbBackend implements StorageBackend {
   async deleteFile(path: string): Promise<void> {
     const db = await this.getDb();
 
-    // Delete all pages for this file using a cursor over all keys
+    // Use IDB key range to target only this file's pages.
+    // Compound keys are [path, pageIndex] where pageIndex is a number.
+    // In IDB key ordering, strings sort after numbers, so [path, ""]
+    // sorts after [path, <any number>], bounding just this file's pages.
     return new Promise((resolve, reject) => {
       const tx = db.transaction(PAGES_STORE, "readwrite");
       const store = tx.objectStore(PAGES_STORE);
-      const request = store.openCursor();
-
-      request.onsuccess = () => {
-        const cursor = request.result;
-        if (!cursor) return; // Done — tx.oncomplete will fire
-
-        const key = cursor.key as [string, number];
-        if (Array.isArray(key) && key[0] === path) {
-          cursor.delete();
-        }
-        cursor.continue();
-      };
+      const range = IDBKeyRange.bound([path, 0], [path, ""], false, true);
+      store.delete(range);
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -172,21 +165,19 @@ export class IdbBackend implements StorageBackend {
   ): Promise<void> {
     const db = await this.getDb();
 
+    // Use IDB key range to target pages at and beyond fromPageIndex.
+    // Lower bound [path, fromPageIndex] captures the first page to delete;
+    // upper bound [path, ""] captures all higher-numbered pages for this path.
     return new Promise((resolve, reject) => {
       const tx = db.transaction(PAGES_STORE, "readwrite");
       const store = tx.objectStore(PAGES_STORE);
-      const request = store.openCursor();
-
-      request.onsuccess = () => {
-        const cursor = request.result;
-        if (!cursor) return;
-
-        const key = cursor.key as [string, number];
-        if (Array.isArray(key) && key[0] === path && key[1] >= fromPageIndex) {
-          cursor.delete();
-        }
-        cursor.continue();
-      };
+      const range = IDBKeyRange.bound(
+        [path, fromPageIndex],
+        [path, ""],
+        false,
+        true,
+      );
+      store.delete(range);
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);

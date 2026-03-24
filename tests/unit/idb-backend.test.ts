@@ -469,5 +469,43 @@ describe("IdbBackend", () => {
         expect(page).toEqual(filledPage(i));
       }
     });
+
+    it("deleteFile with many pages only deletes the target file", async () => {
+      // Write 20 pages across two files with overlapping page indices
+      for (let i = 0; i < 10; i++) {
+        await backend.writePage("/target", i, filledPage(i));
+        await backend.writePage("/keep", i, filledPage(0xff - i));
+      }
+
+      await backend.deleteFile("/target");
+
+      // All target pages gone
+      for (let i = 0; i < 10; i++) {
+        expect(await backend.readPage("/target", i)).toBeNull();
+      }
+      // All kept pages intact
+      for (let i = 0; i < 10; i++) {
+        expect(await backend.readPage("/keep", i)).toEqual(
+          filledPage(0xff - i),
+        );
+      }
+    });
+
+    it("deletePagesFrom preserves pages below the threshold", async () => {
+      for (let i = 0; i < 10; i++) {
+        await backend.writePage("/file", i, filledPage(i));
+      }
+
+      await backend.deletePagesFrom("/file", 5);
+
+      // Pages 0-4 survive
+      for (let i = 0; i < 5; i++) {
+        expect(await backend.readPage("/file", i)).toEqual(filledPage(i));
+      }
+      // Pages 5-9 deleted
+      for (let i = 5; i < 10; i++) {
+        expect(await backend.readPage("/file", i)).toBeNull();
+      }
+    });
   });
 });
