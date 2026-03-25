@@ -161,6 +161,30 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.READ_PAGES: {
+        const path = params.path as string;
+        const pageIndices = params.pageIndices as number[];
+        const pages = await this.backend.readPages(path, pageIndices);
+        const sizes: number[] = [];
+        const chunks: Uint8Array[] = [];
+        for (const page of pages) {
+          if (page) {
+            sizes.push(page.length);
+            chunks.push(page);
+          } else {
+            sizes.push(-1);
+          }
+        }
+        const respLen = encodeMessage(
+          this.dataView,
+          this.uint8View,
+          { sizes },
+          chunks,
+        );
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       case OpCode.WRITE_PAGE: {
         const dataLen = params.dataLen as number;
         const pageData = new Uint8Array(binary.buffer, binary.byteOffset, dataLen);

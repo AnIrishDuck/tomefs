@@ -69,16 +69,17 @@ export class PreloadBackend implements SyncStorageBackend {
       }
     }
 
-    // Load all pages for every file
+    // Load all pages for every file in batches
     for (const path of files) {
       const m = this.meta.get(path);
       if (!m || m.size === 0) continue;
 
       const pageCount = Math.ceil(m.size / 8192); // PAGE_SIZE
-      for (let i = 0; i < pageCount; i++) {
-        const data = await this.remote.readPage(path, i);
-        if (data) {
-          this.pages.set(pageKeyStr(path, i), new Uint8Array(data));
+      const indices = Array.from({ length: pageCount }, (_, i) => i);
+      const pages = await this.remote.readPages(path, indices);
+      for (let i = 0; i < pages.length; i++) {
+        if (pages[i]) {
+          this.pages.set(pageKeyStr(path, i), new Uint8Array(pages[i]!));
         }
       }
     }
@@ -98,6 +99,14 @@ export class PreloadBackend implements SyncStorageBackend {
     this.assertInitialized();
     const data = this.pages.get(pageKeyStr(path, pageIndex));
     return data ? new Uint8Array(data) : null;
+  }
+
+  readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
+    this.assertInitialized();
+    return pageIndices.map((i) => {
+      const data = this.pages.get(pageKeyStr(path, i));
+      return data ? new Uint8Array(data) : null;
+    });
   }
 
   writePage(path: string, pageIndex: number, data: Uint8Array): void {

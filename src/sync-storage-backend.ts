@@ -14,6 +14,12 @@ export interface SyncStorageBackend {
   /** Read a single page. Returns null if the page doesn't exist. */
   readPage(path: string, pageIndex: number): Uint8Array | null;
 
+  /** Read multiple pages in a single batch. Returns an array parallel to pageIndices. */
+  readPages(
+    path: string,
+    pageIndices: number[],
+  ): Array<Uint8Array | null>;
+
   /** Write a single page. */
   writePage(path: string, pageIndex: number, data: Uint8Array): void;
 

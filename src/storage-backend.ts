@@ -11,6 +11,12 @@ export interface StorageBackend {
   /** Read a single page. Returns null if the page doesn't exist. */
   readPage(path: string, pageIndex: number): Promise<Uint8Array | null>;
 
+  /** Read multiple pages in a single batch. Returns an array parallel to pageIndices. */
+  readPages(
+    path: string,
+    pageIndices: number[],
+  ): Promise<Array<Uint8Array | null>>;
+
   /** Write a single page. */
   writePage(path: string, pageIndex: number, data: Uint8Array): Promise<void>;
 

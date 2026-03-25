@@ -118,6 +118,28 @@ export class OpfsBackend implements StorageBackend {
     return new Uint8Array(buffer);
   }
 
+  async readPages(
+    path: string,
+    pageIndices: number[],
+  ): Promise<Array<Uint8Array | null>> {
+    const fileDir = await this.getFileDir(path, false);
+    if (!fileDir) return pageIndices.map(() => null);
+
+    return Promise.all(
+      pageIndices.map(async (pageIndex) => {
+        let handle: FileSystemFileHandle;
+        try {
+          handle = await fileDir.getFileHandle(String(pageIndex));
+        } catch {
+          return null;
+        }
+        const file = await handle.getFile();
+        const buffer = await file.arrayBuffer();
+        return new Uint8Array(buffer);
+      }),
+    );
+  }
+
   async writePage(
     path: string,
     pageIndex: number,

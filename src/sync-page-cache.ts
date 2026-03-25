@@ -102,6 +102,9 @@ export class SyncPageCache {
    *
    * Handles reads that span multiple pages. Returns the number of bytes
    * actually read (may be less than length if position + length > fileSize).
+   *
+   * When a read spans multiple pages, cache misses are batched into a single
+   * backend.readPages() call to reduce SAB bridge round-trips.
    */
   read(
     path: string,
@@ -115,6 +118,42 @@ export class SyncPageCache {
     const toRead = Math.min(length, available);
     if (toRead === 0) return 0;
 
+    // Determine which pages this read spans
+    const firstPage = Math.floor(position / PAGE_SIZE);
+    const lastPage = Math.floor((position + toRead - 1) / PAGE_SIZE);
+
+    // Find cache misses — only batch when there are multiple misses
+    if (lastPage > firstPage) {
+      const missingIndices: number[] = [];
+      for (let p = firstPage; p <= lastPage; p++) {
+        if (!this.cache.has(pageKeyStr(path, p))) {
+          missingIndices.push(p);
+        }
+      }
+
+      if (missingIndices.length > 1) {
+        const results = this.backend.readPages(path, missingIndices);
+        for (let i = 0; i < missingIndices.length; i++) {
+          const pageIndex = missingIndices[i];
+          const key = pageKeyStr(path, pageIndex);
+          if (this.cache.has(key)) continue; // may appear via eviction cascade
+          const page: CachedPage = {
+            path,
+            pageIndex,
+            data: results[i]
+              ? new Uint8Array(results[i]!)
+              : new Uint8Array(PAGE_SIZE),
+            dirty: false,
+          };
+          this.ensureCapacity();
+          this.cache.set(key, page);
+          this.mruKey = key;
+          this.trackPage(path, key);
+        }
+      }
+    }
+
+    // Read from cache (all multi-miss pages are pre-loaded; single misses use getPage)
     let bytesRead = 0;
     let pos = position;
 

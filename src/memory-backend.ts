@@ -19,6 +19,17 @@ export class MemoryBackend implements StorageBackend {
     return data ? new Uint8Array(data) : null;
   }
 
+  async readPages(
+    path: string,
+    pageIndices: number[],
+  ): Promise<Array<Uint8Array | null>> {
+    return pageIndices.map((i) => {
+      const key = pageKeyStr(path, i);
+      const data = this.pages.get(key);
+      return data ? new Uint8Array(data) : null;
+    });
+  }
+
   async writePage(
     path: string,
     pageIndex: number,

@@ -18,6 +18,10 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     return data ? new Uint8Array(data) : null;
   }
 
+  readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
+    return pageIndices.map((i) => this.readPage(path, i));
+  }
+
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     const key = pageKeyStr(path, pageIndex);
     this.pages.set(key, new Uint8Array(data));
