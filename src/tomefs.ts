@@ -28,6 +28,12 @@ const S_IFDIR = 0o040000;
 const S_IFREG = 0o100000;
 const S_IFLNK = 0o120000;
 
+/** POSIX NAME_MAX: maximum bytes in a single path component. */
+const NAME_MAX = 255;
+
+/** Emscripten errno for ENAMETOOLONG. */
+const ENAMETOOLONG = 37;
+
 /** Options for creating a tomefs instance. */
 export interface TomeFSOptions {
   /** Storage backend. Defaults to SyncMemoryBackend. */
@@ -212,6 +218,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   }
 
   function rename(old_node: any, new_dir: any, new_name: string) {
+    if (new_name.length > NAME_MAX) {
+      throw new FS.ErrnoError(ENAMETOOLONG);
+    }
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
@@ -742,6 +751,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     createNode(parent: any, name: string, mode: number, dev: number) {
       if (FS.isBlkdev(mode) || FS.isFIFO(mode)) {
         throw new FS.ErrnoError(63); // EPERM
+      }
+      if (name.length > NAME_MAX) {
+        throw new FS.ErrnoError(ENAMETOOLONG);
       }
 
       const node = FS.createNode(parent, name, mode, dev);
