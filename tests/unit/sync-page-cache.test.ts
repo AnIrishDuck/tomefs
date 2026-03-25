@@ -356,6 +356,192 @@ describe("SyncPageCache", () => {
     });
   });
 
+  describe("batch eviction optimization", () => {
+    /**
+     * Counting wrapper around SyncMemoryBackend to verify that multi-page
+     * operations use batch backend calls instead of per-page calls.
+     */
+    function createCountingBackend() {
+      const inner = new SyncMemoryBackend();
+      const counts = {
+        readPage: 0,
+        readPages: 0,
+        writePage: 0,
+        writePages: 0,
+        reset() {
+          this.readPage = this.readPages = this.writePage = this.writePages = 0;
+        },
+      };
+
+      const counting: SyncMemoryBackend & { counts: typeof counts } =
+        Object.create(inner);
+      counting.counts = counts;
+      counting.readPage = (...args: Parameters<typeof inner.readPage>) => {
+        counts.readPage++;
+        return inner.readPage(...args);
+      };
+      counting.readPages = (...args: Parameters<typeof inner.readPages>) => {
+        counts.readPages++;
+        return inner.readPages(...args);
+      };
+      counting.writePage = (...args: Parameters<typeof inner.writePage>) => {
+        counts.writePage++;
+        return inner.writePage(...args);
+      };
+      counting.writePages = (...args: Parameters<typeof inner.writePages>) => {
+        counts.writePages++;
+        return inner.writePages(...args);
+      };
+      return counting;
+    }
+
+    it("batches dirty eviction flushes during multi-page write", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 4);
+
+      // Fill cache with 4 dirty pages for file A
+      const fillData = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < fillData.length; i++) fillData[i] = (i * 3) & 0xff;
+      cache.write("/a", fillData, 0, PAGE_SIZE * 4, 0, 0);
+
+      cb.counts.reset();
+
+      // Write 4 pages to file B — requires evicting all 4 dirty pages from A
+      const writeData = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < writeData.length; i++)
+        writeData[i] = (i * 7) & 0xff;
+      cache.write("/b", writeData, 0, PAGE_SIZE * 4, 0, 0);
+
+      // Should batch the dirty eviction flush (1 writePages, not 4 writePage)
+      expect(cb.counts.writePage).toBe(0);
+      expect(cb.counts.writePages).toBe(1);
+
+      // Should batch the read of missing pages (1 readPages, not 4 readPage)
+      expect(cb.counts.readPages).toBe(1);
+
+      // Verify data integrity: read back file B
+      const buf = new Uint8Array(PAGE_SIZE * 4);
+      cache.read("/b", buf, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+      expect(buf).toEqual(writeData);
+
+      // Verify evicted file A data is in backend
+      const evicted = cb.readPage("/a", 0);
+      expect(evicted).not.toBeNull();
+      expect(evicted![0]).toBe(fillData[0]);
+    });
+
+    it("batches dirty eviction flushes during multi-page read", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 4);
+
+      // Fill cache with 4 dirty pages
+      const fillData = new Uint8Array(PAGE_SIZE * 4);
+      fillData.fill(0xab);
+      cache.write("/a", fillData, 0, PAGE_SIZE * 4, 0, 0);
+
+      // Write 4 pages of file B directly to backend (bypass cache)
+      for (let i = 0; i < 4; i++) {
+        const d = new Uint8Array(PAGE_SIZE);
+        d[0] = i + 1;
+        cb.writePage("/b", i, d);
+      }
+
+      cb.counts.reset();
+
+      // Read all 4 pages of file B — evicts all of A's dirty pages
+      const buf = new Uint8Array(PAGE_SIZE * 4);
+      cache.read("/b", buf, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+
+      // Eviction should be batched
+      expect(cb.counts.writePage).toBe(0);
+      expect(cb.counts.writePages).toBe(1);
+
+      // Verify read data
+      expect(buf[0]).toBe(1);
+      expect(buf[PAGE_SIZE]).toBe(2);
+      expect(buf[PAGE_SIZE * 2]).toBe(3);
+      expect(buf[PAGE_SIZE * 3]).toBe(4);
+    });
+
+    it("uses single writePage for single dirty eviction", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 2);
+
+      // Fill cache with 2 dirty pages
+      cache.write("/a", new Uint8Array([1]), 0, 1, 0, 0);
+      cache.write("/b", new Uint8Array([2]), 0, 1, 0, 0);
+
+      cb.counts.reset();
+
+      // Single page write that triggers 1 eviction
+      cache.write("/c", new Uint8Array([3]), 0, 1, 0, 0);
+
+      // Single eviction should use writePage, not writePages
+      expect(cb.counts.writePage).toBe(1);
+      expect(cb.counts.writePages).toBe(0);
+    });
+
+    it("data survives batch eviction and re-read from backend", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 4);
+
+      // Write distinctive data to 8 pages across 2 files
+      const dataA = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < dataA.length; i++) dataA[i] = (i * 11) & 0xff;
+      cache.write("/a", dataA, 0, PAGE_SIZE * 4, 0, 0);
+
+      const dataB = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < dataB.length; i++) dataB[i] = (i * 13) & 0xff;
+      cache.write("/b", dataB, 0, PAGE_SIZE * 4, 0, 0);
+
+      // File A was evicted when B was written. Read it back from backend.
+      const bufA = new Uint8Array(PAGE_SIZE * 4);
+      cache.read("/a", bufA, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+      expect(bufA).toEqual(dataA);
+
+      // File B was evicted when A was re-read. Read it back too.
+      const bufB = new Uint8Array(PAGE_SIZE * 4);
+      cache.read("/b", bufB, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+      expect(bufB).toEqual(dataB);
+    });
+
+    it("does not over-evict when some pages are already cached", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 4);
+
+      // Load 2 dirty pages for /other first (these will be LRU)
+      cache.write("/other", new Uint8Array([0xaa]), 0, 1, 0, 0);
+      cache.write("/other", new Uint8Array([0xbb]), 0, 1, PAGE_SIZE, 0);
+
+      // Load pages 0 and 1 for /file (clean, from backend — MRU end)
+      for (let i = 0; i < 2; i++) {
+        const d = new Uint8Array(PAGE_SIZE);
+        d[0] = i + 1;
+        cb.writePage("/file", i, d);
+      }
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 1);
+
+      // Cache is now full (4 pages). Write spanning pages 0-3 of /file.
+      // Pages 0-1 are cached, 2-3 are misses. Only need to evict 2.
+      cb.counts.reset();
+
+      const writeData = new Uint8Array(PAGE_SIZE * 4);
+      writeData.fill(0xcc);
+      cache.write("/file", writeData, 0, PAGE_SIZE * 4, 0, 0);
+
+      // Should only evict 2 pages (the /other pages), not 4
+      // The 2 dirty /other pages should be batch-flushed
+      expect(cb.counts.writePages).toBe(1);
+      expect(cb.counts.writePage).toBe(0);
+
+      // Verify evicted data is in backend
+      const evicted = cb.readPage("/other", 0);
+      expect(evicted).not.toBeNull();
+      expect(evicted![0]).toBe(0xaa);
+    });
+  });
+
   describe("constructor validation", () => {
     it("rejects maxPages < 1", () => {
       expect(() => new SyncPageCache(backend, 0)).toThrow(

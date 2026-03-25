@@ -132,6 +132,9 @@ export class SyncPageCache {
       }
 
       if (missingIndices.length > 1) {
+        // Batch-evict space before pre-loading to reduce bridge round-trips
+        this.batchEvict(missingIndices.length);
+
         const results = this.backend.readPages(path, missingIndices);
         for (let i = 0; i < missingIndices.length; i++) {
           const pageIndex = missingIndices[i];
@@ -184,6 +187,9 @@ export class SyncPageCache {
    * Handles writes that span multiple pages. Pages are loaded (or created)
    * as needed and marked dirty. Returns the number of bytes written and the
    * new file size.
+   *
+   * When a write spans multiple pages, cache misses are pre-computed and
+   * eviction + loading are batched to reduce SAB bridge round-trips.
    */
   write(
     path: string,
@@ -196,6 +202,49 @@ export class SyncPageCache {
     if (length === 0)
       return { bytesWritten: 0, newFileSize: currentFileSize };
 
+    // Determine which pages this write spans
+    const firstPage = Math.floor(position / PAGE_SIZE);
+    const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
+
+    // For multi-page writes, batch eviction and pre-loading of cache misses
+    if (lastPage > firstPage) {
+      const missingIndices: number[] = [];
+      for (let p = firstPage; p <= lastPage; p++) {
+        if (!this.cache.has(pageKeyStr(path, p))) {
+          missingIndices.push(p);
+        }
+      }
+
+      if (missingIndices.length > 0) {
+        // Batch-evict space for all missing pages at once
+        this.batchEvict(missingIndices.length);
+
+        // Batch-load all missing pages from backend
+        if (missingIndices.length > 1) {
+          const results = this.backend.readPages(path, missingIndices);
+          for (let i = 0; i < missingIndices.length; i++) {
+            const pageIndex = missingIndices[i];
+            const key = pageKeyStr(path, pageIndex);
+            if (this.cache.has(key)) continue;
+            const page: CachedPage = {
+              path,
+              pageIndex,
+              data: results[i]
+                ? new Uint8Array(results[i]!)
+                : new Uint8Array(PAGE_SIZE),
+              dirty: false,
+            };
+            this.ensureCapacity();
+            this.cache.set(key, page);
+            this.mruKey = key;
+            this.trackPage(path, key);
+          }
+        }
+        // Single misses are handled efficiently by getPage below
+      }
+    }
+
+    // Write data into pages (all multi-miss pages are pre-loaded)
     let bytesWritten = 0;
     let pos = position;
 
@@ -441,27 +490,101 @@ export class SyncPageCache {
    */
   private ensureCapacity(): void {
     while (this.cache.size >= this.maxPages) {
-      const firstKey = this.cache.keys().next().value!;
-      const victim = this.cache.get(firstKey)!;
+      this.evictOne();
+    }
+  }
+
+  /**
+   * Evict the single least-recently-used page.
+   * If the page is dirty, it is flushed individually to the backend.
+   */
+  private evictOne(): void {
+    const firstKey = this.cache.keys().next().value!;
+    const victim = this.cache.get(firstKey)!;
+
+    if (victim.dirty) {
+      this.backend.writePage(victim.path, victim.pageIndex, victim.data);
+      victim.dirty = false;
+      this.dirtyKeys.delete(firstKey);
+    }
+
+    this.cache.delete(firstKey);
+    if (firstKey === this.mruKey) this.mruKey = null;
+
+    const keys = this.filePages.get(victim.path);
+    if (keys) {
+      keys.delete(firstKey);
+      if (keys.size === 0) {
+        this.filePages.delete(victim.path);
+      }
+    }
+  }
+
+  /**
+   * Batch-evict pages to make room for `count` new entries.
+   *
+   * Collects all dirty victims and flushes them in a single writePages
+   * call, reducing SAB bridge round-trips from O(dirty-evictions) to O(1).
+   * Falls back to single-page eviction when only one page needs flushing.
+   */
+  private batchEvict(count: number): void {
+    const needed = Math.min(
+      this.cache.size,
+      this.cache.size + count - this.maxPages,
+    );
+    if (needed <= 0) return;
+
+    // For a single eviction, use the simple path (no array allocation)
+    if (needed === 1) {
+      this.evictOne();
+      return;
+    }
+
+    // Collect victims from the LRU end (front of the Map)
+    const victimKeys: string[] = [];
+    const victims: CachedPage[] = [];
+    const iter = this.cache.keys();
+    for (let i = 0; i < needed; i++) {
+      const key = iter.next().value!;
+      victimKeys.push(key);
+      victims.push(this.cache.get(key)!);
+    }
+
+    // Batch-flush all dirty victims in one backend call
+    const dirtyPages: Array<{
+      path: string;
+      pageIndex: number;
+      data: Uint8Array;
+    }> = [];
+    for (const v of victims) {
+      if (v.dirty) {
+        dirtyPages.push({ path: v.path, pageIndex: v.pageIndex, data: v.data });
+      }
+    }
+    if (dirtyPages.length === 1) {
+      const p = dirtyPages[0];
+      this.backend.writePage(p.path, p.pageIndex, p.data);
+    } else if (dirtyPages.length > 1) {
+      this.backend.writePages(dirtyPages);
+    }
+
+    // Remove victims from cache and indexes
+    for (let i = 0; i < victimKeys.length; i++) {
+      const key = victimKeys[i];
+      const victim = victims[i];
+
+      this.cache.delete(key);
+      if (key === this.mruKey) this.mruKey = null;
 
       if (victim.dirty) {
-        // Flush before eviction — if write fails, keep the page in cache
-        // to avoid silent data loss.
-        this.backend.writePage(victim.path, victim.pageIndex, victim.data);
         victim.dirty = false;
-        this.dirtyKeys.delete(firstKey);
+        this.dirtyKeys.delete(key);
       }
 
-      this.cache.delete(firstKey);
-      if (firstKey === this.mruKey) this.mruKey = null;
-
-      // Remove from filePages index
-      const keys = this.filePages.get(victim.path);
-      if (keys) {
-        keys.delete(firstKey);
-        if (keys.size === 0) {
-          this.filePages.delete(victim.path);
-        }
+      const fileKeys = this.filePages.get(victim.path);
+      if (fileKeys) {
+        fileKeys.delete(key);
+        if (fileKeys.size === 0) this.filePages.delete(victim.path);
       }
     }
   }
