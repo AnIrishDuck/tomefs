@@ -113,6 +113,35 @@ describe("IdbBackend", () => {
   });
 
   // -------------------------------------------------------------------
+  // Batch reads
+  // -------------------------------------------------------------------
+
+  describe("readPages (batch)", () => {
+    it("reads multiple pages in one transaction", async () => {
+      await backend.writePage("/test", 0, filledPage(0xaa));
+      await backend.writePage("/test", 1, filledPage(0xbb));
+      await backend.writePage("/test", 3, filledPage(0xdd));
+
+      const results = await backend.readPages("/test", [0, 1, 2, 3]);
+      expect(results).toHaveLength(4);
+      expect(results[0]![0]).toBe(0xaa);
+      expect(results[1]![0]).toBe(0xbb);
+      expect(results[2]).toBeNull();
+      expect(results[3]![0]).toBe(0xdd);
+    });
+
+    it("returns empty array for empty indices", async () => {
+      const results = await backend.readPages("/test", []);
+      expect(results).toEqual([]);
+    });
+
+    it("returns all nulls for non-existent file", async () => {
+      const results = await backend.readPages("/missing", [0, 1, 2]);
+      expect(results).toEqual([null, null, null]);
+    });
+  });
+
+  // -------------------------------------------------------------------
   // Batch writes
   // -------------------------------------------------------------------
 

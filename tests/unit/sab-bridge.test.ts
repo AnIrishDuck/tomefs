@@ -153,6 +153,26 @@ describe("SAB+Atomics Bridge", () => {
       expect(toUint8Array(r1)[0]).toBe(0xbb);
     });
 
+    it("readPages batch reads multiple pages", async () => {
+      const page0 = new Uint8Array(PAGE_SIZE);
+      page0[0] = 0xaa;
+      const page1 = new Uint8Array(PAGE_SIZE);
+      page1[0] = 0xbb;
+
+      await callClient(clientWorker, "writePage", ["/test", 0, page0]);
+      await callClient(clientWorker, "writePage", ["/test", 1, page1]);
+
+      const result = (await callClient(clientWorker, "readPages", [
+        "/test",
+        [0, 1, 2],
+      ])) as Array<unknown>;
+
+      expect(result).toHaveLength(3);
+      expect(toUint8Array(result[0])[0]).toBe(0xaa);
+      expect(toUint8Array(result[1])[0]).toBe(0xbb);
+      expect(result[2]).toBeNull();
+    });
+
     it("deleteFile removes all pages", async () => {
       const data = new Uint8Array(PAGE_SIZE);
       data[0] = 0x42;

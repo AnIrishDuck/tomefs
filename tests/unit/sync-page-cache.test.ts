@@ -256,6 +256,106 @@ describe("SyncPageCache", () => {
     });
   });
 
+  describe("batch readPages optimization", () => {
+    it("uses readPages for multi-page reads with multiple cache misses", () => {
+      // Write 4 pages to backend directly
+      for (let i = 0; i < 4; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data[0] = i + 1;
+        backend.writePage("/file", i, data);
+      }
+
+      // Track readPages calls
+      let readPagesCallCount = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = (path: string, pageIndices: number[]) => {
+        readPagesCallCount++;
+        return origReadPages(path, pageIndices);
+      };
+
+      const cache = new SyncPageCache(backend, 16);
+      const buf = new Uint8Array(PAGE_SIZE * 4);
+      cache.read("/file", buf, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+
+      // Should have used readPages (1 batch call instead of 4 individual reads)
+      expect(readPagesCallCount).toBe(1);
+      // Verify data integrity
+      expect(buf[0]).toBe(1);
+      expect(buf[PAGE_SIZE]).toBe(2);
+      expect(buf[PAGE_SIZE * 2]).toBe(3);
+      expect(buf[PAGE_SIZE * 3]).toBe(4);
+    });
+
+    it("skips batch for single-page reads", () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 42;
+      backend.writePage("/file", 0, data);
+
+      let readPagesCallCount = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = (path: string, pageIndices: number[]) => {
+        readPagesCallCount++;
+        return origReadPages(path, pageIndices);
+      };
+
+      const cache = new SyncPageCache(backend, 16);
+      const buf = new Uint8Array(100);
+      cache.read("/file", buf, 0, 100, 0, PAGE_SIZE);
+
+      // Single-page read should NOT use readPages
+      expect(readPagesCallCount).toBe(0);
+      expect(buf[0]).toBe(42);
+    });
+
+    it("skips batch when only one page is a cache miss", () => {
+      // Write 2 pages
+      for (let i = 0; i < 2; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data[0] = i + 1;
+        backend.writePage("/file", i, data);
+      }
+
+      const cache = new SyncPageCache(backend, 16);
+
+      // Pre-load page 0 into cache
+      cache.getPage("/file", 0);
+
+      let readPagesCallCount = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = (path: string, pageIndices: number[]) => {
+        readPagesCallCount++;
+        return origReadPages(path, pageIndices);
+      };
+
+      // Read spanning pages 0-1; only page 1 is a miss
+      const buf = new Uint8Array(PAGE_SIZE * 2);
+      cache.read("/file", buf, 0, PAGE_SIZE * 2, 0, PAGE_SIZE * 2);
+
+      // Only 1 miss — should fall through to getPage, not readPages
+      expect(readPagesCallCount).toBe(0);
+      expect(buf[0]).toBe(1);
+      expect(buf[PAGE_SIZE]).toBe(2);
+    });
+
+    it("handles mix of existing and non-existing pages in batch", () => {
+      // Only write pages 0 and 2; page 1 doesn't exist in backend
+      const d0 = new Uint8Array(PAGE_SIZE);
+      d0[0] = 0xaa;
+      backend.writePage("/file", 0, d0);
+      const d2 = new Uint8Array(PAGE_SIZE);
+      d2[0] = 0xcc;
+      backend.writePage("/file", 2, d2);
+
+      const cache = new SyncPageCache(backend, 16);
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      cache.read("/file", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
+
+      expect(buf[0]).toBe(0xaa);
+      expect(buf[PAGE_SIZE]).toBe(0); // non-existent page → zeros
+      expect(buf[PAGE_SIZE * 2]).toBe(0xcc);
+    });
+  });
+
   describe("constructor validation", () => {
     it("rejects maxPages < 1", () => {
       expect(() => new SyncPageCache(backend, 0)).toThrow(

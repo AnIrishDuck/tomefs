@@ -28,6 +28,10 @@ class FailingSyncBackend implements SyncStorageBackend {
     return this.inner.readPage(path, pageIndex);
   }
 
+  readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
+    return this.inner.readPages(path, pageIndices);
+  }
+
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     if (this.writePageFails) {
       this.writeFailCount++;
@@ -81,6 +85,13 @@ class FailingAsyncBackend implements StorageBackend {
 
   async readPage(path: string, pageIndex: number): Promise<Uint8Array | null> {
     return this.inner.readPage(path, pageIndex);
+  }
+
+  async readPages(
+    path: string,
+    pageIndices: number[],
+  ): Promise<Array<Uint8Array | null>> {
+    return this.inner.readPages(path, pageIndices);
   }
 
   async writePage(

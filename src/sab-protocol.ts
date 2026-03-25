@@ -29,6 +29,7 @@ export const OpCode = {
   WRITE_META: 7,
   DELETE_META: 8,
   LIST_FILES: 9,
+  READ_PAGES: 10,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];

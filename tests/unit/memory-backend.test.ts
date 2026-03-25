@@ -79,6 +79,28 @@ describe("MemoryBackend", () => {
     });
   });
 
+  describe("batch read", () => {
+    it("reads multiple pages in one call", async () => {
+      const d0 = new Uint8Array(PAGE_SIZE);
+      d0[0] = 0xaa;
+      const d1 = new Uint8Array(PAGE_SIZE);
+      d1[0] = 0xbb;
+      await backend.writePage("/test", 0, d0);
+      await backend.writePage("/test", 1, d1);
+
+      const results = await backend.readPages("/test", [0, 1, 2]);
+      expect(results).toHaveLength(3);
+      expect(results[0]![0]).toBe(0xaa);
+      expect(results[1]![0]).toBe(0xbb);
+      expect(results[2]).toBeNull();
+    });
+
+    it("returns empty array for empty indices", async () => {
+      const results = await backend.readPages("/test", []);
+      expect(results).toEqual([]);
+    });
+  });
+
   describe("batch write", () => {
     it("writes multiple pages atomically", async () => {
       const pages = [

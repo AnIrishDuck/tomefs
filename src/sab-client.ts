@@ -66,6 +66,26 @@ export class SabClient implements SyncStorageBackend {
     return new Uint8Array(binary);
   }
 
+  readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
+    if (pageIndices.length === 0) return [];
+    const { json, binary } = this.call(OpCode.READ_PAGES, {
+      path,
+      pageIndices,
+    });
+    const result = json as { sizes: number[] };
+    const pages: Array<Uint8Array | null> = [];
+    let offset = 0;
+    for (const size of result.sizes) {
+      if (size < 0) {
+        pages.push(null);
+      } else {
+        pages.push(new Uint8Array(binary.slice(offset, offset + size)));
+        offset += size;
+      }
+    }
+    return pages;
+  }
+
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     this.call(OpCode.WRITE_PAGE, { path, pageIndex, dataLen: data.length }, [
       data,
