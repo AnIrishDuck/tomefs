@@ -295,11 +295,14 @@ export class PageCache {
       const victim = this.cache.get(firstKey)!;
 
       if (victim.dirty) {
+        // Flush before eviction — if write fails, the exception propagates
+        // and the page stays in cache to avoid silent data loss.
         await this.backend.writePage(
           victim.path,
           victim.pageIndex,
           victim.data,
         );
+        victim.dirty = false;
       }
 
       this.cache.delete(firstKey);
