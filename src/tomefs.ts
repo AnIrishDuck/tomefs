@@ -445,7 +445,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       length: number,
       _mmapFlags: number,
     ) {
-      writePages(stream.node, buffer, offset, length, 0);
+      // offset is the file position (matching MEMFS: write(stream, buffer, 0, length, offset))
+      writePages(stream.node, buffer, 0, length, offset);
       return 0;
     },
   };
