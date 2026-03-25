@@ -30,6 +30,7 @@ export const OpCode = {
   DELETE_META: 8,
   LIST_FILES: 9,
   READ_PAGES: 10,
+  RENAME_FILE: 11,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];

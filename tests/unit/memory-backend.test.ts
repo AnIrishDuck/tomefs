@@ -150,6 +150,32 @@ describe("MemoryBackend", () => {
     });
   });
 
+  describe("renameFile", () => {
+    it("moves all pages from old path to new path", async () => {
+      const d0 = new Uint8Array(PAGE_SIZE);
+      d0[0] = 0xaa;
+      const d1 = new Uint8Array(PAGE_SIZE);
+      d1[0] = 0xbb;
+      await backend.writePage("/old", 0, d0);
+      await backend.writePage("/old", 1, d1);
+      await backend.writePage("/other", 0, new Uint8Array(PAGE_SIZE));
+
+      await backend.renameFile("/old", "/new");
+
+      expect(await backend.readPage("/old", 0)).toBeNull();
+      expect(await backend.readPage("/old", 1)).toBeNull();
+      expect((await backend.readPage("/new", 0))![0]).toBe(0xaa);
+      expect((await backend.readPage("/new", 1))![0]).toBe(0xbb);
+      // Unrelated file untouched
+      expect(await backend.readPage("/other", 0)).not.toBeNull();
+    });
+
+    it("is a no-op when old path has no pages", async () => {
+      await backend.renameFile("/nonexistent", "/new");
+      expect(await backend.readPage("/new", 0)).toBeNull();
+    });
+  });
+
   describe("metadata operations", () => {
     it("@fast returns null for non-existent metadata", async () => {
       expect(await backend.readMeta("/test")).toBeNull();

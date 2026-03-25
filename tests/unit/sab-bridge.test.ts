@@ -200,6 +200,26 @@ describe("SAB+Atomics Bridge", () => {
     });
   });
 
+  describe("renameFile", () => {
+    it("moves all pages from old path to new path", async () => {
+      const d0 = new Uint8Array(PAGE_SIZE);
+      d0[0] = 0xaa;
+      const d1 = new Uint8Array(PAGE_SIZE);
+      d1[0] = 0xbb;
+      await callClient(clientWorker, "writePage", ["/old", 0, d0]);
+      await callClient(clientWorker, "writePage", ["/old", 1, d1]);
+
+      await callClient(clientWorker, "renameFile", ["/old", "/new"]);
+
+      expect(await callClient(clientWorker, "readPage", ["/old", 0])).toBeNull();
+      expect(await callClient(clientWorker, "readPage", ["/old", 1])).toBeNull();
+      const p0 = await callClient(clientWorker, "readPage", ["/new", 0]) as Uint8Array;
+      expect(p0[0]).toBe(0xaa);
+      const p1 = await callClient(clientWorker, "readPage", ["/new", 1]) as Uint8Array;
+      expect(p1[0]).toBe(0xbb);
+    });
+  });
+
   describe("metadata operations", () => {
     it("@fast readMeta returns null for non-existent file", async () => {
       const result = await callClient(clientWorker, "readMeta", ["/test"]);

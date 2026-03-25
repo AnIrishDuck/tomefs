@@ -112,6 +112,10 @@ export class SabClient implements SyncStorageBackend {
     this.call(OpCode.DELETE_PAGES_FROM, { path, fromPageIndex });
   }
 
+  renameFile(oldPath: string, newPath: string): void {
+    this.call(OpCode.RENAME_FILE, { oldPath, newPath });
+  }
+
   readMeta(path: string): FileMeta | null {
     const { json } = this.call(OpCode.READ_META, { path });
     const result = json as { meta: FileMeta | null };

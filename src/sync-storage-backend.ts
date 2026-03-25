@@ -43,6 +43,9 @@ export interface SyncStorageBackend {
   /** Delete file metadata. */
   deleteMeta(path: string): void;
 
+  /** Rename all pages from one path to another. */
+  renameFile(oldPath: string, newPath: string): void;
+
   /** List all paths that have metadata stored. */
   listFiles(): string[];
 }

@@ -56,6 +56,21 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     }
   }
 
+  renameFile(oldPath: string, newPath: string): void {
+    const prefix = `${oldPath}\0`;
+    const toAdd: Array<[string, Uint8Array]> = [];
+    for (const [key, data] of this.pages.entries()) {
+      if (key.startsWith(prefix)) {
+        const pageIndex = key.slice(prefix.length);
+        toAdd.push([`${newPath}\0${pageIndex}`, data]);
+        this.pages.delete(key);
+      }
+    }
+    for (const [key, data] of toAdd) {
+      this.pages.set(key, data);
+    }
+  }
+
   readMeta(path: string): FileMeta | null {
     return this.meta.get(path) ?? null;
   }

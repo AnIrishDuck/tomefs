@@ -122,6 +122,11 @@ class FailingBackend implements StorageBackend {
     return this.inner.deletePagesFrom(path, fromPageIndex);
   }
 
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    this.maybeThrow("renameFile");
+    return this.inner.renameFile(oldPath, newPath);
+  }
+
   async readMeta(path: string): Promise<FileMeta | null> {
     this.maybeThrow("readMeta");
     return this.inner.readMeta(path);
@@ -172,6 +177,10 @@ class SlowBackend implements StorageBackend {
 
   async deletePagesFrom(path: string, fromPageIndex: number): Promise<void> {
     return this.inner.deletePagesFrom(path, fromPageIndex);
+  }
+
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    return this.inner.renameFile(oldPath, newPath);
   }
 
   async readMeta(path: string): Promise<FileMeta | null> {
