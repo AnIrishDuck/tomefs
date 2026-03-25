@@ -40,7 +40,10 @@ function decode(buf: Uint8Array, length?: number): string {
  * the real implementation and records calls as a side effect.
  */
 class RecordingBackend extends SyncMemoryBackend {
-  operations: Array<{ op: "writeMeta" | "deleteMeta"; path: string }> = [];
+  operations: Array<{
+    op: "writeMeta" | "deleteMeta" | "deleteFile";
+    path: string;
+  }> = [];
   recording = false;
 
   startRecording(): void {
@@ -64,6 +67,13 @@ class RecordingBackend extends SyncMemoryBackend {
       this.operations.push({ op: "deleteMeta", path });
     }
     super.deleteMeta(path);
+  }
+
+  deleteFile(path: string): void {
+    if (this.recording) {
+      this.operations.push({ op: "deleteFile", path });
+    }
+    super.deleteFile(path);
   }
 }
 
@@ -235,6 +245,135 @@ describe("syncfs safety", () => {
     const deletes = backend.operations.filter((o) => o.op === "deleteMeta");
     expect(writes.length).toBeGreaterThan(0);
     expect(deletes.length).toBe(0);
+
+    FS.unmount(MOUNT);
+  });
+
+  it("syncfs cleans up orphaned page data for stale entries", async () => {
+    // Create a file and sync so metadata + pages are in the backend
+    const { FS, tomefs } = await mountTome(backend);
+    const s = FS.open(`${MOUNT}/orphan`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("data that will be orphaned"), 0, 26);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    // Verify pages exist in backend
+    expect(backend.readPage("/orphan", 0)).not.toBeNull();
+
+    // Simulate a crash scenario: unlink the file (cleans pages from cache +
+    // backend), then manually re-add stale metadata AND stale page data as
+    // if the crash interrupted the cleanup.
+    FS.unlink(`${MOUNT}/orphan`);
+    backend.writeMeta("/orphan", {
+      size: 26,
+      mode: 0o100666,
+      ctime: Date.now(),
+      mtime: Date.now(),
+    });
+    backend.writePage("/orphan", 0, new Uint8Array(8192));
+
+    // syncfs should clean up both metadata AND page data
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+
+    expect(backend.readMeta("/orphan")).toBeNull();
+    expect(backend.readPage("/orphan", 0)).toBeNull();
+
+    // Verify deleteFile was called for the stale path
+    const fileDeletes = backend.operations.filter(
+      (o) => o.op === "deleteFile" && o.path === "/orphan",
+    );
+    expect(fileDeletes.length).toBe(1);
+
+    FS.unmount(MOUNT);
+  });
+
+  it("syncfs orphan cleanup deletes multi-page stale data", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create a multi-page file
+    const bigData = new Uint8Array(8192 * 3); // 3 pages
+    for (let i = 0; i < bigData.length; i++) bigData[i] = (i * 17) & 0xff;
+    const s = FS.open(`${MOUNT}/big`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, bigData, 0, bigData.length);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    // Verify all 3 pages exist
+    expect(backend.readPage("/big", 0)).not.toBeNull();
+    expect(backend.readPage("/big", 1)).not.toBeNull();
+    expect(backend.readPage("/big", 2)).not.toBeNull();
+
+    // Delete the file, then simulate crash by re-adding stale data
+    FS.unlink(`${MOUNT}/big`);
+    backend.writeMeta("/big", {
+      size: bigData.length,
+      mode: 0o100666,
+      ctime: Date.now(),
+      mtime: Date.now(),
+    });
+    for (let i = 0; i < 3; i++) {
+      backend.writePage("/big", i, new Uint8Array(8192));
+    }
+
+    syncfs(FS, tomefs);
+
+    // All pages and metadata should be gone
+    expect(backend.readMeta("/big")).toBeNull();
+    for (let i = 0; i < 3; i++) {
+      expect(backend.readPage("/big", i)).toBeNull();
+    }
+
+    FS.unmount(MOUNT);
+  });
+
+  it("syncfs orphan cleanup does not affect current files", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create two files
+    let s = FS.open(`${MOUNT}/current`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("live data"), 0, 9);
+    FS.close(s);
+    s = FS.open(`${MOUNT}/stale`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("dead data"), 0, 9);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    // Delete the stale file, simulate crash with leftover data
+    FS.unlink(`${MOUNT}/stale`);
+    backend.writeMeta("/stale", {
+      size: 9,
+      mode: 0o100666,
+      ctime: Date.now(),
+      mtime: Date.now(),
+    });
+    backend.writePage("/stale", 0, new Uint8Array(8192));
+
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+
+    // Stale file cleaned up
+    expect(backend.readMeta("/stale")).toBeNull();
+    expect(backend.readPage("/stale", 0)).toBeNull();
+
+    // Current file untouched
+    expect(backend.readMeta("/current")).not.toBeNull();
+    expect(backend.readPage("/current", 0)).not.toBeNull();
+
+    // No deleteFile call for /current
+    const currentDeletes = backend.operations.filter(
+      (o) => o.op === "deleteFile" && o.path === "/current",
+    );
+    expect(currentDeletes.length).toBe(0);
+
+    // Data integrity
+    s = FS.open(`${MOUNT}/current`, O.RDONLY);
+    const buf = new Uint8Array(20);
+    const n = FS.read(s, buf, 0, 20);
+    FS.close(s);
+    expect(decode(buf, n)).toBe("live data");
 
     FS.unmount(MOUNT);
   });
