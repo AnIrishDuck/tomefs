@@ -30,7 +30,7 @@
 import type { StorageBackend } from "./storage-backend.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
 import type { FileMeta } from "./types.js";
-import { pageKeyStr } from "./types.js";
+import { PAGE_SIZE, pageKeyStr } from "./types.js";
 
 export class PreloadBackend implements SyncStorageBackend {
   private readonly remote: StorageBackend;
@@ -74,7 +74,7 @@ export class PreloadBackend implements SyncStorageBackend {
       const m = this.meta.get(path);
       if (!m || m.size === 0) continue;
 
-      const pageCount = Math.ceil(m.size / 8192); // PAGE_SIZE
+      const pageCount = Math.ceil(m.size / PAGE_SIZE);
       const indices = Array.from({ length: pageCount }, (_, i) => i);
       const pages = await this.remote.readPages(path, indices);
       for (let i = 0; i < pages.length; i++) {
