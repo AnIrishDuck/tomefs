@@ -269,6 +269,18 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.RENAME_FILE: {
+        await this.backend.renameFile(
+          params.oldPath as string,
+          params.newPath as string,
+        );
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          ok: true,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       case OpCode.LIST_FILES: {
         const files = await this.backend.listFiles();
         const respLen = encodeMessage(this.dataView, this.uint8View, { files });

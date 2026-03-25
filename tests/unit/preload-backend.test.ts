@@ -253,6 +253,33 @@ describe("PreloadBackend", () => {
     });
   });
 
+  describe("renameFile", () => {
+    it("moves pages from old path to new path in memory", async () => {
+      await remote.writePage("/old", 0, (() => { const d = new Uint8Array(PAGE_SIZE); d[0] = 0xaa; return d; })());
+      await remote.writeMeta("/old", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      backend.renameFile("/old", "/new");
+
+      expect(backend.readPage("/old", 0)).toBeNull();
+      expect(backend.readPage("/new", 0)![0]).toBe(0xaa);
+    });
+
+    it("flush after renameFile deletes old and writes new to remote", async () => {
+      await remote.writePage("/old", 0, (() => { const d = new Uint8Array(PAGE_SIZE); d[0] = 0xbb; return d; })());
+      await remote.writeMeta("/old", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      backend.renameFile("/old", "/new");
+      await backend.flush();
+
+      expect(await remote.readPage("/old", 0)).toBeNull();
+      expect((await remote.readPage("/new", 0))![0]).toBe(0xbb);
+    });
+  });
+
   describe("flush", () => {
     it("@fast writes dirty pages to remote", async () => {
       const backend = new PreloadBackend(remote);

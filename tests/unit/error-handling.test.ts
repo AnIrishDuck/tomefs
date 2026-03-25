@@ -22,6 +22,7 @@ class FailingSyncBackend implements SyncStorageBackend {
   private inner = new SyncMemoryBackend();
   writePageFails = false;
   writePagesFails = false;
+  renameFileFails = false;
   writeFailCount = 0;
 
   readPage(path: string, pageIndex: number): Uint8Array | null {
@@ -56,6 +57,14 @@ class FailingSyncBackend implements SyncStorageBackend {
 
   deletePagesFrom(path: string, fromPageIndex: number): void {
     this.inner.deletePagesFrom(path, fromPageIndex);
+  }
+
+  renameFile(oldPath: string, newPath: string): void {
+    if (this.renameFileFails) {
+      this.writeFailCount++;
+      throw new Error("injected renameFile failure");
+    }
+    this.inner.renameFile(oldPath, newPath);
   }
 
   readMeta(path: string): FileMeta | null {
@@ -114,6 +123,10 @@ class FailingAsyncBackend implements StorageBackend {
 
   async deleteFile(path: string): Promise<void> {
     return this.inner.deleteFile(path);
+  }
+
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    return this.inner.renameFile(oldPath, newPath);
   }
 
   async deletePagesFrom(
@@ -189,8 +202,8 @@ describe("SyncPageCache error handling", () => {
     });
   });
 
-  describe("renameFile write-before-delete ordering", () => {
-    it("preserves old data in backend if writePages fails during rename", () => {
+  describe("renameFile error handling", () => {
+    it("preserves old data in backend if renameFile fails", () => {
       const backend = new FailingSyncBackend();
       const cache = new SyncPageCache(backend, 4);
 
@@ -198,14 +211,14 @@ describe("SyncPageCache error handling", () => {
       cache.write("/old", new Uint8Array([1, 2, 3]), 0, 3, 0, 0);
       cache.flushFile("/old");
 
-      // Make writePages fail
-      backend.writePagesFails = true;
+      // Make renameFile fail
+      backend.renameFileFails = true;
 
       expect(() => cache.renameFile("/old", "/new")).toThrow(
-        "injected writePages failure",
+        "injected renameFile failure",
       );
 
-      // Old data should still be in the backend (write-before-delete)
+      // Old data should still be in the backend (rename failed, no delete)
       const stored = backend.readPage("/old", 0);
       expect(stored).not.toBeNull();
       expect(stored![0]).toBe(1);

@@ -3,3 +3,4 @@ dist/
 emsdk/
 *.tsbuildinfo
 *.bundle.mjs
+.claude/

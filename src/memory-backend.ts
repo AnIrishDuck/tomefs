@@ -68,6 +68,21 @@ export class MemoryBackend implements StorageBackend {
     }
   }
 
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    const prefix = `${oldPath}\0`;
+    const toAdd: Array<[string, Uint8Array]> = [];
+    for (const [key, data] of this.pages.entries()) {
+      if (key.startsWith(prefix)) {
+        const pageIndex = key.slice(prefix.length);
+        toAdd.push([`${newPath}\0${pageIndex}`, data]);
+        this.pages.delete(key);
+      }
+    }
+    for (const [key, data] of toAdd) {
+      this.pages.set(key, data);
+    }
+  }
+
   async readMeta(path: string): Promise<FileMeta | null> {
     const meta = this.meta.get(path);
     return meta ? { ...meta } : null;

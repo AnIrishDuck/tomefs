@@ -375,10 +375,17 @@ export class SyncPageCache {
 
   /**
    * Rename a file's pages: flush, move in backend, update cache keys.
+   *
+   * Delegates to the backend's renameFile for an atomic re-key of all pages.
+   * Through the SAB bridge, this is a single round-trip instead of O(pages)
+   * individual readPage calls.
    */
   renameFile(oldPath: string, newPath: string): void {
-    // Flush dirty pages for old path so backend has the latest data
+    // Flush dirty pages so backend has the latest data before re-keying
     this.flushFile(oldPath);
+
+    // Re-key all pages in the backend atomically
+    this.backend.renameFile(oldPath, newPath);
 
     // Collect all cached pages for old path via filePages index
     const oldKeys = this.filePages.get(oldPath);
@@ -392,49 +399,6 @@ export class SyncPageCache {
       }
       this.filePages.delete(oldPath);
     }
-
-    // Build the complete set of pages to write under the new path.
-    // Read from backend first, then overlay any cached pages (which may
-    // be newer than what was just flushed if flush was a no-op).
-    const newPages: Array<{
-      path: string;
-      pageIndex: number;
-      data: Uint8Array;
-    }> = [];
-
-    for (let i = 0; ; i++) {
-      const data = this.backend.readPage(oldPath, i);
-      if (!data) break;
-      newPages.push({ path: newPath, pageIndex: i, data });
-    }
-
-    for (const page of toMove) {
-      const existing = newPages.findIndex(
-        (p) => p.pageIndex === page.pageIndex,
-      );
-      if (existing >= 0) {
-        newPages[existing] = {
-          path: newPath,
-          pageIndex: page.pageIndex,
-          data: page.data,
-        };
-      } else {
-        newPages.push({
-          path: newPath,
-          pageIndex: page.pageIndex,
-          data: page.data,
-        });
-      }
-    }
-
-    // Write new path BEFORE deleting old path. If write fails, old data
-    // is still intact in the backend — no data loss on partial failure.
-    if (newPages.length > 0) {
-      this.backend.writePages(newPages);
-    }
-    this.backend.deleteFile(oldPath);
-
-    // Re-insert cached pages under new path
     for (const page of toMove) {
       page.path = newPath;
       const newKey = pageKeyStr(newPath, page.pageIndex);

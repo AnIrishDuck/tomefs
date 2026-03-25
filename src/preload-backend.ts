@@ -139,6 +139,34 @@ export class PreloadBackend implements SyncStorageBackend {
     this.truncations.delete(path);
   }
 
+  renameFile(oldPath: string, newPath: string): void {
+    this.assertInitialized();
+    const oldPrefix = `${oldPath}\0`;
+    const toAdd: Array<[string, Uint8Array]> = [];
+    for (const [key, data] of this.pages.entries()) {
+      if (key.startsWith(oldPrefix)) {
+        const pageIndex = key.slice(oldPrefix.length);
+        const newKey = `${newPath}\0${pageIndex}`;
+        toAdd.push([newKey, data]);
+        // Transfer dirty tracking to new key
+        if (this.dirtyPages.has(key)) {
+          this.dirtyPages.delete(key);
+          this.dirtyPages.add(newKey);
+        }
+        this.pages.delete(key);
+      }
+    }
+    for (const [key, data] of toAdd) {
+      this.pages.set(key, data);
+    }
+    // Track as: delete old file + dirty-write all new pages
+    this.deletedFiles.add(oldPath);
+    this.truncations.delete(oldPath);
+    for (const [key] of toAdd) {
+      this.dirtyPages.add(key);
+    }
+  }
+
   deletePagesFrom(path: string, fromPageIndex: number): void {
     this.assertInitialized();
     const prefix = `${path}\0`;

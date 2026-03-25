@@ -211,6 +211,30 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    const db = await this.getDb();
+
+    // Single transaction: cursor over old pages, write under new key, delete old.
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const store = tx.objectStore(PAGES_STORE);
+      const range = IDBKeyRange.bound([oldPath, 0], [oldPath, ""], false, true);
+      const request = store.openCursor(range);
+
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return; // iteration complete, tx will auto-commit
+        const [, pageIndex] = cursor.key as [string, number];
+        store.put(cursor.value, this.pageKey(newPath, pageIndex));
+        cursor.delete();
+        cursor.continue();
+      };
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async readMeta(path: string): Promise<FileMeta | null> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {

@@ -31,6 +31,9 @@ export interface StorageBackend {
   /** Delete pages beyond a given index (for truncation). */
   deletePagesFrom(path: string, fromPageIndex: number): Promise<void>;
 
+  /** Rename all pages from one path to another. */
+  renameFile(oldPath: string, newPath: string): Promise<void>;
+
   /** Read file metadata. Returns null if the file doesn't exist. */
   readMeta(path: string): Promise<FileMeta | null>;
 
