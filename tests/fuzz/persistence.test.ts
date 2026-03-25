@@ -2,9 +2,9 @@
  * Randomized persistence fuzz tests for tomefs.
  *
  * Exercises syncfs → remount cycles within random operation sequences.
- * After a syncfs+remount, all file data and directory structure must
- * survive exactly. This targets the class of bugs found in PRs #31
- * (dir rename persistence) and #32 (syncfs crash safety).
+ * After a syncfs+remount, all file data, directory structure, and
+ * symlinks must survive exactly. This targets the class of bugs found
+ * in PRs #31 (dir rename persistence) and #32 (syncfs crash safety).
  *
  * Each test generates a random sequence of file operations interleaved
  * with "checkpoint" operations that:
@@ -75,10 +75,12 @@ interface FileState {
 interface Model {
   files: Map<string, FileState>;
   dirs: Set<string>;
+  /** Symlinks: path → target string. */
+  symlinks: Map<string, string>;
 }
 
 function newModel(): Model {
-  return { files: new Map(), dirs: new Set(["/"]) };
+  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map() };
 }
 
 function filesInDir(model: Model, dir: string): string[] {
@@ -97,8 +99,18 @@ function dirsInDir(model: Model, dir: string): string[] {
   });
 }
 
+function symlinksInDir(model: Model, dir: string): string[] {
+  const prefix = dir === "/" ? "/" : dir + "/";
+  return [...model.symlinks.keys()].filter((p) => {
+    if (!p.startsWith(prefix)) return false;
+    return !p.slice(prefix.length).includes("/");
+  });
+}
+
 function isDirEmpty(model: Model, dir: string): boolean {
-  return filesInDir(model, dir).length === 0 && dirsInDir(model, dir).length === 0;
+  return filesInDir(model, dir).length === 0 &&
+    dirsInDir(model, dir).length === 0 &&
+    symlinksInDir(model, dir).length === 0;
 }
 
 // ---------------------------------------------------------------
@@ -114,15 +126,19 @@ type Op =
   | { type: "mkdir"; path: string }
   | { type: "rmdir"; path: string }
   | { type: "renameDir"; oldPath: string; newPath: string }
+  | { type: "symlink"; target: string; path: string }
+  | { type: "unlinkSymlink"; path: string }
   | { type: "checkpoint" };
 
 const DIR_NAMES = ["aa", "bb", "cc"];
 const FILE_NAMES = ["x.dat", "y.dat", "z.dat", "w.dat"];
+const LINK_NAMES = ["lnk1", "lnk2", "lnk3"];
 
 function generateOp(rng: Rng, model: Model): Op {
   const allFiles = [...model.files.keys()];
   const allDirs = [...model.dirs].filter((d) => d !== "/");
   const allContainerDirs = [...model.dirs];
+  const allSymlinks = [...model.symlinks.keys()];
 
   const weights: Array<[string, number]> = [
     ["createFile", 20],
@@ -133,6 +149,8 @@ function generateOp(rng: Rng, model: Model): Op {
     ["unlink", allFiles.length > 0 ? 6 : 0],
     ["rmdir", allDirs.filter((d) => isDirEmpty(model, d)).length > 0 ? 4 : 0],
     ["renameDir", allDirs.length > 0 ? 6 : 0],
+    ["symlink", allFiles.length > 0 ? 8 : 0],
+    ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
     ["checkpoint", 8], // ~8% chance of checkpoint
   ];
 
@@ -204,6 +222,18 @@ function generateOp(rng: Rng, model: Model): Op {
       return { type: "renameDir", oldPath, newPath };
     }
 
+    case "symlink": {
+      const dir = rng.pick(allContainerDirs);
+      const name = rng.pick(LINK_NAMES);
+      const path = dir === "/" ? `/${name}` : `${dir}/${name}`;
+      // Point at a random existing file (use its full path as target)
+      const target = rng.pick(allFiles);
+      return { type: "symlink", target, path };
+    }
+
+    case "unlinkSymlink":
+      return { type: "unlinkSymlink", path: rng.pick(allSymlinks) };
+
     case "checkpoint":
     default:
       return { type: "checkpoint" };
@@ -220,6 +250,8 @@ function formatOp(op: Op, index: number): string {
     case "unlink": return `[${index}] unlink(${op.path})`;
     case "mkdir": return `[${index}] mkdir(${op.path})`;
     case "rmdir": return `[${index}] rmdir(${op.path})`;
+    case "symlink": return `[${index}] symlink(${op.target} -> ${op.path})`;
+    case "unlinkSymlink": return `[${index}] unlinkSymlink(${op.path})`;
     case "checkpoint": return `[${index}] CHECKPOINT`;
   }
 }
@@ -285,9 +317,21 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
           model.dirs.add(op.newPath + dir.slice(op.oldPath.length));
         }
       }
+      for (const [path, target] of [...model.symlinks]) {
+        if (path.startsWith(oldPrefix)) {
+          model.symlinks.delete(path);
+          model.symlinks.set(op.newPath + path.slice(op.oldPath.length), target);
+        }
+      }
       if (!model.dirs.has(op.newPath)) model.dirs.add(op.newPath);
       break;
     }
+    case "symlink":
+      model.symlinks.set(op.path, op.target);
+      break;
+    case "unlinkSymlink":
+      model.symlinks.delete(op.path);
+      break;
   }
 }
 
@@ -403,6 +447,10 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
       case "renameDir":
         FS.rename(op.oldPath, op.newPath);
         return true;
+      case "symlink":
+        FS.symlink(op.target, op.path);
+        return true;
+      case "unlinkSymlink":
       case "unlink":
         FS.unlink(op.path);
         return true;
@@ -464,6 +512,19 @@ function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
     } catch (e: any) {
       throw new Error(`${context}: directory ${dir} should exist but stat failed: ${e.message}`);
     }
+  }
+
+  // Verify symlinks survive persistence
+  for (const [path, target] of model.symlinks) {
+    let linkTarget: string;
+    try {
+      const stat = FS.lstat(path);
+      expect(FS.isLink(stat.mode), `${context}: ${path} should be a symlink`).toBe(true);
+      linkTarget = FS.readlink(path);
+    } catch (e: any) {
+      throw new Error(`${context}: symlink ${path} should exist but failed: ${e.message}`);
+    }
+    expect(linkTarget, `${context}: symlink ${path} target mismatch`).toBe(target);
   }
 }
 
