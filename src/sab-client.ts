@@ -34,17 +34,24 @@ import {
  *
  * Can be passed directly as the `backend` option to `createTomeFS`.
  */
+export interface SabClientOptions {
+  /** Timeout in milliseconds for each SAB bridge call. 0 = no timeout (default). */
+  timeout?: number;
+}
+
 export class SabClient implements SyncStorageBackend {
   private readonly sab: SharedArrayBuffer;
   private readonly controlView: Int32Array;
   private readonly dataView: DataView;
   private readonly uint8View: Uint8Array;
+  private readonly timeout: number;
 
-  constructor(sab: SharedArrayBuffer) {
+  constructor(sab: SharedArrayBuffer, options?: SabClientOptions) {
     this.sab = sab;
     this.controlView = new Int32Array(sab, 0, 3);
     this.dataView = new DataView(sab);
     this.uint8View = new Uint8Array(sab);
+    this.timeout = options?.timeout ?? 0;
   }
 
   /** Create a SharedArrayBuffer for use with this client and a SabWorker. */
@@ -129,9 +136,22 @@ export class SabClient implements SyncStorageBackend {
     Atomics.notify(this.controlView, SLOT_STATUS);
 
     // Block until response arrives
+    const waitTimeout = this.timeout > 0 ? this.timeout : undefined;
     let status: number;
     do {
-      Atomics.wait(this.controlView, SLOT_STATUS, STATUS_REQUEST);
+      const result = Atomics.wait(
+        this.controlView,
+        SLOT_STATUS,
+        STATUS_REQUEST,
+        waitTimeout,
+      );
+      if (result === "timed-out") {
+        // Reset to idle so the bridge can recover
+        Atomics.store(this.controlView, SLOT_STATUS, STATUS_IDLE);
+        throw new Error(
+          `SAB bridge timeout: storage worker did not respond within ${this.timeout}ms`,
+        );
+      }
       status = Atomics.load(this.controlView, SLOT_STATUS);
     } while (status === STATUS_REQUEST);
 
