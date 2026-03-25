@@ -1,0 +1,514 @@
+/**
+ * OpfsBackend tests — exercises the StorageBackend interface over OPFS.
+ *
+ * Uses a fake OPFS implementation (tests/harness/fake-opfs.ts) to provide
+ * the FileSystemDirectoryHandle API in Node.js. This is a fake (not a mock)
+ * per project conventions.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { OpfsBackend } from "../../src/opfs-backend.js";
+import { PAGE_SIZE } from "../../src/types.js";
+import { createFakeOpfsRoot } from "../harness/fake-opfs.js";
+
+/** Create a page filled with a repeating byte value. */
+function filledPage(value: number): Uint8Array {
+  const page = new Uint8Array(PAGE_SIZE);
+  page.fill(value);
+  return page;
+}
+
+/** Create a small buffer with sequential byte values. */
+function testData(length: number, start = 0): Uint8Array {
+  const buf = new Uint8Array(length);
+  for (let i = 0; i < length; i++) {
+    buf[i] = (start + i) & 0xff;
+  }
+  return buf;
+}
+
+describe("OpfsBackend", () => {
+  let backend: OpfsBackend;
+
+  beforeEach(() => {
+    const root = createFakeOpfsRoot();
+    backend = new OpfsBackend({ root: root as any });
+  });
+
+  afterEach(async () => {
+    await backend.destroy();
+  });
+
+  // -------------------------------------------------------------------
+  // Page read/write
+  // -------------------------------------------------------------------
+
+  describe("page operations", () => {
+    it("readPage returns null for non-existent page @fast", async () => {
+      const result = await backend.readPage("/test", 0);
+      expect(result).toBeNull();
+    });
+
+    it("writePage then readPage round-trips data", async () => {
+      const data = filledPage(0xab);
+      await backend.writePage("/file1", 0, data);
+
+      const result = await backend.readPage("/file1", 0);
+      expect(result).toEqual(data);
+    });
+
+    it("writePage stores a copy, not a reference", async () => {
+      const data = filledPage(0x01);
+      await backend.writePage("/file1", 0, data);
+
+      // Mutate original
+      data.fill(0xff);
+
+      const result = await backend.readPage("/file1", 0);
+      expect(result![0]).toBe(0x01);
+    });
+
+    it("readPage returns a copy, not a reference", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x42));
+
+      const a = await backend.readPage("/file1", 0);
+      const b = await backend.readPage("/file1", 0);
+      a![0] = 0xff;
+
+      expect(b![0]).toBe(0x42);
+    });
+
+    it("handles multiple pages for the same file", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file1", 1, filledPage(0x02));
+      await backend.writePage("/file1", 2, filledPage(0x03));
+
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/file1", 1)).toEqual(filledPage(0x02));
+      expect(await backend.readPage("/file1", 2)).toEqual(filledPage(0x03));
+    });
+
+    it("handles pages for different files independently", async () => {
+      await backend.writePage("/a", 0, filledPage(0xaa));
+      await backend.writePage("/b", 0, filledPage(0xbb));
+
+      expect(await backend.readPage("/a", 0)).toEqual(filledPage(0xaa));
+      expect(await backend.readPage("/b", 0)).toEqual(filledPage(0xbb));
+    });
+
+    it("overwrites existing page data", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file1", 0, filledPage(0x02));
+
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0x02));
+    });
+
+    it("handles sub-page-size data", async () => {
+      const small = testData(100);
+      await backend.writePage("/file1", 0, small);
+
+      const result = await backend.readPage("/file1", 0);
+      expect(result).toEqual(small);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Batch writes
+  // -------------------------------------------------------------------
+
+  describe("writePages (batch)", () => {
+    it("writes zero pages without error", async () => {
+      await backend.writePages([]);
+    });
+
+    it("writes multiple pages", async () => {
+      await backend.writePages([
+        { path: "/file1", pageIndex: 0, data: filledPage(0x01) },
+        { path: "/file1", pageIndex: 1, data: filledPage(0x02) },
+        { path: "/file2", pageIndex: 0, data: filledPage(0x03) },
+      ]);
+
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/file1", 1)).toEqual(filledPage(0x02));
+      expect(await backend.readPage("/file2", 0)).toEqual(filledPage(0x03));
+    });
+
+    it("batch overwrite replaces existing pages", async () => {
+      await backend.writePage("/file1", 0, filledPage(0xaa));
+
+      await backend.writePages([
+        { path: "/file1", pageIndex: 0, data: filledPage(0xbb) },
+      ]);
+
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0xbb));
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Delete operations
+  // -------------------------------------------------------------------
+
+  describe("deleteFile", () => {
+    it("deletes all pages for a file", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file1", 1, filledPage(0x02));
+      await backend.writePage("/file1", 2, filledPage(0x03));
+
+      await backend.deleteFile("/file1");
+
+      expect(await backend.readPage("/file1", 0)).toBeNull();
+      expect(await backend.readPage("/file1", 1)).toBeNull();
+      expect(await backend.readPage("/file1", 2)).toBeNull();
+    });
+
+    it("does not affect other files", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file2", 0, filledPage(0x02));
+
+      await backend.deleteFile("/file1");
+
+      expect(await backend.readPage("/file1", 0)).toBeNull();
+      expect(await backend.readPage("/file2", 0)).toEqual(filledPage(0x02));
+    });
+
+    it("deleting non-existent file is a no-op", async () => {
+      await backend.deleteFile("/nonexistent");
+      // No error thrown
+    });
+
+    it("does not delete file with prefix match", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file10", 0, filledPage(0x10));
+
+      await backend.deleteFile("/file1");
+
+      expect(await backend.readPage("/file1", 0)).toBeNull();
+      expect(await backend.readPage("/file10", 0)).toEqual(filledPage(0x10));
+    });
+  });
+
+  describe("deletePagesFrom", () => {
+    it("deletes pages at and beyond the given index", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file1", 1, filledPage(0x02));
+      await backend.writePage("/file1", 2, filledPage(0x03));
+      await backend.writePage("/file1", 3, filledPage(0x04));
+
+      await backend.deletePagesFrom("/file1", 2);
+
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/file1", 1)).toEqual(filledPage(0x02));
+      expect(await backend.readPage("/file1", 2)).toBeNull();
+      expect(await backend.readPage("/file1", 3)).toBeNull();
+    });
+
+    it("deletePagesFrom(0) deletes all pages", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file1", 1, filledPage(0x02));
+
+      await backend.deletePagesFrom("/file1", 0);
+
+      expect(await backend.readPage("/file1", 0)).toBeNull();
+      expect(await backend.readPage("/file1", 1)).toBeNull();
+    });
+
+    it("does not affect other files", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writePage("/file1", 1, filledPage(0x02));
+      await backend.writePage("/file2", 0, filledPage(0xaa));
+
+      await backend.deletePagesFrom("/file1", 1);
+
+      expect(await backend.readPage("/file2", 0)).toEqual(filledPage(0xaa));
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Metadata operations
+  // -------------------------------------------------------------------
+
+  describe("metadata", () => {
+    const meta = { size: 8192, mode: 0o100644, ctime: 1000, mtime: 2000 };
+
+    it("readMeta returns null for non-existent file @fast", async () => {
+      const result = await backend.readMeta("/test");
+      expect(result).toBeNull();
+    });
+
+    it("writeMeta then readMeta round-trips", async () => {
+      await backend.writeMeta("/file1", meta);
+      const result = await backend.readMeta("/file1");
+      expect(result).toEqual(meta);
+    });
+
+    it("writeMeta stores a copy", async () => {
+      const m = { ...meta };
+      await backend.writeMeta("/file1", m);
+      m.size = 99999;
+
+      const result = await backend.readMeta("/file1");
+      expect(result!.size).toBe(8192);
+    });
+
+    it("overwrites existing metadata", async () => {
+      await backend.writeMeta("/file1", meta);
+      const updated = { ...meta, size: 16384, mtime: 3000 };
+      await backend.writeMeta("/file1", updated);
+
+      const result = await backend.readMeta("/file1");
+      expect(result).toEqual(updated);
+    });
+
+    it("deleteMeta removes metadata", async () => {
+      await backend.writeMeta("/file1", meta);
+      await backend.deleteMeta("/file1");
+
+      expect(await backend.readMeta("/file1")).toBeNull();
+    });
+
+    it("deleteMeta on non-existent file is a no-op", async () => {
+      await backend.deleteMeta("/nonexistent");
+    });
+
+    it("metadata and pages are independent", async () => {
+      await backend.writeMeta("/file1", meta);
+      await backend.writePage("/file1", 0, filledPage(0x42));
+
+      await backend.deleteMeta("/file1");
+
+      // Pages still exist after meta deletion
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0x42));
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // listFiles
+  // -------------------------------------------------------------------
+
+  describe("listFiles", () => {
+    it("returns empty array when no files exist @fast", async () => {
+      const files = await backend.listFiles();
+      expect(files).toEqual([]);
+    });
+
+    it("returns paths of files with metadata", async () => {
+      await backend.writeMeta("/a", {
+        size: 0,
+        mode: 0o100644,
+        ctime: 0,
+        mtime: 0,
+      });
+      await backend.writeMeta("/b", {
+        size: 0,
+        mode: 0o100644,
+        ctime: 0,
+        mtime: 0,
+      });
+
+      const files = await backend.listFiles();
+      expect(files.sort()).toEqual(["/a", "/b"]);
+    });
+
+    it("does not include files that only have pages (no meta)", async () => {
+      await backend.writePage("/orphan", 0, filledPage(0x01));
+
+      const files = await backend.listFiles();
+      expect(files).toEqual([]);
+    });
+
+    it("reflects deletions", async () => {
+      await backend.writeMeta("/a", {
+        size: 0,
+        mode: 0o100644,
+        ctime: 0,
+        mtime: 0,
+      });
+      await backend.writeMeta("/b", {
+        size: 0,
+        mode: 0o100644,
+        ctime: 0,
+        mtime: 0,
+      });
+      await backend.deleteMeta("/a");
+
+      const files = await backend.listFiles();
+      expect(files).toEqual(["/b"]);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Integration: PageCache + OpfsBackend
+  // -------------------------------------------------------------------
+
+  describe("integration with PageCache", () => {
+    it("PageCache reads and writes through OpfsBackend", async () => {
+      const { PageCache } = await import("../../src/page-cache.js");
+
+      const cache = new PageCache(backend, 4);
+
+      // Write through cache
+      const data = new TextEncoder().encode("Hello, OPFS!");
+      await cache.write("/test", data, 0, data.length, 0, 0);
+
+      // Flush to OPFS
+      await cache.flushFile("/test");
+
+      // Verify data reached OPFS
+      const page = await backend.readPage("/test", 0);
+      expect(page).not.toBeNull();
+      expect(new TextDecoder().decode(page!.subarray(0, data.length))).toBe(
+        "Hello, OPFS!",
+      );
+    });
+
+    it("PageCache survives eviction with OpfsBackend", async () => {
+      const { PageCache } = await import("../../src/page-cache.js");
+
+      // Very small cache — forces eviction
+      const cache = new PageCache(backend, 2);
+
+      // Write 4 pages (2 will be evicted)
+      for (let i = 0; i < 4; i++) {
+        const page = filledPage(i + 1);
+        await cache.write(
+          "/bigfile",
+          page,
+          0,
+          PAGE_SIZE,
+          i * PAGE_SIZE,
+          i * PAGE_SIZE,
+        );
+      }
+
+      // Read all pages back — evicted ones should come from OPFS
+      for (let i = 0; i < 4; i++) {
+        const buf = new Uint8Array(PAGE_SIZE);
+        await cache.read(
+          "/bigfile",
+          buf,
+          0,
+          PAGE_SIZE,
+          i * PAGE_SIZE,
+          4 * PAGE_SIZE,
+        );
+        expect(buf[0]).toBe(i + 1);
+        expect(buf[PAGE_SIZE - 1]).toBe(i + 1);
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------
+
+  describe("lifecycle", () => {
+    it("destroy removes all data", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writeMeta("/file1", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+
+      await backend.destroy();
+
+      // Create a new backend on the same root — data should be gone
+      const root = createFakeOpfsRoot();
+      const backend2 = new OpfsBackend({ root: root as any });
+      expect(await backend2.readPage("/file1", 0)).toBeNull();
+      expect(await backend2.readMeta("/file1")).toBeNull();
+      await backend2.destroy();
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Edge cases
+  // -------------------------------------------------------------------
+
+  describe("edge cases", () => {
+    it("handles paths with special characters", async () => {
+      const path = "/base/16384/12345";
+      await backend.writePage(path, 0, filledPage(0xcc));
+      expect(await backend.readPage(path, 0)).toEqual(filledPage(0xcc));
+    });
+
+    it("handles high page indices", async () => {
+      await backend.writePage("/file1", 10000, filledPage(0xdd));
+      expect(await backend.readPage("/file1", 10000)).toEqual(
+        filledPage(0xdd),
+      );
+    });
+
+    it("handles empty page (all zeros)", async () => {
+      const empty = new Uint8Array(PAGE_SIZE);
+      await backend.writePage("/file1", 0, empty);
+
+      const result = await backend.readPage("/file1", 0);
+      expect(result).toEqual(empty);
+    });
+
+    it("concurrent writes to different files do not interfere", async () => {
+      const writes = Array.from({ length: 10 }, (_, i) =>
+        backend.writePage(`/file${i}`, 0, filledPage(i)),
+      );
+      await Promise.all(writes);
+
+      for (let i = 0; i < 10; i++) {
+        const page = await backend.readPage(`/file${i}`, 0);
+        expect(page).toEqual(filledPage(i));
+      }
+    });
+
+    it("deleteFile with many pages only deletes the target file", async () => {
+      // Write 20 pages across two files with overlapping page indices
+      for (let i = 0; i < 10; i++) {
+        await backend.writePage("/target", i, filledPage(i));
+        await backend.writePage("/keep", i, filledPage(0xff - i));
+      }
+
+      await backend.deleteFile("/target");
+
+      // All target pages gone
+      for (let i = 0; i < 10; i++) {
+        expect(await backend.readPage("/target", i)).toBeNull();
+      }
+      // All kept pages intact
+      for (let i = 0; i < 10; i++) {
+        expect(await backend.readPage("/keep", i)).toEqual(
+          filledPage(0xff - i),
+        );
+      }
+    });
+
+    it("deletePagesFrom preserves pages below the threshold", async () => {
+      for (let i = 0; i < 10; i++) {
+        await backend.writePage("/file", i, filledPage(i));
+      }
+
+      await backend.deletePagesFrom("/file", 5);
+
+      // Pages 0-4 survive
+      for (let i = 0; i < 5; i++) {
+        expect(await backend.readPage("/file", i)).toEqual(filledPage(i));
+      }
+      // Pages 5-9 deleted
+      for (let i = 5; i < 10; i++) {
+        expect(await backend.readPage("/file", i)).toBeNull();
+      }
+    });
+
+    it("metadata preserves optional fields", async () => {
+      const meta = {
+        size: 100,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+        atime: 3000,
+        link: "/symlink/target",
+      };
+      await backend.writeMeta("/file1", meta);
+      expect(await backend.readMeta("/file1")).toEqual(meta);
+    });
+  });
+});

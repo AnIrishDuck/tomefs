@@ -49,7 +49,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 - **Dirty tracking**: Only modified pages are written back to storage
 - **Batch flush**: All dirty pages for a file (or globally) can be flushed in a single operation
 - **Page-aligned I/O**: 8 KB pages match Postgres internals, eliminating partial-page overhead
-- **Pluggable backends**: `StorageBackend` interface allows swapping storage (memory for testing, IDB for production, OPFS for future)
+- **Pluggable backends**: `StorageBackend` interface allows swapping storage (memory for testing, IDB or OPFS for production)
 
 ## Status
 
@@ -70,7 +70,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 | 3.5 | Adversarial differential testing | Done |
 | 3.6 | Full-stack integration tests (tomefs + SAB + backend) | Done |
 | 4 | PGlite integration + migration from IDBFS | Done |
-| 5 | OPFS backend (alternative to IDB) | Future |
+| 5 | OPFS backend (alternative to IDB) | Done |
 
 ## License
 
