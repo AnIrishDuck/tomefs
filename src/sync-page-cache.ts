@@ -20,6 +20,9 @@ export class SyncPageCache {
   /** Cache entries keyed by pageKeyStr. Insertion order = LRU order (oldest first). */
   private cache = new Map<string, CachedPage>();
 
+  /** Key of the most-recently-used page (last entry in Map). Skip LRU touch if hit. */
+  private mruKey: string | null = null;
+
   constructor(
     backend: SyncStorageBackend,
     maxPages: number = DEFAULT_MAX_PAGES,
@@ -50,11 +53,17 @@ export class SyncPageCache {
    */
   getPage(path: string, pageIndex: number): CachedPage {
     const key = pageKeyStr(path, pageIndex);
+    // Fast path: if this is already the MRU page, skip Map reordering
+    if (key === this.mruKey) {
+      return this.cache.get(key)!;
+    }
+
     const existing = this.cache.get(key);
     if (existing) {
       // Move to end (most recently used)
       this.cache.delete(key);
       this.cache.set(key, existing);
+      this.mruKey = key;
       return existing;
     }
 
@@ -69,6 +78,7 @@ export class SyncPageCache {
 
     this.ensureCapacity();
     this.cache.set(key, page);
+    this.mruKey = key;
     return page;
   }
 
@@ -234,6 +244,7 @@ export class SyncPageCache {
     for (const key of this.cache.keys()) {
       if (key.startsWith(prefix)) {
         this.cache.delete(key);
+        if (key === this.mruKey) this.mruKey = null;
       }
     }
   }
@@ -248,6 +259,7 @@ export class SyncPageCache {
     for (const [key, page] of this.cache.entries()) {
       if (key.startsWith(prefix) && page.pageIndex >= fromPageIndex) {
         this.cache.delete(key);
+        if (key === this.mruKey) this.mruKey = null;
       }
     }
   }
@@ -278,6 +290,7 @@ export class SyncPageCache {
     for (const key of this.cache.keys()) {
       if (key.startsWith(prefix)) {
         this.cache.delete(key);
+        if (key === this.mruKey) this.mruKey = null;
       }
     }
     this.backend.deleteFile(path);
@@ -297,6 +310,7 @@ export class SyncPageCache {
       if (key.startsWith(oldPrefix)) {
         toMove.push(page);
         this.cache.delete(key);
+        if (key === this.mruKey) this.mruKey = null;
       }
     }
 
@@ -387,6 +401,7 @@ export class SyncPageCache {
       }
 
       this.cache.delete(firstKey);
+      if (firstKey === this.mruKey) this.mruKey = null;
     }
   }
 }
