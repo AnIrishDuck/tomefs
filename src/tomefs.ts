@@ -66,6 +66,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   const maxPages = options?.maxPages ?? 4096;
   const pageCache = new SyncPageCache(backend, maxPages);
 
+  /**
+   * Registry of all live tomefs file nodes.
+   *
+   * When PGlite's MemoryFS preloads a database image, Emscripten may
+   * reinitialize its nameTable (hash table) during module startup. This
+   * causes nodes created before the reinitialization to become invisible
+   * to hash-based lookups, even though they remain reachable through
+   * parent.contents chains. Additionally, path resolution can route
+   * through MEMFS parent nodes instead of the tomefs mount tree, creating
+   * "detached" file nodes that have tomefs stream_ops but don't appear
+   * in mount.root's subtree.
+   *
+   * This registry ensures syncfs can find ALL tomefs file nodes regardless
+   * of their position in the Emscripten node graph.
+   */
+  const allFileNodes = new Set<any>();
+
   // ---------------------------------------------------------------
   // Page-cached file I/O
   // ---------------------------------------------------------------
@@ -212,6 +229,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (FS.isFile(new_node.mode)) {
         pageCache.deleteFile(new_node.storagePath);
         backend.deleteMeta(new_node.storagePath);
+        allFileNodes.delete(new_node);
       }
       FS.hashRemoveNode(new_node);
     }
@@ -258,6 +276,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         pageCache.deleteFile(node.storagePath);
         backend.deleteMeta(node.storagePath);
       }
+      allFileNodes.delete(node);
     } else if (node && FS.isLink(node.mode)) {
       const sp = computeStoragePath(parent, name);
       backend.deleteMeta(sp);
@@ -410,6 +429,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // Last fd closed on an unlinked file — clean up pages + metadata
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath);
+          allFileNodes.delete(node);
         } else {
           pageCache.flushFile(node.storagePath);
         }
@@ -460,6 +480,22 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   // ---------------------------------------------------------------
 
   /**
+   * Compute the mount-relative storage path for a node.
+   *
+   * For nodes in the mount root's tree, this walks up to the mount root
+   * (where parent === node). For "detached" nodes parented in MEMFS,
+   * the path walks through the mount point directory; we strip the mount
+   * prefix so storage paths are always mount-relative.
+   */
+  function nodeStoragePath(node: any, mountPrefix: string): string {
+    const full = nodePath(node);
+    if (mountPrefix && full.startsWith(mountPrefix + "/")) {
+      return full.substring(mountPrefix.length);
+    }
+    return full;
+  }
+
+  /**
    * Walk the in-memory node tree and persist all file/directory/symlink
    * metadata to the storage backend. File page data is flushed via the
    * page cache. Call this before unmount to ensure durability.
@@ -468,30 +504,22 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     node: any,
     path: string,
     currentPaths: Set<string>,
-  ): void {
-    if (FS.isFile(node.mode)) {
-      currentPaths.add(path);
-      // Page data is already flushed by flushAll() before persistTree() is called.
-      backend.writeMeta(path, {
-        size: node.usedBytes,
-        mode: node.mode,
-        ctime: node.ctime,
-        mtime: node.mtime,
-        atime: node.atime,
-      });
-    } else if (FS.isLink(node.mode)) {
-      currentPaths.add(path);
-      backend.writeMeta(path, {
-        size: 0,
-        mode: node.mode,
-        ctime: node.ctime,
-        mtime: node.mtime,
-        atime: node.atime,
-        link: node.link,
-      });
-    } else if (FS.isDir(node.mode)) {
-      // Persist directory metadata (skip root — it's recreated on mount)
-      if (path !== "/") {
+  ): Set<any> {
+    const visited = new Set<any>();
+
+    function walk(node: any, path: string): void {
+      visited.add(node);
+      if (FS.isFile(node.mode)) {
+        currentPaths.add(path);
+        // Page data is already flushed by flushAll() before persistTree() is called.
+        backend.writeMeta(path, {
+          size: node.usedBytes,
+          mode: node.mode,
+          ctime: node.ctime,
+          mtime: node.mtime,
+          atime: node.atime,
+        });
+      } else if (FS.isLink(node.mode)) {
         currentPaths.add(path);
         backend.writeMeta(path, {
           size: 0,
@@ -499,14 +527,30 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           ctime: node.ctime,
           mtime: node.mtime,
           atime: node.atime,
+          link: node.link,
         });
-      }
-      // Recurse into children
-      for (const name of Object.keys(node.contents)) {
-        const childPath = path === "/" ? `/${name}` : `${path}/${name}`;
-        persistTree(node.contents[name], childPath, currentPaths);
+      } else if (FS.isDir(node.mode)) {
+        // Persist directory metadata (skip root — it's recreated on mount)
+        if (path !== "/") {
+          currentPaths.add(path);
+          backend.writeMeta(path, {
+            size: 0,
+            mode: node.mode,
+            ctime: node.ctime,
+            mtime: node.mtime,
+            atime: node.atime,
+          });
+        }
+        // Recurse into children
+        for (const name of Object.keys(node.contents)) {
+          const childPath = path === "/" ? `/${name}` : `${path}/${name}`;
+          walk(node.contents[name], childPath);
+        }
       }
     }
+
+    walk(node, path);
+    return visited;
   }
 
   /**
@@ -547,7 +591,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.ctime = meta.ctime;
       } else if (typeMode === S_IFREG) {
         const node = TOMEFS.createNode(parent, name, meta.mode, 0);
-        node.usedBytes = meta.size;
+        // Use metadata size, but verify against actual backend pages.
+        // Pages may extend beyond meta.size if writes occurred after the
+        // last metadata sync (e.g., Postgres shutdown writes during close).
+        let fileSize = meta.size;
+        const storagePath = computeStoragePath(parent, name);
+        const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
+        // Check if a page exists beyond what metadata accounts for
+        const nextPage = backend.readPage(storagePath, pagesFromMeta);
+        if (nextPage) {
+          // Scan forward to find the true extent
+          let maxPage = pagesFromMeta;
+          while (backend.readPage(storagePath, maxPage + 1)) {
+            maxPage++;
+          }
+          fileSize = (maxPage + 1) * PAGE_SIZE;
+        }
+        node.usedBytes = fileSize;
         node.atime = meta.atime ?? meta.mtime;
         node.mtime = meta.mtime;
         node.ctime = meta.ctime;
@@ -606,7 +666,60 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // is already written. Worst case is stale orphan entries that get
           // cleaned up on the next sync — never metadata loss.
           const currentPaths = new Set<string>();
-          persistTree(mount.root, "/", currentPaths);
+          const visited = persistTree(mount.root, "/", currentPaths);
+
+          // Persist "detached" file nodes — nodes created via tomefs's
+          // createNode but parented in MEMFS's directory tree instead of
+          // the tomefs mount root. This happens with PGlite's MemoryFS
+          // preloading, where Emscripten's path resolution routes through
+          // MEMFS parent nodes. These nodes have tomefs stream_ops and
+          // storagePaths, so reads/writes go through the page cache
+          // correctly, but they don't appear in mount.root's subtree.
+          const mountPrefix = mount.mountpoint || "";
+          for (const node of allFileNodes) {
+            if (visited.has(node)) continue;
+            if (node.unlinked) continue;
+            const path = nodeStoragePath(node, mountPrefix);
+            currentPaths.add(path);
+            if (!backend.readMeta(path)) {
+              // flushAll() already flushed dirty pages, but detached nodes
+              // may not have been flushed if their storagePath differs.
+              pageCache.flushFile(node.storagePath);
+              backend.writeMeta(path, {
+                size: node.usedBytes,
+                mode: node.mode,
+                ctime: node.ctime,
+                mtime: node.mtime,
+                atime: node.atime,
+              });
+            }
+          }
+
+          // Also persist parent directories for detached nodes
+          // so restoreTree can recreate the full tree structure.
+          for (const node of allFileNodes) {
+            if (visited.has(node)) continue;
+            if (node.unlinked) continue;
+            // Walk up from node's parent to the mount boundary,
+            // persisting any directories not already in metadata.
+            let dir = node.parent;
+            while (dir && dir.parent && dir.parent !== dir) {
+              const dirPath = nodeStoragePath(dir, mountPrefix);
+              if (backend.readMeta(dirPath)) break; // already persisted
+              currentPaths.add(dirPath);
+              if (FS.isDir(dir.mode)) {
+                backend.writeMeta(dirPath, {
+                  size: 0,
+                  mode: dir.mode,
+                  ctime: dir.ctime,
+                  mtime: dir.mtime,
+                  atime: dir.atime,
+                });
+              }
+              dir = dir.parent;
+            }
+          }
+
           // Delete metadata and orphaned page data for paths no longer in the tree.
           // Page data can become orphaned if the process crashes between an unlink
           // (which deletes pages) and the next syncfs (which updates metadata).
@@ -647,6 +760,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.storagePath = parent
           ? computeStoragePath(parent, name)
           : `/__root_${nextPathId++}`;
+        // Track this file node for persistence
+        allFileNodes.add(node);
       } else if (FS.isLink(node.mode)) {
         node.node_ops = link_node_ops;
         node.stream_ops = {};
