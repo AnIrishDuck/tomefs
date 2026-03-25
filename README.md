@@ -69,7 +69,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 | 3 | SAB+Atomics sync bridge | Done |
 | 3.5 | Adversarial differential testing | Done |
 | 3.6 | Full-stack integration tests (tomefs + SAB + backend) | Done |
-| 4 | PGlite integration + migration from IDBFS | Planned |
+| 4 | PGlite integration + migration from IDBFS | Done |
 | 5 | OPFS backend (alternative to IDB) | Future |
 
 ## License

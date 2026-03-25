@@ -13,6 +13,10 @@
     "./worker": {
       "types": "./dist/worker.d.ts",
       "import": "./dist/worker.js"
+    },
+    "./pglite": {
+      "types": "./dist/pglite.d.ts",
+      "import": "./dist/pglite.js"
     }
   },
   "files": [
@@ -28,6 +32,7 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.4.1",
     "fake-indexeddb": "^6.2.5",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
