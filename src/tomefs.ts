@@ -470,7 +470,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   ): void {
     if (FS.isFile(node.mode)) {
       currentPaths.add(path);
-      pageCache.flushFile(node.storagePath);
+      // Page data is already flushed by flushAll() before persistTree() is called.
       backend.writeMeta(path, {
         size: node.usedBytes,
         mode: node.mode,
@@ -606,9 +606,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // cleaned up on the next sync — never metadata loss.
           const currentPaths = new Set<string>();
           persistTree(mount.root, "/", currentPaths);
-          // Delete metadata for paths no longer in the tree
+          // Delete metadata and orphaned page data for paths no longer in the tree.
+          // Page data can become orphaned if the process crashes between an unlink
+          // (which deletes pages) and the next syncfs (which updates metadata).
+          // On restart, restoreTree recreates the file from stale metadata, but
+          // the pages may already be gone — or they may still exist if the crash
+          // happened before backend.deleteFile completed.  Either way, clean up both.
           for (const path of backend.listFiles()) {
             if (!currentPaths.has(path)) {
+              backend.deleteFile(path);
               backend.deleteMeta(path);
             }
           }

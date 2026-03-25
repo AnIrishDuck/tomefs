@@ -49,6 +49,10 @@ export const SLOT_STATUS = 0;
 export const SLOT_OPCODE = 1;
 export const SLOT_DATA_LEN = 2;
 
+/** Reusable encoder/decoder to avoid allocation on every SAB call. */
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
 /**
  * Encode a request into the shared buffer.
  * Returns the total bytes written to the data region.
@@ -64,7 +68,7 @@ export function encodeMessage(
   binaryChunks?: Uint8Array[],
 ): number {
   const jsonStr = JSON.stringify(json);
-  const jsonBytes = new TextEncoder().encode(jsonStr);
+  const jsonBytes = encoder.encode(jsonStr);
   const jsonLen = jsonBytes.length;
 
   // Calculate total size needed before writing anything
@@ -115,7 +119,7 @@ export function decodeMessage(
     JSON_REGION_OFFSET + 4,
     JSON_REGION_OFFSET + 4 + jsonLen,
   );
-  const json = JSON.parse(new TextDecoder().decode(jsonBytes));
+  const json = JSON.parse(decoder.decode(jsonBytes));
 
   const binaryStart = JSON_REGION_OFFSET + 4 + jsonLen;
   const binaryEnd = JSON_REGION_OFFSET + totalLen;
