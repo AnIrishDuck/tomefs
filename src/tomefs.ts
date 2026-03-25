@@ -463,8 +463,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    * metadata to the storage backend. File page data is flushed via the
    * page cache. Call this before unmount to ensure durability.
    */
-  function persistTree(node: any, path: string): void {
+  function persistTree(
+    node: any,
+    path: string,
+    currentPaths: Set<string>,
+  ): void {
     if (FS.isFile(node.mode)) {
+      currentPaths.add(path);
       pageCache.flushFile(node.storagePath);
       backend.writeMeta(path, {
         size: node.usedBytes,
@@ -474,6 +479,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         atime: node.atime,
       });
     } else if (FS.isLink(node.mode)) {
+      currentPaths.add(path);
       backend.writeMeta(path, {
         size: 0,
         mode: node.mode,
@@ -485,6 +491,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     } else if (FS.isDir(node.mode)) {
       // Persist directory metadata (skip root — it's recreated on mount)
       if (path !== "/") {
+        currentPaths.add(path);
         backend.writeMeta(path, {
           size: 0,
           mode: node.mode,
@@ -496,7 +503,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // Recurse into children
       for (const name of Object.keys(node.contents)) {
         const childPath = path === "/" ? `/${name}` : `${path}/${name}`;
-        persistTree(node.contents[name], childPath);
+        persistTree(node.contents[name], childPath, currentPaths);
       }
     }
   }
@@ -592,11 +599,19 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       try {
         if (!populate) {
           pageCache.flushAll();
-          // Clear existing metadata and re-persist the full tree
+          // Persist the full tree first, then clean up stale entries.
+          // This ordering is critical for crash safety with IDB: if the
+          // process is killed mid-sync (e.g., tab close), current metadata
+          // is already written. Worst case is stale orphan entries that get
+          // cleaned up on the next sync — never metadata loss.
+          const currentPaths = new Set<string>();
+          persistTree(mount.root, "/", currentPaths);
+          // Delete metadata for paths no longer in the tree
           for (const path of backend.listFiles()) {
-            backend.deleteMeta(path);
+            if (!currentPaths.has(path)) {
+              backend.deleteMeta(path);
+            }
           }
-          persistTree(mount.root, "/");
         }
         callback(null);
       } catch (err) {
