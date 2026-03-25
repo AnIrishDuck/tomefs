@@ -10,5 +10,6 @@ export { createTomeFS } from "./tomefs.js";
 export type { TomeFSOptions } from "./tomefs.js";
 export type { CachedPage, FileMeta, PageKey } from "./types.js";
 export { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
+export { PreloadBackend } from "./preload-backend.js";
 export { SabClient } from "./sab-client.js";
 export { SabWorker } from "./sab-worker.js";
