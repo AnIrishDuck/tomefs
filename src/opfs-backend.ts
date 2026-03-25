@@ -172,6 +172,46 @@ export class OpfsBackend implements StorageBackend {
     }
   }
 
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    await this.init();
+    const oldEncoded = encodePath(oldPath);
+    const newEncoded = encodePath(newPath);
+
+    // Remove destination if it already exists (overwrite semantics).
+    try {
+      await this.pagesDir!.removeEntry(newEncoded, { recursive: true });
+    } catch {
+      // Doesn't exist — no-op
+    }
+
+    // Move page files from old directory to new directory.
+    let oldDir: FileSystemDirectoryHandle;
+    try {
+      oldDir = await this.pagesDir!.getDirectoryHandle(oldEncoded);
+    } catch {
+      // Source pages don't exist — nothing to move.
+      return;
+    }
+
+    const newDir = await this.pagesDir!.getDirectoryHandle(newEncoded, {
+      create: true,
+    });
+
+    for await (const name of (oldDir as IterableDirectoryHandle).keys()) {
+      const srcHandle = await oldDir.getFileHandle(name);
+      const file = await srcHandle.getFile();
+      const data = await file.arrayBuffer();
+
+      const dstHandle = await newDir.getFileHandle(name, { create: true });
+      const writable = await dstHandle.createWritable();
+      await writable.write(new Uint8Array(data));
+      await writable.close();
+    }
+
+    // Remove old pages directory.
+    await this.pagesDir!.removeEntry(oldEncoded, { recursive: true });
+  }
+
   async deletePagesFrom(
     path: string,
     fromPageIndex: number,
