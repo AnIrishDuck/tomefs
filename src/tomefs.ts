@@ -231,6 +231,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     } else if (FS.isDir(old_node.mode)) {
       // Delete old directory metadata
       backend.deleteMeta(oldStoragePath);
+      // Recursively update storagePaths for all file descendants.
+      // Without this, pages remain keyed by old paths in the cache/backend,
+      // causing data loss on syncfs → remount when metadata is persisted
+      // under the new tree-computed paths but pages are under old paths.
+      const newDirPath = computeStoragePath(new_dir, new_name);
+      renameDescendantPaths(old_node, oldStoragePath, newDirPath);
     }
 
     // Rewire the node tree
@@ -280,6 +286,31 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       n = n.parent;
     }
     return "/" + parts.join("/");
+  }
+
+  /**
+   * Recursively rename storage paths for all file descendants of a directory.
+   * Called during directory rename to keep storagePaths consistent with the
+   * new tree structure, preventing data loss on persist → restore cycles.
+   */
+  function renameDescendantPaths(
+    dirNode: any,
+    oldDirPath: string,
+    newDirPath: string,
+  ): void {
+    for (const childName of Object.keys(dirNode.contents)) {
+      const child = dirNode.contents[childName];
+      if (FS.isFile(child.mode)) {
+        const oldPath = child.storagePath;
+        const newPath = newDirPath + oldPath.substring(oldDirPath.length);
+        pageCache.renameFile(oldPath, newPath);
+        child.storagePath = newPath;
+      } else if (FS.isDir(child.mode)) {
+        const oldChildPath = oldDirPath + "/" + childName;
+        const newChildPath = newDirPath + "/" + childName;
+        renameDescendantPaths(child, oldChildPath, newChildPath);
+      }
+    }
   }
 
   /** Directory node_ops. */

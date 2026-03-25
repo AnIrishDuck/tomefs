@@ -434,6 +434,83 @@ describe("persistence (Batch 6)", () => {
     expect(decode(buf, n)).toBe("renamed");
   });
 
+  it("renamed directory preserves child file data across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    FS.mkdir(`${MOUNT}/mydir`);
+    const s = FS.open(`${MOUNT}/mydir/data.txt`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("child file data"), 0, 15);
+    FS.close(s);
+    FS.rename(`${MOUNT}/mydir`, `${MOUNT}/renamed`);
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    expect(() => FS2.stat(`${MOUNT}/mydir`)).toThrow();
+    const stat = FS2.stat(`${MOUNT}/renamed`);
+    expect(FS2.isDir(stat.mode)).toBe(true);
+    const s2 = FS2.open(`${MOUNT}/renamed/data.txt`, O.RDONLY);
+    const buf = new Uint8Array(30);
+    const n = FS2.read(s2, buf, 0, 30);
+    FS2.close(s2);
+    expect(decode(buf, n)).toBe("child file data");
+  });
+
+  it("renamed nested directory preserves deeply nested files across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    FS.mkdir(`${MOUNT}/top`);
+    FS.mkdir(`${MOUNT}/top/mid`);
+    FS.mkdir(`${MOUNT}/top/mid/bottom`);
+    // Create files at each level
+    for (const [path, content] of [
+      [`${MOUNT}/top/f1.txt`, "level-1"],
+      [`${MOUNT}/top/mid/f2.txt`, "level-2"],
+      [`${MOUNT}/top/mid/bottom/f3.txt`, "level-3"],
+    ] as const) {
+      const s = FS.open(path, O.RDWR | O.CREAT, 0o666);
+      FS.write(s, encode(content), 0, content.length);
+      FS.close(s);
+    }
+
+    // Rename the top-level directory
+    FS.rename(`${MOUNT}/top`, `${MOUNT}/moved`);
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    for (const [path, content] of [
+      [`${MOUNT}/moved/f1.txt`, "level-1"],
+      [`${MOUNT}/moved/mid/f2.txt`, "level-2"],
+      [`${MOUNT}/moved/mid/bottom/f3.txt`, "level-3"],
+    ] as const) {
+      const s = FS2.open(path, O.RDONLY);
+      const buf = new Uint8Array(20);
+      const n = FS2.read(s, buf, 0, 20);
+      FS2.close(s);
+      expect(decode(buf, n)).toBe(content);
+    }
+  });
+
+  it("renamed directory with multi-page files preserves data across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend, 4);
+    FS.mkdir(`${MOUNT}/bigdir`);
+    // Create a file larger than the cache
+    const size = PAGE_SIZE * 6;
+    const data = new Uint8Array(size);
+    for (let i = 0; i < size; i++) data[i] = (i * 11 + 3) & 0xff;
+    const s = FS.open(`${MOUNT}/bigdir/large.bin`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, data, 0, size);
+    FS.close(s);
+
+    FS.rename(`${MOUNT}/bigdir`, `${MOUNT}/newbigdir`);
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend, 4);
+    const s2 = FS2.open(`${MOUNT}/newbigdir/large.bin`, O.RDONLY);
+    const buf = new Uint8Array(size);
+    const n = FS2.read(s2, buf, 0, size);
+    FS2.close(s2);
+    expect(n).toBe(size);
+    expect(buf).toEqual(data);
+  });
+
   it("three mount cycles with modifications each time", async () => {
     // Cycle 1: create a, b
     const { FS: FS1, tomefs: t1 } = await mountTome(backend);
