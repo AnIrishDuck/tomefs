@@ -609,12 +609,25 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // Check if a page exists beyond what metadata accounts for
         const nextPage = backend.readPage(storagePath, pagesFromMeta);
         if (nextPage) {
-          // Scan forward to find the true extent
-          let maxPage = pagesFromMeta;
-          while (backend.readPage(storagePath, maxPage + 1)) {
-            maxPage++;
+          // Exponential probe + binary search to find the true extent.
+          // This is O(log n) reads instead of O(n) linear scanning.
+          let lo = pagesFromMeta;
+          let hi = pagesFromMeta + 1;
+          // Exponential probe: double the step until we find a missing page
+          while (backend.readPage(storagePath, hi)) {
+            lo = hi;
+            hi *= 2;
           }
-          fileSize = (maxPage + 1) * PAGE_SIZE;
+          // Binary search between lo (exists) and hi (missing)
+          while (hi - lo > 1) {
+            const mid = (lo + hi) >>> 1;
+            if (backend.readPage(storagePath, mid)) {
+              lo = mid;
+            } else {
+              hi = mid;
+            }
+          }
+          fileSize = (lo + 1) * PAGE_SIZE;
         }
         node.usedBytes = fileSize;
         node.atime = meta.atime ?? meta.mtime;
