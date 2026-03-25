@@ -68,13 +68,17 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
     // Call parent init to store pg reference (needed for dumpTar)
     const result = await originalInit(pg, emscriptenOptions);
 
-    // Add preRun hook that mounts tomefs
+    // Add preRun hook that mounts tomefs. The hook is idempotent —
+    // Emscripten may run preRun hooks multiple times during module
+    // initialization (e.g., when PGlite restarts the WASM module).
+    // Only the first invocation creates and mounts tomefs.
     return {
       emscriptenOpts: {
         ...result.emscriptenOpts,
         preRun: [
           ...(result.emscriptenOpts.preRun || []),
           (mod: any) => {
+            if (tomefs) return; // Already mounted
             moduleFS = mod.FS;
             tomefs = createTomeFS(mod.FS, { backend, maxPages });
             mod.FS.mkdir(PGLITE_DATA);
@@ -96,11 +100,18 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
     });
   };
 
-  // Override closeFs to flush dirty pages
+  // Override closeFs to persist all state before shutdown.
+  // During pg.close(), Postgres modifies files (WAL, temp cleanup), so we
+  // must re-persist both pages AND metadata — not just flush pages.
   const originalCloseFs = adapter.closeFs.bind(adapter);
   adapter.closeFs = async () => {
-    if (tomefs) {
-      tomefs.pageCache.flushAll();
+    if (moduleFS) {
+      await new Promise<void>((resolve, reject) => {
+        moduleFS.syncfs(false, (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
     }
     return originalCloseFs();
   };

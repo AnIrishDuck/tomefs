@@ -27,22 +27,39 @@ export interface PGliteHarness {
   adapter: any;
   /** The storage backend (for persistence testing). */
   backend: SyncStorageBackend;
+  /** Flush tomefs data to the backend (calls syncToFs). */
+  syncToFs(): Promise<void>;
   /** Clean up resources. */
   destroy(): Promise<void>;
+}
+
+export interface PGliteHarnessOptions {
+  /** Cache size preset or explicit page count. */
+  cacheSize: CacheSize | number;
+  /** Existing backend to reuse (for persistence round-trip tests). */
+  backend?: SyncStorageBackend;
 }
 
 /**
  * Create a PGlite instance backed by tomefs with a specific cache size.
  *
  * PGlite is imported dynamically to keep it as a devDependency.
+ * Pass an existing backend to test persistence round-trips (remount).
  */
 export async function createPGliteHarness(
-  cacheSize: CacheSize | number,
+  cacheSizeOrOptions: CacheSize | number | PGliteHarnessOptions,
 ): Promise<PGliteHarness> {
-  const maxPages =
-    typeof cacheSize === "number" ? cacheSize : CACHE_CONFIGS[cacheSize];
+  const options: PGliteHarnessOptions =
+    typeof cacheSizeOrOptions === "object" && "cacheSize" in cacheSizeOrOptions
+      ? cacheSizeOrOptions
+      : { cacheSize: cacheSizeOrOptions };
 
-  const backend = new SyncMemoryBackend();
+  const maxPages =
+    typeof options.cacheSize === "number"
+      ? options.cacheSize
+      : CACHE_CONFIGS[options.cacheSize];
+
+  const backend = options.backend ?? new SyncMemoryBackend();
   const { PGlite, MemoryFS } = await import("@electric-sql/pglite");
   const adapter = createTomeFSPGlite({ MemoryFS, backend, maxPages });
 
@@ -53,8 +70,15 @@ export async function createPGliteHarness(
     pg,
     adapter,
     backend,
+    async syncToFs() {
+      await adapter.syncToFs();
+    },
     async destroy() {
-      await pg.close();
+      try {
+        await pg.close();
+      } catch (_e) {
+        // Ignore "PGlite is closed" errors from double-close
+      }
     },
   };
 }
