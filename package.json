@@ -29,6 +29,7 @@
     "test": "vitest run",
     "test:fast": "vitest run --testNamePattern @fast",
     "test:watch": "vitest",
+    "bench": "vitest bench",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
