@@ -54,6 +54,8 @@ export const SLOT_DATA_LEN = 2;
  * Returns the total bytes written to the data region.
  *
  * Format: [jsonLen: 4 bytes LE][json bytes][binary data bytes]
+ *
+ * Throws if the encoded message exceeds the buffer capacity.
  */
 export function encodeMessage(
   dataView: DataView,
@@ -64,6 +66,22 @@ export function encodeMessage(
   const jsonStr = JSON.stringify(json);
   const jsonBytes = new TextEncoder().encode(jsonStr);
   const jsonLen = jsonBytes.length;
+
+  // Calculate total size needed before writing anything
+  let totalNeeded = JSON_REGION_OFFSET + 4 + jsonLen;
+  if (binaryChunks) {
+    for (const chunk of binaryChunks) {
+      totalNeeded += chunk.length;
+    }
+  }
+
+  const bufferSize = uint8View.byteLength;
+  if (totalNeeded > bufferSize) {
+    throw new Error(
+      `SAB buffer overflow: message requires ${totalNeeded} bytes but buffer is ${bufferSize} bytes. ` +
+        `Increase buffer size or reduce batch size.`,
+    );
+  }
 
   // Write JSON length prefix (4 bytes LE)
   dataView.setUint32(JSON_REGION_OFFSET, jsonLen, true);
