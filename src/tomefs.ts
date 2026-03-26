@@ -333,9 +333,27 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         const newPath = newDirPath + oldPath.substring(oldDirPath.length);
         pageCache.renameFile(oldPath, newPath);
         child.storagePath = newPath;
+      } else if (FS.isLink(child.mode)) {
+        // Symlinks have no page data, but their metadata is keyed by path.
+        // Move metadata to the new path so a crash before syncfs doesn't
+        // orphan the symlink (old parent metadata is already deleted).
+        const oldPath = oldDirPath + "/" + childName;
+        const newPath = newDirPath + "/" + childName;
+        const meta = backend.readMeta(oldPath);
+        if (meta) {
+          backend.writeMeta(newPath, meta);
+          backend.deleteMeta(oldPath);
+        }
       } else if (FS.isDir(child.mode)) {
         const oldChildPath = oldDirPath + "/" + childName;
         const newChildPath = newDirPath + "/" + childName;
+        // Move directory metadata before recursing into children,
+        // so a crash mid-rename doesn't orphan the subtree.
+        const meta = backend.readMeta(oldChildPath);
+        if (meta) {
+          backend.writeMeta(newChildPath, meta);
+          backend.deleteMeta(oldChildPath);
+        }
         renameDescendantPaths(child, oldChildPath, newChildPath);
       }
     }

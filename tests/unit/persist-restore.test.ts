@@ -596,6 +596,64 @@ describe("persist/restore: edge cases", () => {
     expect(decode(buf, n)).toBe("inside");
   });
 
+  it("directory renamed with symlink child persists correctly", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    FS.mkdir(`${MOUNT}/olddir`);
+    // Create a file and a symlink inside the directory
+    const s = FS.open(`${MOUNT}/olddir/file`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("data"), 0, 4);
+    FS.close(s);
+    FS.symlink("file", `${MOUNT}/olddir/link`);
+
+    FS.rename(`${MOUNT}/olddir`, `${MOUNT}/newdir`);
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+
+    expect(() => FS2.stat(`${MOUNT}/olddir`)).toThrow();
+
+    // The symlink should survive under the new path
+    const linkStat = FS2.lstat(`${MOUNT}/newdir/link`);
+    expect((linkStat.mode & 0o170000) === 0o120000).toBe(true);
+    expect(FS2.readlink(`${MOUNT}/newdir/link`)).toBe("file");
+
+    // Following the symlink should reach the file
+    const s2 = FS2.open(`${MOUNT}/newdir/link`, O.RDONLY);
+    const buf = new Uint8Array(10);
+    const n = FS2.read(s2, buf, 0, 10);
+    FS2.close(s2);
+    expect(decode(buf, n)).toBe("data");
+  });
+
+  it("directory renamed with nested subdirectory persists correctly", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    FS.mkdir(`${MOUNT}/top`);
+    FS.mkdir(`${MOUNT}/top/sub`);
+    const s = FS.open(`${MOUNT}/top/sub/deep`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("nested"), 0, 6);
+    FS.close(s);
+    FS.symlink("deep", `${MOUNT}/top/sub/link`);
+
+    FS.rename(`${MOUNT}/top`, `${MOUNT}/moved`);
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+
+    expect(() => FS2.stat(`${MOUNT}/top`)).toThrow();
+
+    // Nested file should be accessible
+    const s2 = FS2.open(`${MOUNT}/moved/sub/deep`, O.RDONLY);
+    const buf = new Uint8Array(10);
+    const n = FS2.read(s2, buf, 0, 10);
+    FS2.close(s2);
+    expect(decode(buf, n)).toBe("nested");
+
+    // Nested symlink should survive
+    expect(FS2.readlink(`${MOUNT}/moved/sub/link`)).toBe("deep");
+  });
+
   it("large number of files in a single directory", async () => {
     const { FS, tomefs } = await mountTome(backend);
 
