@@ -386,7 +386,10 @@ export class SyncPageCache {
 
   /**
    * Zero-fill the tail of the last page after truncation to a smaller size.
-   * If the page is cached, modifies it in place. Does not load from backend.
+   * If the page is cached, modifies it in place. If the page is only in
+   * the backend (evicted from cache), loads it, zeros the tail, and writes
+   * it back. This prevents stale data from being served if the file is
+   * later extended without writing to the truncated region.
    */
   zeroTailAfterTruncate(path: string, newSize: number): void {
     const lastPageIndex = Math.floor(newSize / PAGE_SIZE);
@@ -400,6 +403,14 @@ export class SyncPageCache {
       if (!page.dirty) {
         page.dirty = true;
         this.dirtyKeys.add(key);
+      }
+    } else {
+      // Page is not cached — check if it exists in the backend
+      const data = this.backend.readPage(path, lastPageIndex);
+      if (data) {
+        const updated = new Uint8Array(data);
+        updated.fill(0, tailOffset);
+        this.backend.writePage(path, lastPageIndex, updated);
       }
     }
   }
