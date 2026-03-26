@@ -57,7 +57,12 @@ describe("readdir (test_readdir.c)", () => {
     expect(entries.length).toBe(3);
   });
 
-  it("readdir on root contains expected directories", () => {
+  // Root and /dev listing tests only apply to MEMFS — under tomefs, "/" is
+  // rewritten to the mount point which doesn't contain system directories.
+  const itIfMemfs =
+    process.env.TOMEFS_BACKEND === "tomefs" ? it.skip : it;
+
+  itIfMemfs("readdir on root contains expected directories", () => {
     const { FS } = h;
     const entries = FS.readdir("/");
 
@@ -67,7 +72,7 @@ describe("readdir (test_readdir.c)", () => {
     expect(entries).toContain("testtmp");
   });
 
-  it("readdir on /dev lists device files", () => {
+  itIfMemfs("readdir on /dev lists device files", () => {
     const { FS } = h;
     const entries = FS.readdir("/dev");
 

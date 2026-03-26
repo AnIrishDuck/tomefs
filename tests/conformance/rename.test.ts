@@ -138,13 +138,18 @@ describe("rename (test_rename.c)", () => {
     );
   });
 
-  it("rename root as source throws EINVAL (JS FS) or EBUSY (WasmFS)", () => {
+  // Root rename tests only apply to MEMFS — under tomefs, "/" is rewritten
+  // to the mount point, which produces EXDEV (cross-device) instead.
+  const itIfMemfs =
+    process.env.TOMEFS_BACKEND === "tomefs" ? it.skip : it;
+
+  itIfMemfs("rename root as source throws EINVAL (JS FS) or EBUSY (WasmFS)", () => {
     const { FS, E } = h;
     // Emscripten JS FS returns EINVAL for renaming root
     expectErrno(() => FS.rename("/", "/dir/file2"), E.EINVAL);
   });
 
-  it("rename onto root throws ENOTEMPTY (JS FS) or EBUSY (WasmFS)", () => {
+  itIfMemfs("rename onto root throws ENOTEMPTY (JS FS) or EBUSY (WasmFS)", () => {
     const { FS, E } = h;
     // Emscripten JS FS returns ENOTEMPTY for renaming onto root
     expectErrno(() => FS.rename("/dir/file", "/"), E.ENOTEMPTY);

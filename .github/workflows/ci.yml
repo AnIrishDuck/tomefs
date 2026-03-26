@@ -61,5 +61,8 @@ jobs:
 
       - run: npm ci
 
-      - name: Full test suite
+      - name: Full test suite (MEMFS)
         run: npm test
+
+      - name: Full test suite (tomefs)
+        run: TOMEFS_BACKEND=tomefs npm test
