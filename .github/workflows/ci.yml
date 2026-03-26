@@ -21,8 +21,11 @@ jobs:
 
       - run: npm ci
 
-      - name: Type-check and build
+      - name: Type-check and build (src)
         run: npm run build
+
+      - name: Type-check tests
+        run: npx tsc --noEmit
 
   smoke-tests:
     name: Smoke tests (@fast)

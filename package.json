@@ -25,6 +25,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
     "build:harness": "bash scripts/build-harness.sh",
     "test": "vitest run",
     "test:fast": "vitest run --testNamePattern @fast",
@@ -34,6 +35,7 @@
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.4.1",
+    "@types/node": "^25.5.0",
     "fake-indexeddb": "^6.2.5",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

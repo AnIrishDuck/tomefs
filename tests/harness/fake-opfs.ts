@@ -22,7 +22,7 @@ class FakeBlob {
     return this._data.buffer.slice(
       this._data.byteOffset,
       this._data.byteOffset + this._data.byteLength,
-    );
+    ) as ArrayBuffer;
   }
 
   async text(): Promise<string> {

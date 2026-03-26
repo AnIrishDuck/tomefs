@@ -20,6 +20,7 @@ export interface EmscriptenStream {
   node: EmscriptenFSNode;
   position: number;
   flags: number;
+  stream_ops: Record<string, Function>;
 }
 
 export interface EmscriptenFSNode {
