@@ -498,6 +498,177 @@ describe("PageCache", () => {
     });
   });
 
+  describe("batch read pre-loading", () => {
+    it("batch-loads missing pages for multi-page reads", async () => {
+      // Pre-populate 3 pages in backend
+      for (let i = 0; i < 3; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(i + 1);
+        await backend.writePage("/test", i, data);
+      }
+
+      // Track readPages calls
+      let readPagesCalls = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, indices: number[]) => {
+        readPagesCalls++;
+        return origReadPages(path, indices);
+      };
+
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      const n = await cache.read("/test", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
+      expect(n).toBe(PAGE_SIZE * 3);
+      // Should have used batch readPages (one call for the 3 missing pages)
+      expect(readPagesCalls).toBe(1);
+      // Verify data integrity
+      expect(buf[0]).toBe(1);
+      expect(buf[PAGE_SIZE]).toBe(2);
+      expect(buf[PAGE_SIZE * 2]).toBe(3);
+    });
+
+    it("skips batching when all pages are cached", async () => {
+      // Pre-load pages into cache
+      for (let i = 0; i < 3; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(i + 1);
+        await backend.writePage("/test", i, data);
+        await cache.getPage("/test", i);
+      }
+
+      let readPagesCalls = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, indices: number[]) => {
+        readPagesCalls++;
+        return origReadPages(path, indices);
+      };
+
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      await cache.read("/test", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
+      // No batch read needed — all pages already cached
+      expect(readPagesCalls).toBe(0);
+    });
+
+    it("only batch-loads uncached pages, skips cached ones", async () => {
+      // Pre-populate 3 pages in backend
+      for (let i = 0; i < 3; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(i + 1);
+        await backend.writePage("/test", i, data);
+      }
+      // Cache page 1 (middle page)
+      await cache.getPage("/test", 1);
+
+      let batchedIndices: number[] = [];
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, indices: number[]) => {
+        batchedIndices = indices;
+        return origReadPages(path, indices);
+      };
+
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      await cache.read("/test", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
+      // Should only request pages 0 and 2 (page 1 is cached)
+      expect(batchedIndices).toEqual([0, 2]);
+    });
+
+    it("falls back to getPage for single-page reads", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data.fill(0xab);
+      await backend.writePage("/test", 0, data);
+
+      let readPagesCalls = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, indices: number[]) => {
+        readPagesCalls++;
+        return origReadPages(path, indices);
+      };
+
+      const buf = new Uint8Array(100);
+      await cache.read("/test", buf, 0, 100, 0, PAGE_SIZE);
+      // Single-page read should not use batch readPages
+      expect(readPagesCalls).toBe(0);
+      expect(buf[0]).toBe(0xab);
+    });
+  });
+
+  describe("batch write pre-loading", () => {
+    it("batch-loads missing pages for multi-page writes", async () => {
+      // Pre-populate 3 pages with existing data
+      for (let i = 0; i < 3; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(0x10 + i);
+        await backend.writePage("/test", i, data);
+      }
+
+      let readPagesCalls = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, indices: number[]) => {
+        readPagesCalls++;
+        return origReadPages(path, indices);
+      };
+
+      // Write spanning 3 pages
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      buf.fill(0xff);
+      await cache.write("/test", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
+      // Should batch-load 3 missing pages
+      expect(readPagesCalls).toBe(1);
+    });
+  });
+
+  describe("batch eviction", () => {
+    it("batch-flushes dirty pages during eviction", async () => {
+      const small = new PageCache(backend, 4);
+
+      // Fill cache with dirty pages
+      for (let i = 0; i < 4; i++) {
+        await small.write("/a", fillBuf(PAGE_SIZE, i + 1), 0, PAGE_SIZE, i * PAGE_SIZE, i * PAGE_SIZE);
+      }
+      expect(small.size).toBe(4);
+
+      let writePagesCalls = 0;
+      const origWritePages = backend.writePages.bind(backend);
+      backend.writePages = async (pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) => {
+        writePagesCalls++;
+        return origWritePages(pages);
+      };
+
+      // Read 3 new pages — triggers batch eviction of 3 dirty pages
+      for (let i = 0; i < 3; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(0xbb);
+        await backend.writePage("/b", i, data);
+      }
+
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      await small.read("/b", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
+
+      // Dirty pages should have been flushed to backend
+      for (let i = 0; i < 3; i++) {
+        const stored = await backend.readPage("/a", i);
+        expect(stored).not.toBeNull();
+        expect(stored![0]).toBe(i + 1);
+      }
+    });
+
+    it("preserves data integrity under eviction pressure during multi-page write", async () => {
+      // Cache holds 4 pages, write spans 8 pages with batch optimizations
+      const small = new PageCache(backend, 4);
+      const size = PAGE_SIZE * 8;
+      const data = new Uint8Array(size);
+      for (let i = 0; i < size; i++) data[i] = i % 251;
+
+      await small.write("/test", data, 0, size, 0, 0);
+      await small.flushAll();
+
+      // Verify all data round-trips correctly
+      const buf = new Uint8Array(size);
+      const n = await small.read("/test", buf, 0, size, 0, size);
+      expect(n).toBe(size);
+      expect(Array.from(buf)).toEqual(Array.from(data));
+    });
+  });
+
   describe("read-write round-trip", () => {
     it("@fast writes then reads same data", async () => {
       const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
