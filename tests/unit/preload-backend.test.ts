@@ -9,6 +9,83 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryBackend } from "../../src/memory-backend.js";
 import { PreloadBackend } from "../../src/preload-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
+import type { StorageBackend } from "../../src/storage-backend.js";
+import type { FileMeta } from "../../src/types.js";
+
+/**
+ * Wrapper around MemoryBackend that counts calls to each method.
+ * Used to verify that flush() uses batch operations instead of
+ * individual calls (reducing SAB bridge round-trips).
+ */
+class CountingBackend implements StorageBackend {
+  private inner: MemoryBackend;
+  calls: Record<string, number> = {};
+
+  constructor(inner: MemoryBackend) {
+    this.inner = inner;
+  }
+
+  private count(method: string): void {
+    this.calls[method] = (this.calls[method] ?? 0) + 1;
+  }
+
+  resetCounts(): void {
+    this.calls = {};
+  }
+
+  async readPage(path: string, pageIndex: number) {
+    this.count("readPage");
+    return this.inner.readPage(path, pageIndex);
+  }
+  async readPages(path: string, pageIndices: number[]) {
+    this.count("readPages");
+    return this.inner.readPages(path, pageIndices);
+  }
+  async writePage(path: string, pageIndex: number, data: Uint8Array) {
+    this.count("writePage");
+    return this.inner.writePage(path, pageIndex, data);
+  }
+  async writePages(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) {
+    this.count("writePages");
+    return this.inner.writePages(pages);
+  }
+  async deleteFile(path: string) {
+    this.count("deleteFile");
+    return this.inner.deleteFile(path);
+  }
+  async deletePagesFrom(path: string, fromPageIndex: number) {
+    this.count("deletePagesFrom");
+    return this.inner.deletePagesFrom(path, fromPageIndex);
+  }
+  async renameFile(oldPath: string, newPath: string) {
+    this.count("renameFile");
+    return this.inner.renameFile(oldPath, newPath);
+  }
+  async readMeta(path: string) {
+    this.count("readMeta");
+    return this.inner.readMeta(path);
+  }
+  async writeMeta(path: string, meta: FileMeta) {
+    this.count("writeMeta");
+    return this.inner.writeMeta(path, meta);
+  }
+  async writeMetas(entries: Array<{ path: string; meta: FileMeta }>) {
+    this.count("writeMetas");
+    return this.inner.writeMetas(entries);
+  }
+  async deleteMeta(path: string) {
+    this.count("deleteMeta");
+    return this.inner.deleteMeta(path);
+  }
+  async deleteMetas(paths: string[]) {
+    this.count("deleteMetas");
+    return this.inner.deleteMetas(paths);
+  }
+  async listFiles() {
+    this.count("listFiles");
+    return this.inner.listFiles();
+  }
+}
 
 describe("PreloadBackend", () => {
   let remote: MemoryBackend;
@@ -636,6 +713,172 @@ describe("PreloadBackend", () => {
       expect(page).not.toBeNull();
       expect(page![0]).toBe(0xdd);
       expect(page![PAGE_SIZE - 1]).toBe(0xee);
+    });
+  });
+
+  describe("flush batching", () => {
+    it("@fast batches multiple metadata writes into a single writeMetas call", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+      const backend = new PreloadBackend(counting);
+      await backend.init();
+
+      // Write 5 metadata entries
+      for (let i = 0; i < 5; i++) {
+        backend.writeMeta(`/file${i}`, {
+          size: 0,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+
+      counting.resetCounts();
+      await backend.flush();
+
+      // Should use 1 writeMetas call, not 5 individual writeMeta calls
+      expect(counting.calls["writeMetas"]).toBe(1);
+      expect(counting.calls["writeMeta"] ?? 0).toBe(0);
+    });
+
+    it("batches multiple metadata deletes into a single deleteMetas call", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+      const backend = new PreloadBackend(counting);
+
+      // Seed with metadata
+      for (let i = 0; i < 5; i++) {
+        await inner.writeMeta(`/file${i}`, {
+          size: 0,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+      await backend.init();
+
+      // Delete all metadata entries
+      for (let i = 0; i < 5; i++) {
+        backend.deleteMeta(`/file${i}`);
+      }
+
+      counting.resetCounts();
+      await backend.flush();
+
+      // Should use 1 deleteMetas call, not 5 individual deleteMeta calls
+      expect(counting.calls["deleteMetas"]).toBe(1);
+      expect(counting.calls["deleteMeta"] ?? 0).toBe(0);
+    });
+
+    it("parallelizes multiple file deletions", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+      const backend = new PreloadBackend(counting);
+
+      // Seed with files
+      for (let i = 0; i < 3; i++) {
+        await inner.writePage(`/file${i}`, 0, new Uint8Array(PAGE_SIZE));
+        await inner.writeMeta(`/file${i}`, {
+          size: PAGE_SIZE,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+      await backend.init();
+
+      // Delete all files
+      for (let i = 0; i < 3; i++) {
+        backend.deleteFile(`/file${i}`);
+      }
+
+      counting.resetCounts();
+      await backend.flush();
+
+      // All 3 deleteFile calls should happen (in parallel)
+      expect(counting.calls["deleteFile"]).toBe(3);
+    });
+
+    it("parallelizes multiple truncations", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+      const backend = new PreloadBackend(counting);
+      await backend.init();
+
+      // Write pages for 3 files, then truncate each
+      for (let i = 0; i < 3; i++) {
+        for (let p = 0; p < 5; p++) {
+          backend.writePage(`/file${i}`, p, new Uint8Array(PAGE_SIZE));
+        }
+      }
+      await backend.flush();
+
+      for (let i = 0; i < 3; i++) {
+        backend.deletePagesFrom(`/file${i}`, 1);
+      }
+
+      counting.resetCounts();
+      await backend.flush();
+
+      // All 3 truncation calls should happen (in parallel)
+      expect(counting.calls["deletePagesFrom"]).toBe(3);
+    });
+
+    it("batches late metadata writes for delete-then-recreate paths", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+      const backend = new PreloadBackend(counting);
+
+      // Seed remote
+      for (let i = 0; i < 3; i++) {
+        await inner.writePage(`/file${i}`, 0, new Uint8Array(PAGE_SIZE));
+        await inner.writeMeta(`/file${i}`, {
+          size: PAGE_SIZE,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+      await backend.init();
+
+      // Delete and recreate all 3 files with new metadata
+      for (let i = 0; i < 3; i++) {
+        backend.deleteFile(`/file${i}`);
+        backend.writePage(`/file${i}`, 0, new Uint8Array(PAGE_SIZE));
+        backend.writeMeta(`/file${i}`, {
+          size: PAGE_SIZE,
+          mode: 0o100644,
+          ctime: 2000,
+          mtime: 2000,
+        });
+      }
+
+      counting.resetCounts();
+      await backend.flush();
+
+      // Late metadata should be batched into a single writeMetas call
+      expect(counting.calls["writeMetas"]).toBe(1);
+      expect(counting.calls["writeMeta"] ?? 0).toBe(0);
+
+      // Verify data integrity
+      for (let i = 0; i < 3; i++) {
+        const meta = await inner.readMeta(`/file${i}`);
+        expect(meta!.mtime).toBe(2000);
+      }
+    });
+
+    it("no remote calls when nothing is dirty", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+      const backend = new PreloadBackend(counting);
+      await backend.init();
+
+      counting.resetCounts();
+      await backend.flush();
+
+      // No remote calls should happen at all
+      const totalCalls = Object.values(counting.calls).reduce((a, b) => a + b, 0);
+      expect(totalCalls).toBe(0);
     });
   });
 });

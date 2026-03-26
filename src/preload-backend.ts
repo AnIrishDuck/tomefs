@@ -315,6 +315,10 @@ export class PreloadBackend implements SyncStorageBackend {
    * to avoid the subsequent deleteFile removing newly written pages.
    * These are handled in a separate pass after deletions.
    *
+   * Operations within each step are batched to minimize round-trips
+   * to the remote backend (important when the remote is IDB behind
+   * a SAB bridge, where each call is a cross-worker round-trip).
+   *
    * Safe to call multiple times — no-op if nothing is dirty.
    */
   async flush(): Promise<void> {
@@ -349,12 +353,8 @@ export class PreloadBackend implements SyncStorageBackend {
     }
     this.dirtyPages.clear();
 
-    // 1. Write new pages at non-deleted paths (crash-safe: new data first)
-    if (earlyBatch.length > 0) {
-      await this.remote.writePages(earlyBatch);
-    }
-
-    // 2. Write dirty metadata for non-deleted paths
+    // Partition dirty metadata the same way as pages.
+    const earlyMeta: Array<{ path: string; meta: FileMeta }> = [];
     const lateMeta: Array<{ path: string; meta: FileMeta }> = [];
     for (const path of this.dirtyMeta) {
       const m = this.meta.get(path);
@@ -362,27 +362,43 @@ export class PreloadBackend implements SyncStorageBackend {
         if (this.deletedMeta.has(path)) {
           lateMeta.push({ path, meta: m });
         } else {
-          await this.remote.writeMeta(path, m);
+          earlyMeta.push({ path, meta: m });
         }
       }
     }
     this.dirtyMeta.clear();
 
-    // 3. Delete files from remote
-    for (const path of this.deletedFiles) {
-      await this.remote.deleteFile(path);
+    // 1. Write new pages at non-deleted paths (crash-safe: new data first)
+    if (earlyBatch.length > 0) {
+      await this.remote.writePages(earlyBatch);
+    }
+
+    // 2. Batch-write dirty metadata for non-deleted paths
+    if (earlyMeta.length > 0) {
+      await this.remote.writeMetas(earlyMeta);
+    }
+
+    // 3. Delete files from remote (parallel — independent operations)
+    if (this.deletedFiles.size > 0) {
+      await Promise.all(
+        [...this.deletedFiles].map((path) => this.remote.deleteFile(path)),
+      );
     }
     this.deletedFiles.clear();
 
-    // 4. Apply truncations
-    for (const [path, fromIndex] of this.truncations) {
-      await this.remote.deletePagesFrom(path, fromIndex);
+    // 4. Apply truncations (parallel — independent operations)
+    if (this.truncations.size > 0) {
+      await Promise.all(
+        [...this.truncations].map(([path, fromIndex]) =>
+          this.remote.deletePagesFrom(path, fromIndex),
+        ),
+      );
     }
     this.truncations.clear();
 
-    // 5. Delete metadata
-    for (const path of this.deletedMeta) {
-      await this.remote.deleteMeta(path);
+    // 5. Batch-delete metadata
+    if (this.deletedMeta.size > 0) {
+      await this.remote.deleteMetas([...this.deletedMeta]);
     }
     this.deletedMeta.clear();
 
@@ -391,9 +407,9 @@ export class PreloadBackend implements SyncStorageBackend {
       await this.remote.writePages(lateBatch);
     }
 
-    // 7. Write metadata for delete-then-recreate paths
-    for (const { path, meta } of lateMeta) {
-      await this.remote.writeMeta(path, meta);
+    // 7. Batch-write metadata for delete-then-recreate paths
+    if (lateMeta.length > 0) {
+      await this.remote.writeMetas(lateMeta);
     }
   }
 }
