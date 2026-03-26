@@ -209,6 +209,37 @@ describe("SyncPageCache", () => {
         expect(page.data[i]).toBe(0);
       }
     });
+
+    it("zeroTailAfterTruncate zeros tail of evicted page in backend", () => {
+      // Use a 1-page cache so the target page gets evicted to backend
+      const cache = new SyncPageCache(backend, 1);
+
+      // Write a full page of 0xFF
+      const data = new Uint8Array(PAGE_SIZE);
+      data.fill(0xff);
+      cache.write("/file", data, 0, PAGE_SIZE, 0, 0);
+
+      // Evict the page by touching a different file
+      const other = new Uint8Array(PAGE_SIZE);
+      cache.write("/other", other, 0, PAGE_SIZE, 0, 0);
+
+      // Page 0 of /file is now only in the backend, not in cache
+      expect(cache.has("/file", 0)).toBe(false);
+
+      // Truncate to 100 bytes — must zero tail even though page is not cached
+      cache.zeroTailAfterTruncate("/file", 100);
+
+      // Load the page back from backend
+      const page = cache.getPage("/file", 0);
+      // First 100 bytes should be 0xff
+      for (let i = 0; i < 100; i++) {
+        expect(page.data[i]).toBe(0xff);
+      }
+      // Tail should be zeroed, not stale 0xff
+      for (let i = 100; i < PAGE_SIZE; i++) {
+        expect(page.data[i]).toBe(0);
+      }
+    });
   });
 
   describe("deleteFile", () => {
