@@ -8,7 +8,7 @@ import type { FileMeta } from "./types.js";
  * to StorageBackend.
  *
  * - MemoryBackend implements this natively (all ops are Map lookups).
- * - IDB will appear synchronous via the SAB+Atomics bridge (future).
+ * - IDB appears synchronous via the SAB+Atomics bridge (SabClient).
  */
 export interface SyncStorageBackend {
   /** Read a single page. Returns null if the page doesn't exist. */

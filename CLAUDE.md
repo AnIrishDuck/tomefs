@@ -70,7 +70,7 @@ Test harness: `tests/harness/emscripten-fs.ts` provides `createFS()` which retur
 
 - `SyncStorageBackend` — synchronous storage (used by tomefs directly)
 - `StorageBackend` — async storage (used in worker context)
-- Both define: `readPage`, `writePage`, `readPages`, `writePages`, `deleteFile`, `listFiles`, `getMetadata`, `putMetadata`, `deleteMetadata`, `listMetadata`
+- Both define: `readPage`, `writePage`, `readPages`, `writePages`, `deleteFile`, `deletePagesFrom`, `renameFile`, `readMeta`, `writeMeta`, `deleteMeta`, `listFiles`
 
 ## Design Decisions
 

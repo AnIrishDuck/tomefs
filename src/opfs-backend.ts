@@ -157,9 +157,16 @@ export class OpfsBackend implements StorageBackend {
   async writePages(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
   ): Promise<void> {
-    for (const { path, pageIndex, data } of pages) {
-      await this.writePage(path, pageIndex, data);
+    if (pages.length === 0) return;
+    if (pages.length === 1) {
+      await this.writePage(pages[0].path, pages[0].pageIndex, pages[0].data);
+      return;
     }
+    await Promise.all(
+      pages.map(({ path, pageIndex, data }) =>
+        this.writePage(path, pageIndex, data),
+      ),
+    );
   }
 
   async deleteFile(path: string): Promise<void> {
@@ -197,16 +204,24 @@ export class OpfsBackend implements StorageBackend {
       create: true,
     });
 
+    // Collect page names, then copy all in parallel.
+    const names: string[] = [];
     for await (const name of (oldDir as IterableDirectoryHandle).keys()) {
-      const srcHandle = await oldDir.getFileHandle(name);
-      const file = await srcHandle.getFile();
-      const data = await file.arrayBuffer();
-
-      const dstHandle = await newDir.getFileHandle(name, { create: true });
-      const writable = await dstHandle.createWritable();
-      await writable.write(new Uint8Array(data));
-      await writable.close();
+      names.push(name);
     }
+
+    await Promise.all(
+      names.map(async (name) => {
+        const srcHandle = await oldDir.getFileHandle(name);
+        const file = await srcHandle.getFile();
+        const data = await file.arrayBuffer();
+
+        const dstHandle = await newDir.getFileHandle(name, { create: true });
+        const writable = await dstHandle.createWritable();
+        await writable.write(new Uint8Array(data));
+        await writable.close();
+      }),
+    );
 
     // Remove old pages directory.
     await this.pagesDir!.removeEntry(oldEncoded, { recursive: true });
