@@ -125,6 +125,37 @@ describe("persistence (Batch 6)", () => {
     expect(stat.mode & 0o777).toBe(0o644);
   });
 
+  it("chmod-modified mode bits persist across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    const stream = FS.open(`${MOUNT}/chmodfile`, O.RDWR | O.CREAT, 0o777);
+    FS.write(stream, encode("data"), 0, 4);
+    FS.close(stream);
+
+    // Change mode after creation
+    FS.chmod(`${MOUNT}/chmodfile`, 0o640);
+    expect(FS.stat(`${MOUNT}/chmodfile`).mode & 0o777).toBe(0o640);
+
+    syncAndUnmount(FS, tomefs);
+
+    // Remount and verify the chmod'd mode persisted (not the creation mode)
+    const { FS: FS2 } = await mountTome(backend);
+    const stat = FS2.stat(`${MOUNT}/chmodfile`);
+    expect(stat.mode & 0o777).toBe(0o640);
+  });
+
+  it("directory chmod persists across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    FS.mkdir(`${MOUNT}/chmoddir`);
+    FS.chmod(`${MOUNT}/chmoddir`, 0o750);
+    expect(FS.stat(`${MOUNT}/chmoddir`).mode & 0o777).toBe(0o750);
+
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    const stat = FS2.stat(`${MOUNT}/chmoddir`);
+    expect(stat.mode & 0o777).toBe(0o750);
+  });
+
   it("file timestamps are preserved across remount", async () => {
     const { FS, tomefs } = await mountTome(backend);
     const stream = FS.open(`${MOUNT}/timed`, O.RDWR | O.CREAT, 0o666);
