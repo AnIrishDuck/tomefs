@@ -367,7 +367,7 @@ describe("PageCache", () => {
     it("zeros bytes after new size within last page", async () => {
       await cache.write("/test", fillBuf(PAGE_SIZE, 0xff), 0, PAGE_SIZE, 0, 0);
 
-      cache.zeroTailAfterTruncate("/test", 10);
+      await cache.zeroTailAfterTruncate("/test", 10);
 
       const page = await cache.getPage("/test", 0);
       // First 10 bytes unchanged
@@ -382,16 +382,119 @@ describe("PageCache", () => {
       await cache.write("/test", fillBuf(PAGE_SIZE, 0xff), 0, PAGE_SIZE, 0, 0);
       await cache.flushFile("/test");
 
-      cache.zeroTailAfterTruncate("/test", PAGE_SIZE);
+      await cache.zeroTailAfterTruncate("/test", PAGE_SIZE);
       // Page should not be re-dirtied since there's no tail to zero
       // (dirty was cleared by flush, and PAGE_SIZE % PAGE_SIZE === 0 exits early)
       expect(cache.isDirty("/test", 0)).toBe(false);
     });
 
-    it("no-op when page not in cache", async () => {
-      // No pages loaded — should not throw
-      cache.zeroTailAfterTruncate("/test", 100);
+    it("no-op when page not in cache and not in backend", async () => {
+      // No pages loaded or stored — should not throw
+      await cache.zeroTailAfterTruncate("/test", 100);
       expect(cache.size).toBe(0);
+    });
+
+    it("zeros tail of evicted page in backend", async () => {
+      // Write a full page, flush, and evict it
+      await cache.write("/file", fillBuf(PAGE_SIZE, 0xaa), 0, PAGE_SIZE, 0, 0);
+      await cache.flushFile("/file");
+      await cache.evictFile("/file");
+      expect(cache.has("/file", 0)).toBe(false);
+
+      // Truncate to 100 bytes — should zero tail in backend
+      await cache.zeroTailAfterTruncate("/file", 100);
+
+      // Reload from backend and verify
+      const page = await cache.getPage("/file", 0);
+      expect(page.data[99]).toBe(0xaa);
+      expect(page.data[100]).toBe(0);
+      expect(page.data[PAGE_SIZE - 1]).toBe(0);
+    });
+  });
+
+  describe("deleteFile", () => {
+    it("removes all cached pages and deletes from backend", async () => {
+      await cache.write("/file", fillBuf(PAGE_SIZE * 2, 0xbb), 0, PAGE_SIZE * 2, 0, 0);
+      await cache.flushFile("/file");
+      expect(cache.has("/file", 0)).toBe(true);
+      expect(cache.has("/file", 1)).toBe(true);
+
+      await cache.deleteFile("/file");
+      expect(cache.has("/file", 0)).toBe(false);
+      expect(cache.has("/file", 1)).toBe(false);
+      expect(cache.size).toBe(0);
+
+      // Backend should also be empty
+      const data = await backend.readPage("/file", 0);
+      expect(data).toBeNull();
+    });
+
+    it("does not flush dirty pages before deletion", async () => {
+      await cache.write("/file", fillBuf(10, 0xcc), 0, 10, 0, 0);
+      expect(cache.dirtyCount).toBe(1);
+
+      await cache.deleteFile("/file");
+      expect(cache.dirtyCount).toBe(0);
+
+      // Backend should have no data (dirty page was discarded, not flushed)
+      const data = await backend.readPage("/file", 0);
+      expect(data).toBeNull();
+    });
+
+    it("does not affect other files", async () => {
+      await cache.write("/a", fillBuf(10, 0x11), 0, 10, 0, 0);
+      await cache.write("/b", fillBuf(10, 0x22), 0, 10, 0, 0);
+      await cache.flushAll();
+
+      await cache.deleteFile("/a");
+      expect(cache.has("/b", 0)).toBe(true);
+      const data = await backend.readPage("/b", 0);
+      expect(data).not.toBeNull();
+    });
+  });
+
+  describe("renameFile", () => {
+    it("moves pages from old path to new path", async () => {
+      await cache.write("/old", fillBuf(PAGE_SIZE + 10, 0xdd), 0, PAGE_SIZE + 10, 0, 0);
+
+      await cache.renameFile("/old", "/new");
+
+      // Old path should be gone
+      expect(cache.has("/old", 0)).toBe(false);
+      expect(cache.has("/old", 1)).toBe(false);
+
+      // New path should have the data
+      expect(cache.has("/new", 0)).toBe(true);
+      expect(cache.has("/new", 1)).toBe(true);
+
+      const buf = new Uint8Array(PAGE_SIZE + 10);
+      const n = await cache.read("/new", buf, 0, PAGE_SIZE + 10, 0, PAGE_SIZE + 10);
+      expect(n).toBe(PAGE_SIZE + 10);
+      expect(buf[0]).toBe(0xdd);
+      expect(buf[PAGE_SIZE + 9]).toBe(0xdd);
+    });
+
+    it("flushes dirty pages before rename", async () => {
+      await cache.write("/old", fillBuf(10, 0xee), 0, 10, 0, 0);
+      expect(cache.isDirty("/old", 0)).toBe(true);
+
+      await cache.renameFile("/old", "/new");
+
+      // Backend should have the data under new path
+      const data = await backend.readPage("/new", 0);
+      expect(data).not.toBeNull();
+      expect(data![0]).toBe(0xee);
+    });
+
+    it("survives eviction and re-read after rename", async () => {
+      await cache.write("/old", fillBuf(10, 0xff), 0, 10, 0, 0);
+      await cache.renameFile("/old", "/new");
+      await cache.evictFile("/new");
+
+      const buf = new Uint8Array(10);
+      const n = await cache.read("/new", buf, 0, 10, 0, 10);
+      expect(n).toBe(10);
+      expect(buf[0]).toBe(0xff);
     });
   });
 
