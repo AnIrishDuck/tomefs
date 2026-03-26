@@ -84,10 +84,11 @@ class Rng {
 interface FSModel {
   files: Map<string, number>; // path -> size
   dirs: Set<string>;          // directory paths
+  symlinks: Map<string, string>; // link path -> target
 }
 
 function newModel(): FSModel {
-  return { files: new Map(), dirs: new Set(["/"]) };
+  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map() };
 }
 
 /** List files in a specific directory. */
@@ -111,9 +112,21 @@ function dirsInDir(model: FSModel, dir: string): string[] {
   });
 }
 
-/** Check if a directory is empty (no files or subdirs). */
+/** List symlinks in a specific directory. */
+function symlinksInDir(model: FSModel, dir: string): string[] {
+  const prefix = dir === "/" ? "/" : dir + "/";
+  return [...model.symlinks.keys()].filter((p) => {
+    if (!p.startsWith(prefix)) return false;
+    const rest = p.slice(prefix.length);
+    return !rest.includes("/");
+  });
+}
+
+/** Check if a directory is empty (no files, subdirs, or symlinks). */
 function isDirEmpty(model: FSModel, dir: string): boolean {
-  return filesInDir(model, dir).length === 0 && dirsInDir(model, dir).length === 0;
+  return filesInDir(model, dir).length === 0 &&
+    dirsInDir(model, dir).length === 0 &&
+    symlinksInDir(model, dir).length === 0;
 }
 
 // ---------------------------------------------------------------
@@ -131,15 +144,26 @@ type Op =
   | { type: "rmdir"; path: string }
   | { type: "renameDir"; oldPath: string; newPath: string }
   | { type: "overwrite"; path: string; data: Uint8Array }
+  | { type: "symlink"; target: string; path: string }
+  | { type: "readlink"; path: string }
+  | { type: "unlinkSymlink"; path: string }
+  | { type: "readThroughSymlink"; path: string; realPath: string }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat", "e.dat", "f.dat"];
+const LINK_NAMES = ["lnk1", "lnk2", "lnk3"];
 
 function generateOp(rng: Rng, model: FSModel): Op {
   const allFiles = [...model.files.keys()];
   const allDirs = [...model.dirs].filter((d) => d !== "/");
   const allContainerDirs = [...model.dirs];
+  const allSymlinks = [...model.symlinks.keys()];
+  // Symlinks that point to files that still exist (for reading through)
+  const validSymlinks = allSymlinks.filter((p) => {
+    const target = model.symlinks.get(p)!;
+    return model.files.has(target);
+  });
 
   // Weight operation types based on state
   const weights: Array<[string, number]> = [
@@ -153,6 +177,10 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["overwrite", allFiles.length > 0 ? 8 : 0],
     ["rmdir", allDirs.filter((d) => isDirEmpty(model, d)).length > 0 ? 5 : 0],
     ["renameDir", allDirs.length > 0 ? 5 : 0],
+    ["symlink", allFiles.length > 0 ? 8 : 0],
+    ["readlink", allSymlinks.length > 0 ? 4 : 0],
+    ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
+    ["readThroughSymlink", validSymlinks.length > 0 ? 6 : 0],
     ["syncfs", 3],
   ];
 
@@ -255,6 +283,27 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "renameDir", oldPath, newPath };
     }
 
+    case "symlink": {
+      const dir = rng.pick(allContainerDirs);
+      const name = rng.pick(LINK_NAMES);
+      const path = dir === "/" ? `/${name}` : `${dir}/${name}`;
+      // Point at a random existing file
+      const target = rng.pick(allFiles);
+      return { type: "symlink", target, path };
+    }
+
+    case "readlink":
+      return { type: "readlink", path: rng.pick(allSymlinks) };
+
+    case "unlinkSymlink":
+      return { type: "unlinkSymlink", path: rng.pick(allSymlinks) };
+
+    case "readThroughSymlink": {
+      const linkPath = rng.pick(validSymlinks);
+      const realPath = model.symlinks.get(linkPath)!;
+      return { type: "readThroughSymlink", path: linkPath, realPath };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -337,6 +386,33 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void): OpResult {
         return { error: null };
       }
 
+      case "symlink": {
+        FS.symlink(op.target, op.path);
+        return { error: null };
+      }
+
+      case "readlink": {
+        const target = FS.readlink(op.path);
+        return { error: null, data: new TextEncoder().encode(target) };
+      }
+
+      case "unlinkSymlink": {
+        FS.unlink(op.path);
+        return { error: null };
+      }
+
+      case "readThroughSymlink": {
+        // Read file contents through the symlink path
+        const stat = FS.stat(op.path);
+        const buf = new Uint8Array(stat.size);
+        if (stat.size > 0) {
+          const s = FS.open(op.path, O.RDONLY);
+          FS.read(s, buf, 0, stat.size, 0);
+          FS.close(s);
+        }
+        return { error: null, data: buf, size: stat.size };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -402,12 +478,26 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
           model.dirs.add(op.newPath + dir.slice(op.oldPath.length));
         }
       }
+      // Move all symlinks under old dir
+      for (const [path, target] of [...model.symlinks]) {
+        if (path.startsWith(oldPrefix)) {
+          model.symlinks.delete(path);
+          model.symlinks.set(op.newPath + path.slice(op.oldPath.length), target);
+        }
+      }
       // If target was an existing empty dir, it's replaced
       if (!model.dirs.has(op.newPath)) {
         model.dirs.add(op.newPath);
       }
       break;
     }
+    case "symlink":
+      model.symlinks.set(op.path, op.target);
+      break;
+    case "unlinkSymlink":
+      model.symlinks.delete(op.path);
+      break;
+    // readlink and readThroughSymlink don't modify state
   }
 }
 
@@ -434,6 +524,14 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] mkdir(${op.path})`;
     case "rmdir":
       return `[${index}] rmdir(${op.path})`;
+    case "symlink":
+      return `[${index}] symlink(${op.target} -> ${op.path})`;
+    case "readlink":
+      return `[${index}] readlink(${op.path})`;
+    case "unlinkSymlink":
+      return `[${index}] unlinkSymlink(${op.path})`;
+    case "readThroughSymlink":
+      return `[${index}] readThroughSymlink(${op.path} -> ${op.realPath})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -573,7 +671,37 @@ function compareFileContents(
   }
 }
 
-/** Compare all files tracked by the model between two FSes. */
+/** Compare symlink targets between two FSes. */
+function compareSymlinks(
+  memFS: EmscriptenFS,
+  tomeFS: EmscriptenFS,
+  model: FSModel,
+  context: string,
+): void {
+  for (const [path, _target] of model.symlinks) {
+    let memErr: string | null = null, tomeErr: string | null = null;
+    let memTarget: string | undefined, tomeTarget: string | undefined;
+
+    try { memTarget = memFS.readlink(path); } catch (e: any) { memErr = `errno:${e.errno}`; }
+    try { tomeTarget = tomeFS.readlink(path); } catch (e: any) { tomeErr = `errno:${e.errno}`; }
+
+    if (memErr || tomeErr) {
+      expect(tomeErr, `${context}: readlink error mismatch for ${path}`).toBe(memErr);
+      continue;
+    }
+
+    expect(tomeTarget, `${context}: symlink target mismatch for ${path}`).toBe(memTarget);
+
+    // Also verify lstat reports a symlink
+    const memLstat = memFS.lstat(path);
+    const tomeLstat = tomeFS.lstat(path);
+    expect(tomeFS.isLink(tomeLstat.mode), `${context}: ${path} should be a symlink in tomefs`).toBe(
+      memFS.isLink(memLstat.mode),
+    );
+  }
+}
+
+/** Compare all files and symlinks tracked by the model between two FSes. */
 function compareAllFiles(
   memFS: EmscriptenFS,
   tomeFS: EmscriptenFS,
@@ -583,6 +711,7 @@ function compareAllFiles(
   for (const path of model.files.keys()) {
     compareFileContents(memFS, tomeFS, path, context);
   }
+  compareSymlinks(memFS, tomeFS, model, context);
 }
 
 // ---------------------------------------------------------------
@@ -617,7 +746,7 @@ async function runFuzzSequence(
     updateModel(model, op, memResult);
 
     // For read operations, compare returned data
-    if (op.type === "readFile" && !memResult.error && memResult.data && tomeResult.data) {
+    if ((op.type === "readFile" || op.type === "readThroughSymlink" || op.type === "readlink") && !memResult.error && memResult.data && tomeResult.data) {
       expect(tomeResult.data.length, `${desc}: read length mismatch`).toBe(memResult.data.length);
       for (let j = 0; j < memResult.data.length; j++) {
         if (memResult.data[j] !== tomeResult.data[j]) {
