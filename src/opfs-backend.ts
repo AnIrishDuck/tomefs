@@ -256,9 +256,7 @@ export class OpfsBackend implements StorageBackend {
       }
     }
 
-    for (const name of toRemove) {
-      await fileDir.removeEntry(name);
-    }
+    await Promise.all(toRemove.map((name) => fileDir.removeEntry(name)));
   }
 
   async readMeta(path: string): Promise<FileMeta | null> {
@@ -275,7 +273,13 @@ export class OpfsBackend implements StorageBackend {
 
     const file = await handle.getFile();
     const text = await file.text();
-    return JSON.parse(text) as FileMeta;
+    try {
+      return JSON.parse(text) as FileMeta;
+    } catch {
+      // Corrupted metadata (e.g., partial write on tab close).
+      // Treat as missing rather than crashing the filesystem.
+      return null;
+    }
   }
 
   async writeMeta(path: string, meta: FileMeta): Promise<void> {
