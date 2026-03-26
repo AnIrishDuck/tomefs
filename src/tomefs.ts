@@ -513,6 +513,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     node: any,
     path: string,
     currentPaths: Set<string>,
+    metaBatch: Array<{ path: string; meta: FileMeta }>,
   ): Set<any> {
     const visited = new Set<any>();
 
@@ -521,33 +522,42 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (FS.isFile(node.mode)) {
         currentPaths.add(path);
         // Page data is already flushed by flushAll() before persistTree() is called.
-        backend.writeMeta(path, {
-          size: node.usedBytes,
-          mode: node.mode,
-          ctime: node.ctime,
-          mtime: node.mtime,
-          atime: node.atime,
+        metaBatch.push({
+          path,
+          meta: {
+            size: node.usedBytes,
+            mode: node.mode,
+            ctime: node.ctime,
+            mtime: node.mtime,
+            atime: node.atime,
+          },
         });
       } else if (FS.isLink(node.mode)) {
         currentPaths.add(path);
-        backend.writeMeta(path, {
-          size: 0,
-          mode: node.mode,
-          ctime: node.ctime,
-          mtime: node.mtime,
-          atime: node.atime,
-          link: node.link,
-        });
-      } else if (FS.isDir(node.mode)) {
-        // Persist directory metadata (skip root — it's recreated on mount)
-        if (path !== "/") {
-          currentPaths.add(path);
-          backend.writeMeta(path, {
+        metaBatch.push({
+          path,
+          meta: {
             size: 0,
             mode: node.mode,
             ctime: node.ctime,
             mtime: node.mtime,
             atime: node.atime,
+            link: node.link,
+          },
+        });
+      } else if (FS.isDir(node.mode)) {
+        // Persist directory metadata (skip root — it's recreated on mount)
+        if (path !== "/") {
+          currentPaths.add(path);
+          metaBatch.push({
+            path,
+            meta: {
+              size: 0,
+              mode: node.mode,
+              ctime: node.ctime,
+              mtime: node.mtime,
+              atime: node.atime,
+            },
           });
         }
         // Recurse into children
@@ -688,7 +698,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // is already written. Worst case is stale orphan entries that get
           // cleaned up on the next sync — never metadata loss.
           const currentPaths = new Set<string>();
-          const visited = persistTree(mount.root, "/", currentPaths);
+          const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
+          const visited = persistTree(mount.root, "/", currentPaths, metaBatch);
 
           // Persist "detached" file nodes — nodes created via tomefs's
           // createNode but parented in MEMFS's directory tree instead of
@@ -707,12 +718,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               // flushAll() already flushed dirty pages, but detached nodes
               // may not have been flushed if their storagePath differs.
               pageCache.flushFile(node.storagePath);
-              backend.writeMeta(path, {
-                size: node.usedBytes,
-                mode: node.mode,
-                ctime: node.ctime,
-                mtime: node.mtime,
-                atime: node.atime,
+              metaBatch.push({
+                path,
+                meta: {
+                  size: node.usedBytes,
+                  mode: node.mode,
+                  ctime: node.ctime,
+                  mtime: node.mtime,
+                  atime: node.atime,
+                },
               });
             }
           }
@@ -730,17 +744,24 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               if (backend.readMeta(dirPath)) break; // already persisted
               currentPaths.add(dirPath);
               if (FS.isDir(dir.mode)) {
-                backend.writeMeta(dirPath, {
-                  size: 0,
-                  mode: dir.mode,
-                  ctime: dir.ctime,
-                  mtime: dir.mtime,
-                  atime: dir.atime,
+                metaBatch.push({
+                  path: dirPath,
+                  meta: {
+                    size: 0,
+                    mode: dir.mode,
+                    ctime: dir.ctime,
+                    mtime: dir.mtime,
+                    atime: dir.atime,
+                  },
                 });
               }
               dir = dir.parent;
             }
           }
+
+          // Batch-write all collected metadata in a single backend call.
+          // Through the SAB bridge, this reduces O(n) round-trips to O(1).
+          backend.writeMetas(metaBatch);
 
           // Delete metadata and orphaned page data for paths no longer in the tree.
           // Page data can become orphaned if the process crashes between an unlink
@@ -748,12 +769,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // On restart, restoreTree recreates the file from stale metadata, but
           // the pages may already be gone — or they may still exist if the crash
           // happened before backend.deleteFile completed.  Either way, clean up both.
+          const orphanPaths: string[] = [];
           for (const path of backend.listFiles()) {
             if (!currentPaths.has(path)) {
-              backend.deleteFile(path);
-              backend.deleteMeta(path);
+              orphanPaths.push(path);
             }
           }
+          for (const path of orphanPaths) {
+            backend.deleteFile(path);
+          }
+          backend.deleteMetas(orphanPaths);
         }
         callback(null);
       } catch (err) {

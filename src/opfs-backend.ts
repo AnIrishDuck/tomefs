@@ -274,6 +274,19 @@ export class OpfsBackend implements StorageBackend {
     await writable.close();
   }
 
+  async writeMetas(
+    entries: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    if (entries.length === 1) {
+      await this.writeMeta(entries[0].path, entries[0].meta);
+      return;
+    }
+    await Promise.all(
+      entries.map(({ path, meta }) => this.writeMeta(path, meta)),
+    );
+  }
+
   async deleteMeta(path: string): Promise<void> {
     await this.init();
     const encoded = encodePath(path);
@@ -282,6 +295,15 @@ export class OpfsBackend implements StorageBackend {
     } catch {
       // File doesn't exist — no-op
     }
+  }
+
+  async deleteMetas(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+    if (paths.length === 1) {
+      await this.deleteMeta(paths[0]);
+      return;
+    }
+    await Promise.all(paths.map((path) => this.deleteMeta(path)));
   }
 
   async listFiles(): Promise<string[]> {

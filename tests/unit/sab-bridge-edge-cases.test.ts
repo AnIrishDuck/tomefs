@@ -142,9 +142,19 @@ class FailingBackend implements StorageBackend {
     return this.inner.writeMeta(path, meta);
   }
 
+  async writeMetas(entries: Array<{ path: string; meta: FileMeta }>): Promise<void> {
+    this.maybeThrow("writeMetas");
+    return this.inner.writeMetas(entries);
+  }
+
   async deleteMeta(path: string): Promise<void> {
     this.maybeThrow("deleteMeta");
     return this.inner.deleteMeta(path);
+  }
+
+  async deleteMetas(paths: string[]): Promise<void> {
+    this.maybeThrow("deleteMetas");
+    return this.inner.deleteMetas(paths);
   }
 
   async listFiles(): Promise<string[]> {
@@ -203,8 +213,16 @@ class SlowBackend implements StorageBackend {
     return this.inner.writeMeta(path, meta);
   }
 
+  async writeMetas(entries: Array<{ path: string; meta: FileMeta }>): Promise<void> {
+    return this.inner.writeMetas(entries);
+  }
+
   async deleteMeta(path: string): Promise<void> {
     return this.inner.deleteMeta(path);
+  }
+
+  async deleteMetas(paths: string[]): Promise<void> {
+    return this.inner.deleteMetas(paths);
   }
 
   async listFiles(): Promise<string[]> {

@@ -62,11 +62,29 @@ class RecordingBackend extends SyncMemoryBackend {
     super.writeMeta(path, meta);
   }
 
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
+    if (this.recording) {
+      for (const { path } of entries) {
+        this.operations.push({ op: "writeMeta", path });
+      }
+    }
+    super.writeMetas(entries);
+  }
+
   deleteMeta(path: string): void {
     if (this.recording) {
       this.operations.push({ op: "deleteMeta", path });
     }
     super.deleteMeta(path);
+  }
+
+  deleteMetas(paths: string[]): void {
+    if (this.recording) {
+      for (const path of paths) {
+        this.operations.push({ op: "deleteMeta", path });
+      }
+    }
+    super.deleteMetas(paths);
   }
 
   deleteFile(path: string): void {

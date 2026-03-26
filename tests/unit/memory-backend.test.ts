@@ -212,6 +212,62 @@ describe("MemoryBackend", () => {
     });
   });
 
+  describe("batch metadata write", () => {
+    it("@fast writes multiple metadata entries in one call", async () => {
+      await backend.writeMetas([
+        { path: "/a", meta: { size: 100, mode: 0o644, ctime: 1, mtime: 2 } },
+        { path: "/b", meta: { size: 200, mode: 0o755, ctime: 3, mtime: 4 } },
+        { path: "/c/d", meta: { size: 0, mode: 0o40755, ctime: 5, mtime: 6 } },
+      ]);
+
+      const a = await backend.readMeta("/a");
+      const b = await backend.readMeta("/b");
+      const cd = await backend.readMeta("/c/d");
+      expect(a).toEqual({ size: 100, mode: 0o644, ctime: 1, mtime: 2 });
+      expect(b).toEqual({ size: 200, mode: 0o755, ctime: 3, mtime: 4 });
+      expect(cd).toEqual({ size: 0, mode: 0o40755, ctime: 5, mtime: 6 });
+    });
+
+    it("overwrites existing metadata", async () => {
+      await backend.writeMeta("/a", { size: 100, mode: 0o644, ctime: 1, mtime: 2 });
+      await backend.writeMetas([
+        { path: "/a", meta: { size: 999, mode: 0o755, ctime: 10, mtime: 20 } },
+      ]);
+      expect((await backend.readMeta("/a"))!.size).toBe(999);
+    });
+
+    it("is a no-op for empty array", async () => {
+      await backend.writeMetas([]);
+      expect(await backend.listFiles()).toEqual([]);
+    });
+  });
+
+  describe("batch metadata delete", () => {
+    it("@fast deletes multiple metadata entries in one call", async () => {
+      const meta = { size: 0, mode: 0o644, ctime: 0, mtime: 0 };
+      await backend.writeMeta("/a", meta);
+      await backend.writeMeta("/b", meta);
+      await backend.writeMeta("/c", meta);
+
+      await backend.deleteMetas(["/a", "/c"]);
+
+      expect(await backend.readMeta("/a")).toBeNull();
+      expect(await backend.readMeta("/b")).not.toBeNull();
+      expect(await backend.readMeta("/c")).toBeNull();
+    });
+
+    it("is a no-op for empty array", async () => {
+      await backend.writeMeta("/a", { size: 0, mode: 0o644, ctime: 0, mtime: 0 });
+      await backend.deleteMetas([]);
+      expect(await backend.readMeta("/a")).not.toBeNull();
+    });
+
+    it("silently ignores non-existent paths", async () => {
+      await backend.deleteMetas(["/nonexistent"]);
+      // No error thrown
+    });
+  });
+
   describe("listFiles", () => {
     it("returns empty array when no files exist", async () => {
       expect(await backend.listFiles()).toEqual([]);
