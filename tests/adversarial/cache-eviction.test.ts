@@ -43,7 +43,7 @@ describe("adversarial: cache eviction under pressure", () => {
   let h: FSHarness;
 
   beforeEach(async () => {
-    h = await createFS();
+    h = await createSmallCacheFS();
   });
 
   // ------------------------------------------------------------------

@@ -328,7 +328,10 @@ export async function createFS(): Promise<FSHarness> {
   const backendName = process.env.TOMEFS_BACKEND;
   if (backendName === "tomefs") {
     const { createTomeFS } = await import("../../src/tomefs.js");
-    const tomefs = createTomeFS(rawFS);
+    const maxPages = process.env.TOMEFS_MAX_PAGES
+      ? parseInt(process.env.TOMEFS_MAX_PAGES, 10)
+      : undefined;
+    const tomefs = createTomeFS(rawFS, maxPages ? { maxPages } : undefined);
 
     rawFS.mkdir(TOME_MOUNT);
     rawFS.mount(tomefs, {}, TOME_MOUNT);
