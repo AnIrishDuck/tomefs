@@ -142,6 +142,93 @@ describe("OpfsBackend", () => {
 
       expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0xbb));
     });
+
+    it("writes many pages across multiple files in parallel", async () => {
+      const pages = [];
+      for (let f = 0; f < 5; f++) {
+        for (let p = 0; p < 4; p++) {
+          pages.push({
+            path: `/file${f}`,
+            pageIndex: p,
+            data: filledPage(f * 10 + p),
+          });
+        }
+      }
+
+      await backend.writePages(pages);
+
+      for (let f = 0; f < 5; f++) {
+        for (let p = 0; p < 4; p++) {
+          expect(await backend.readPage(`/file${f}`, p)).toEqual(
+            filledPage(f * 10 + p),
+          );
+        }
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Rename operations
+  // -------------------------------------------------------------------
+
+  describe("renameFile", () => {
+    it("moves all pages from old path to new path", async () => {
+      await backend.writePage("/old", 0, filledPage(0x01));
+      await backend.writePage("/old", 1, filledPage(0x02));
+      await backend.writePage("/old", 2, filledPage(0x03));
+
+      await backend.renameFile("/old", "/new");
+
+      // Old pages gone
+      expect(await backend.readPage("/old", 0)).toBeNull();
+      expect(await backend.readPage("/old", 1)).toBeNull();
+      expect(await backend.readPage("/old", 2)).toBeNull();
+
+      // New pages present with correct data
+      expect(await backend.readPage("/new", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/new", 1)).toEqual(filledPage(0x02));
+      expect(await backend.readPage("/new", 2)).toEqual(filledPage(0x03));
+    });
+
+    it("overwrites existing destination pages", async () => {
+      await backend.writePage("/old", 0, filledPage(0xaa));
+      await backend.writePage("/dest", 0, filledPage(0xbb));
+
+      await backend.renameFile("/old", "/dest");
+
+      expect(await backend.readPage("/dest", 0)).toEqual(filledPage(0xaa));
+      expect(await backend.readPage("/old", 0)).toBeNull();
+    });
+
+    it("renaming non-existent file is a no-op", async () => {
+      await backend.renameFile("/nonexistent", "/dest");
+      expect(await backend.readPage("/dest", 0)).toBeNull();
+    });
+
+    it("does not affect other files", async () => {
+      await backend.writePage("/a", 0, filledPage(0x01));
+      await backend.writePage("/b", 0, filledPage(0x02));
+      await backend.writePage("/c", 0, filledPage(0x03));
+
+      await backend.renameFile("/a", "/d");
+
+      expect(await backend.readPage("/b", 0)).toEqual(filledPage(0x02));
+      expect(await backend.readPage("/c", 0)).toEqual(filledPage(0x03));
+    });
+
+    it("handles rename with many pages (parallel copy)", async () => {
+      const pageCount = 20;
+      for (let i = 0; i < pageCount; i++) {
+        await backend.writePage("/source", i, filledPage(i));
+      }
+
+      await backend.renameFile("/source", "/target");
+
+      for (let i = 0; i < pageCount; i++) {
+        expect(await backend.readPage("/source", i)).toBeNull();
+        expect(await backend.readPage("/target", i)).toEqual(filledPage(i));
+      }
+    });
   });
 
   // -------------------------------------------------------------------
