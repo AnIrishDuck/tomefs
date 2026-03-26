@@ -168,6 +168,54 @@ describe("OpfsBackend", () => {
   });
 
   // -------------------------------------------------------------------
+  // Batch reads
+  // -------------------------------------------------------------------
+
+  describe("readPages (batch)", () => {
+    it("returns empty array for empty indices", async () => {
+      const result = await backend.readPages("/file", []);
+      expect(result).toEqual([]);
+    });
+
+    it("returns nulls for non-existent file", async () => {
+      const result = await backend.readPages("/nonexistent", [0, 1, 2]);
+      expect(result).toEqual([null, null, null]);
+    });
+
+    it("reads multiple pages in parallel", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 1, filledPage(0x02));
+      await backend.writePage("/file", 2, filledPage(0x03));
+
+      const result = await backend.readPages("/file", [0, 1, 2]);
+      expect(result[0]).toEqual(filledPage(0x01));
+      expect(result[1]).toEqual(filledPage(0x02));
+      expect(result[2]).toEqual(filledPage(0x03));
+    });
+
+    it("returns null for missing pages in a sparse read", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 3, filledPage(0x04));
+
+      const result = await backend.readPages("/file", [0, 1, 2, 3]);
+      expect(result[0]).toEqual(filledPage(0x01));
+      expect(result[1]).toBeNull();
+      expect(result[2]).toBeNull();
+      expect(result[3]).toEqual(filledPage(0x04));
+    });
+
+    it("preserves order matching indices", async () => {
+      await backend.writePage("/file", 2, filledPage(0xcc));
+      await backend.writePage("/file", 0, filledPage(0xaa));
+
+      // Request in reverse order
+      const result = await backend.readPages("/file", [2, 0]);
+      expect(result[0]).toEqual(filledPage(0xcc));
+      expect(result[1]).toEqual(filledPage(0xaa));
+    });
+  });
+
+  // -------------------------------------------------------------------
   // Rename operations
   // -------------------------------------------------------------------
 
@@ -566,6 +614,50 @@ describe("OpfsBackend", () => {
 
       await expect(b.deleteMeta("/any")).rejects.toThrow("IO error");
       metaDir.removeEntry = original;
+    });
+
+    it("readMeta returns null for corrupted JSON metadata", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+
+      // Write valid metadata first
+      await b.writeMeta("/corrupt", { size: 100, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      // Corrupt the metadata file by writing invalid JSON directly
+      const metaDir = (b as any).metaDir;
+      const encoded = Array.from(new TextEncoder().encode("/corrupt"))
+        .map((byte: number) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      const handle = await metaDir.getFileHandle(encoded);
+      const writable = await handle.createWritable();
+      await writable.write("{truncated");
+      await writable.close();
+
+      // Should return null instead of crashing
+      const result = await b.readMeta("/corrupt");
+      expect(result).toBeNull();
+      await b.destroy();
+    });
+
+    it("readMeta returns null for empty metadata file", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+
+      await b.writeMeta("/empty", { size: 0, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      // Write empty content to metadata file
+      const metaDir = (b as any).metaDir;
+      const encoded = Array.from(new TextEncoder().encode("/empty"))
+        .map((byte: number) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      const handle = await metaDir.getFileHandle(encoded);
+      const writable = await handle.createWritable();
+      await writable.write("");
+      await writable.close();
+
+      const result = await b.readMeta("/empty");
+      expect(result).toBeNull();
+      await b.destroy();
     });
 
     it("readMeta propagates non-NotFoundError", async () => {
