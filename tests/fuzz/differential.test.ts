@@ -144,6 +144,8 @@ type Op =
   | { type: "rmdir"; path: string }
   | { type: "renameDir"; oldPath: string; newPath: string }
   | { type: "overwrite"; path: string; data: Uint8Array }
+  | { type: "chmod"; path: string; mode: number }
+  | { type: "utime"; path: string; atime: number; mtime: number }
   | { type: "symlink"; target: string; path: string }
   | { type: "readlink"; path: string }
   | { type: "unlinkSymlink"; path: string }
@@ -175,6 +177,8 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["renameFile", allFiles.length > 0 ? 10 : 0],
     ["unlink", allFiles.length > 0 ? 8 : 0],
     ["overwrite", allFiles.length > 0 ? 8 : 0],
+    ["chmod", allFiles.length > 0 ? 6 : 0],
+    ["utime", allFiles.length > 0 ? 6 : 0],
     ["rmdir", allDirs.filter((d) => isDirEmpty(model, d)).length > 0 ? 5 : 0],
     ["renameDir", allDirs.length > 0 ? 5 : 0],
     ["symlink", allFiles.length > 0 ? 8 : 0],
@@ -263,6 +267,21 @@ function generateOp(rng: Rng, model: FSModel): Op {
       const size = rng.pick(sizeChoices);
       const data = rng.bytes(size);
       return { type: "overwrite", path, data };
+    }
+
+    case "chmod": {
+      const path = rng.pick(allFiles);
+      const modeChoices = [0o444, 0o555, 0o644, 0o666, 0o755, 0o777];
+      return { type: "chmod", path, mode: rng.pick(modeChoices) };
+    }
+
+    case "utime": {
+      const path = rng.pick(allFiles);
+      // Use fixed timestamps for deterministic comparison
+      const baseTime = 1000000000000; // ~2001
+      const atime = baseTime + rng.int(1000000000);
+      const mtime = baseTime + rng.int(1000000000);
+      return { type: "utime", path, atime, mtime };
     }
 
     case "rmdir": {
@@ -374,6 +393,16 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void): OpResult {
         }
         FS.close(s);
         return { error: null, size: op.data.length };
+      }
+
+      case "chmod": {
+        FS.chmod(op.path, op.mode);
+        return { error: null };
+      }
+
+      case "utime": {
+        FS.utime(op.path, op.atime, op.mtime);
+        return { error: null };
       }
 
       case "mkdir": {
@@ -520,6 +549,10 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] unlink(${op.path})`;
     case "overwrite":
       return `[${index}] overwrite(${op.path}, ${op.data.length}B)`;
+    case "chmod":
+      return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
+    case "utime":
+      return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
     case "mkdir":
       return `[${index}] mkdir(${op.path})`;
     case "rmdir":
@@ -643,6 +676,7 @@ function compareFileContents(
   }
 
   expect(tomeStat.size, `${context}: size mismatch for ${path}`).toBe(memStat.size);
+  expect(tomeStat.mode, `${context}: mode mismatch for ${path}`).toBe(memStat.mode);
 
   if (memStat.size > 0) {
     const memBuf = new Uint8Array(memStat.size);
@@ -744,6 +778,27 @@ async function runFuzzSequence(
 
     // Update model on success
     updateModel(model, op, memResult);
+
+    // For utime operations, verify timestamps were set identically
+    if (op.type === "utime" && !memResult.error) {
+      const memStat = memFS.stat(op.path);
+      const tomeStat = tomeFS.stat(op.path);
+      expect(
+        new Date(tomeStat.atime).getTime(),
+        `${desc}: atime mismatch after utime`,
+      ).toBe(new Date(memStat.atime).getTime());
+      expect(
+        new Date(tomeStat.mtime).getTime(),
+        `${desc}: mtime mismatch after utime`,
+      ).toBe(new Date(memStat.mtime).getTime());
+    }
+
+    // For chmod operations, verify mode was set identically
+    if (op.type === "chmod" && !memResult.error) {
+      const memStat = memFS.stat(op.path);
+      const tomeStat = tomeFS.stat(op.path);
+      expect(tomeStat.mode, `${desc}: mode mismatch after chmod`).toBe(memStat.mode);
+    }
 
     // For read operations, compare returned data
     if ((op.type === "readFile" || op.type === "readThroughSymlink" || op.type === "readlink") && !memResult.error && memResult.data && tomeResult.data) {
