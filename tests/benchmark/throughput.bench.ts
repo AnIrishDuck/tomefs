@@ -64,30 +64,37 @@ async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
   rawFS.mkdir(TOME_MOUNT);
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
-  // Wrap FS with path rewriting so benchmarks use clean paths
+  // Wrap FS with path rewriting so benchmarks use clean paths.
+  // Pre-bind methods to avoid Proxy overhead on the hot path —
+  // a Proxy get-trap calling val.bind(target) on every access creates
+  // a new Function object per call, unfairly penalizing tomefs benchmarks.
+  const methodCache = new Map<string, Function>();
+  const pathMethods = new Set([
+    "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
+    "readdir", "unlink", "writeFile", "readFile", "mknod",
+    "chmod", "utime",
+  ]);
+
   const wrappedFS = new Proxy(rawFS, {
     get(target: any, prop: string) {
+      const cached = methodCache.get(prop);
+      if (cached) return cached;
+
       const val = target[prop];
       if (typeof val !== "function") return val;
 
-      // Methods that take a path as first arg
-      const pathMethods = new Set([
-        "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
-        "readdir", "unlink", "writeFile", "readFile", "mknod",
-        "chmod", "utime",
-      ]);
-
+      let wrapped: Function;
       if (pathMethods.has(prop)) {
-        return (path: string, ...args: any[]) =>
+        wrapped = (path: string, ...args: any[]) =>
           val.call(target, rewritePath(path), ...args);
-      }
-
-      if (prop === "rename") {
-        return (oldPath: string, newPath: string) =>
+      } else if (prop === "rename") {
+        wrapped = (oldPath: string, newPath: string) =>
           val.call(target, rewritePath(oldPath), rewritePath(newPath));
+      } else {
+        wrapped = val.bind(target);
       }
-
-      return val.bind(target);
+      methodCache.set(prop, wrapped);
+      return wrapped;
     },
   }) as unknown as EmscriptenFS;
 
