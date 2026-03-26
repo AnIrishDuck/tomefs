@@ -152,6 +152,41 @@ describe("PreloadBackend", () => {
       const backend = new PreloadBackend(remote);
       expect(() => backend.readPage("/x", 0)).toThrow("init()");
     });
+
+    it("concurrent init() calls are safe (idempotent)", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0xcc;
+      await remote.writePage("/f", 0, data);
+      await remote.writeMeta("/f", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 1000,
+      });
+
+      const backend = new PreloadBackend(remote);
+      // Call init() multiple times concurrently
+      await Promise.all([backend.init(), backend.init(), backend.init()]);
+
+      const read = backend.readPage("/f", 0);
+      expect(read).not.toBeNull();
+      expect(read![0]).toBe(0xcc);
+    });
+
+    it("repeated init() after completion is a no-op", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+      const backend = new PreloadBackend(counting);
+
+      await backend.init();
+      const firstCallCount = counting.calls["listFiles"] ?? 0;
+
+      counting.resetCounts();
+      await backend.init();
+
+      // Second init should not call listFiles again
+      expect(counting.calls["listFiles"] ?? 0).toBe(0);
+    });
   });
 
   describe("sync operations after init", () => {

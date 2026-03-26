@@ -237,6 +237,19 @@ export class OpfsBackend implements StorageBackend {
       }),
     );
 
+    // Verify all pages were copied before deleting the source.
+    // Without this check, a partial copy failure would cause data loss
+    // when the old directory is removed.
+    const copiedNames: string[] = [];
+    for await (const name of (newDir as IterableDirectoryHandle).keys()) {
+      copiedNames.push(name);
+    }
+    if (copiedNames.length < names.length) {
+      throw new Error(
+        `OPFS renameFile: copy verification failed — expected ${names.length} pages but found ${copiedNames.length}`,
+      );
+    }
+
     // Remove old pages directory.
     await this.pagesDir!.removeEntry(oldEncoded, { recursive: true });
   }

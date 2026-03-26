@@ -30,7 +30,7 @@
 import type { StorageBackend } from "./storage-backend.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
 import type { FileMeta } from "./types.js";
-import { PAGE_SIZE, pageKeyStr } from "./types.js";
+import { PAGE_SIZE, MAX_PROBE_PAGE, pageKeyStr } from "./types.js";
 
 export class PreloadBackend implements SyncStorageBackend {
   private readonly remote: StorageBackend;
@@ -49,6 +49,7 @@ export class PreloadBackend implements SyncStorageBackend {
   private deletedMeta = new Set<string>();
 
   private initialized = false;
+  private initPromise: Promise<void> | null = null;
 
   constructor(remote: StorageBackend) {
     this.remote = remote;
@@ -57,8 +58,18 @@ export class PreloadBackend implements SyncStorageBackend {
   /**
    * Load all metadata and pages from the remote backend into memory.
    * Must be called (and awaited) before using any sync methods.
+   *
+   * Idempotent: concurrent or repeated calls return the same promise.
    */
   async init(): Promise<void> {
+    if (this.initialized) return;
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = this.doInit();
+    return this.initPromise;
+  }
+
+  private async doInit(): Promise<void> {
     const files = await this.remote.listFiles();
 
     // Load all metadata
@@ -103,7 +114,8 @@ export class PreloadBackend implements SyncStorageBackend {
         let hi = pageCount + 1;
         while (await this.remote.readPage(path, hi)) {
           lo = hi;
-          hi *= 2;
+          hi = Math.min(hi * 2, MAX_PROBE_PAGE);
+          if (hi === lo) break; // hit cap — lo is the last known page
         }
 
         // Binary search between lo (exists) and hi (missing)
