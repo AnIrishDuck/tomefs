@@ -81,14 +81,22 @@ class Rng {
 // Filesystem state model (tracks what exists for valid op generation)
 // ---------------------------------------------------------------
 
+interface OpenFd {
+  id: number;       // unique id for the fd slot
+  path: string;     // path at time of open (may have been renamed since)
+  currentPath: string; // tracks the file's current path after renames
+}
+
 interface FSModel {
   files: Map<string, number>; // path -> size
   dirs: Set<string>;          // directory paths
   symlinks: Map<string, string>; // link path -> target
+  openFds: Map<number, OpenFd>; // fd slot id -> open fd info
+  nextFdId: number;
 }
 
 function newModel(): FSModel {
-  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map() };
+  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map(), openFds: new Map(), nextFdId: 0 };
 }
 
 /** List files in a specific directory. */
@@ -150,6 +158,10 @@ type Op =
   | { type: "readlink"; path: string }
   | { type: "unlinkSymlink"; path: string }
   | { type: "readThroughSymlink"; path: string; realPath: string }
+  | { type: "openFd"; path: string; fdId: number }
+  | { type: "readFd"; fdId: number }
+  | { type: "writeFd"; fdId: number; data: Uint8Array; offset: number }
+  | { type: "closeFd"; fdId: number }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -185,6 +197,10 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["readlink", allSymlinks.length > 0 ? 4 : 0],
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
     ["readThroughSymlink", validSymlinks.length > 0 ? 6 : 0],
+    ["openFd", allFiles.length > 0 && model.openFds.size < 4 ? 8 : 0],
+    ["readFd", model.openFds.size > 0 ? 8 : 0],
+    ["writeFd", model.openFds.size > 0 ? 8 : 0],
+    ["closeFd", model.openFds.size > 0 ? 6 : 0],
     ["syncfs", 3],
   ];
 
@@ -323,6 +339,37 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "readThroughSymlink", path: linkPath, realPath };
     }
 
+    case "openFd": {
+      // Open a random existing file and keep the fd
+      const path = rng.pick(allFiles);
+      const fdId = model.nextFdId;
+      return { type: "openFd", path, fdId };
+    }
+
+    case "readFd": {
+      const fds = [...model.openFds.keys()];
+      return { type: "readFd", fdId: rng.pick(fds) };
+    }
+
+    case "writeFd": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const sizeChoices = [1, 50, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1];
+      const size = rng.pick(sizeChoices);
+      const data = rng.bytes(size);
+      // Write at beginning (to test data overwrite via fd)
+      const fdInfo = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+      const maxOffset = currentSize + PAGE_SIZE;
+      const offset = rng.int(maxOffset + 1);
+      return { type: "writeFd", fdId, data, offset };
+    }
+
+    case "closeFd": {
+      const fds = [...model.openFds.keys()];
+      return { type: "closeFd", fdId: rng.pick(fds) };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -339,7 +386,10 @@ interface OpResult {
   size?: number;
 }
 
-function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void): OpResult {
+/** Tracks actual FS stream objects for open fds on a specific FS instance. */
+type FdStreamMap = Map<number, any>; // fdId -> FS stream object
+
+function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdStreamMap): OpResult {
   try {
     switch (op.type) {
       case "createFile": {
@@ -442,6 +492,40 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void): OpResult {
         return { error: null, data: buf, size: stat.size };
       }
 
+      case "openFd": {
+        const stream = FS.open(op.path, O.RDWR);
+        if (fdStreams) fdStreams.set(op.fdId, stream);
+        return { error: null };
+      }
+
+      case "readFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        // Read entire file from position 0 using fstat for size
+        const fstatResult = FS.fstat(stream.fd ?? stream);
+        const buf = new Uint8Array(fstatResult.size);
+        if (fstatResult.size > 0) {
+          FS.read(stream, buf, 0, fstatResult.size, 0);
+        }
+        return { error: null, data: buf, size: fstatResult.size };
+      }
+
+      case "writeFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        FS.write(stream, op.data, 0, op.data.length, op.offset);
+        const fstatResult = FS.fstat(stream.fd ?? stream);
+        return { error: null, size: fstatResult.size };
+      }
+
+      case "closeFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        FS.close(stream);
+        fdStreams?.delete(op.fdId);
+        return { error: null };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -489,6 +573,12 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
       model.files.delete(op.oldPath);
       // If target was a file, it's replaced
       model.files.set(op.newPath, size);
+      // Update open fds that track the renamed file
+      for (const fd of model.openFds.values()) {
+        if (fd.currentPath === op.oldPath) {
+          fd.currentPath = op.newPath;
+        }
+      }
       break;
     }
     case "renameDir": {
@@ -514,6 +604,12 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
           model.symlinks.set(op.newPath + path.slice(op.oldPath.length), target);
         }
       }
+      // Update open fds that track files under the renamed dir
+      for (const fd of model.openFds.values()) {
+        if (fd.currentPath.startsWith(oldPrefix)) {
+          fd.currentPath = op.newPath + fd.currentPath.slice(op.oldPath.length);
+        }
+      }
       // If target was an existing empty dir, it's replaced
       if (!model.dirs.has(op.newPath)) {
         model.dirs.add(op.newPath);
@@ -526,7 +622,22 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
     case "unlinkSymlink":
       model.symlinks.delete(op.path);
       break;
-    // readlink and readThroughSymlink don't modify state
+    case "openFd":
+      model.openFds.set(op.fdId, { id: op.fdId, path: op.path, currentPath: op.path });
+      model.nextFdId++;
+      break;
+    case "writeFd": {
+      const fdInfo = model.openFds.get(op.fdId);
+      if (fdInfo) {
+        const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+        model.files.set(fdInfo.currentPath, Math.max(currentSize, op.offset + op.data.length));
+      }
+      break;
+    }
+    case "closeFd":
+      model.openFds.delete(op.fdId);
+      break;
+    // readFd, readlink, readThroughSymlink don't modify state
   }
 }
 
@@ -565,6 +676,14 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] unlinkSymlink(${op.path})`;
     case "readThroughSymlink":
       return `[${index}] readThroughSymlink(${op.path} -> ${op.realPath})`;
+    case "openFd":
+      return `[${index}] openFd(${op.path}, fdId=${op.fdId})`;
+    case "readFd":
+      return `[${index}] readFd(fdId=${op.fdId})`;
+    case "writeFd":
+      return `[${index}] writeFd(fdId=${op.fdId}, offset=${op.offset}, ${op.data.length}B)`;
+    case "closeFd":
+      return `[${index}] closeFd(fdId=${op.fdId})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -639,7 +758,13 @@ function createTomePathRewriter(realFS: any): EmscriptenFS {
     unlink(path) { return realFS.unlink(rw(path)); },
     rename(oldPath, newPath) { return realFS.rename(rw(oldPath), rw(newPath)); },
     symlink(target, linkpath) { return realFS.symlink(target.startsWith("/") ? rw(target) : target, rw(linkpath)); },
-    readlink(path) { return realFS.readlink(rw(path)); },
+    readlink(path) {
+      const target = realFS.readlink(rw(path));
+      // Strip mount prefix from returned target so it matches MEMFS paths
+      if (target.startsWith(TOME_MOUNT + "/")) return target.slice(TOME_MOUNT.length);
+      if (target === TOME_MOUNT) return "/";
+      return target;
+    },
     writeFile(path, data, opts?) { return realFS.writeFile(rw(path), data, opts); },
     readFile(path, opts?) { return realFS.readFile(rw(path), opts); },
     isFile(mode) { return realFS.isFile(mode); },
@@ -761,17 +886,19 @@ async function runFuzzSequence(
   const model = newModel();
   const { memFS, tomeFS, syncTomeFS } = await createDualFS(maxPages);
 
-  const ops: Op[] = [];
-  for (let i = 0; i < numOps; i++) {
-    ops.push(generateOp(rng, model));
-  }
+  // Track actual stream objects for open fds per FS
+  const memFdStreams: FdStreamMap = new Map();
+  const tomeFdStreams: FdStreamMap = new Map();
 
-  for (let i = 0; i < ops.length; i++) {
-    const op = ops[i];
+  // Generate ops lazily so fd-related state (nextFdId, openFds) is current.
+  // Previous approach of pre-generating all ops doesn't work with stateful
+  // fd tracking since fdIds depend on execution order.
+  for (let i = 0; i < numOps; i++) {
+    const op = generateOp(rng, model);
     const desc = formatOp(op, i);
 
-    const memResult = execOp(memFS, op);
-    const tomeResult = execOp(tomeFS, op, syncTomeFS);
+    const memResult = execOp(memFS, op, undefined, memFdStreams);
+    const tomeResult = execOp(tomeFS, op, syncTomeFS, tomeFdStreams);
 
     // Error behavior must match
     expect(tomeResult.error, `${desc}: error mismatch`).toBe(memResult.error);
@@ -801,7 +928,7 @@ async function runFuzzSequence(
     }
 
     // For read operations, compare returned data
-    if ((op.type === "readFile" || op.type === "readThroughSymlink" || op.type === "readlink") && !memResult.error && memResult.data && tomeResult.data) {
+    if ((op.type === "readFile" || op.type === "readThroughSymlink" || op.type === "readlink" || op.type === "readFd") && !memResult.error && memResult.data && tomeResult.data) {
       expect(tomeResult.data.length, `${desc}: read length mismatch`).toBe(memResult.data.length);
       for (let j = 0; j < memResult.data.length; j++) {
         if (memResult.data[j] !== tomeResult.data[j]) {

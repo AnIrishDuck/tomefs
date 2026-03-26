@@ -236,8 +236,19 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       }
       // Clean up target's storage if it's a file
       if (FS.isFile(new_node.mode)) {
-        pageCache.deleteFile(new_node.storagePath);
-        backend.deleteMeta(new_node.storagePath);
+        const targetStoragePath = new_node.storagePath;
+        if (new_node.openCount > 0) {
+          // Target has open fds — preserve its pages under a unique path
+          // so open fds can still read the old data (POSIX unlink semantics).
+          // The source is about to take over this storagePath.
+          const tempPath = `/__deleted_${nextPathId++}`;
+          pageCache.renameFile(targetStoragePath, tempPath);
+          new_node.storagePath = tempPath;
+          new_node.unlinked = true;
+        } else {
+          pageCache.deleteFile(targetStoragePath);
+        }
+        backend.deleteMeta(targetStoragePath);
         allFileNodes.delete(new_node);
       }
       FS.hashRemoveNode(new_node);
@@ -279,11 +290,19 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const node = parent.contents[name];
     if (node && FS.isFile(node.mode)) {
       node.unlinked = true;
-      // Defer page deletion: if open fds exist, data must remain readable.
-      // Pages are cleaned up when the last fd is closed (see stream_ops.close).
       if (node.openCount === 0) {
         pageCache.deleteFile(node.storagePath);
         backend.deleteMeta(node.storagePath);
+      } else {
+        // Open fds exist — move pages to a unique temporary path so the
+        // original storagePath is free for reuse by new files or renames.
+        // Without this, a new file at the same path would share page cache
+        // entries with the unlinked node, causing data corruption.
+        const originalPath = node.storagePath;
+        const tempPath = `/__deleted_${nextPathId++}`;
+        pageCache.renameFile(originalPath, tempPath);
+        node.storagePath = tempPath;
+        backend.deleteMeta(originalPath);
       }
       allFileNodes.delete(node);
     } else if (node && FS.isLink(node.mode)) {
