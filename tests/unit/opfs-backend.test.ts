@@ -485,6 +485,109 @@ describe("OpfsBackend", () => {
   });
 
   // -------------------------------------------------------------------
+  // Error propagation (non-NotFoundError exceptions must not be swallowed)
+  // -------------------------------------------------------------------
+
+  describe("error propagation", () => {
+    it("getFileDir propagates non-NotFoundError from getDirectoryHandle", async () => {
+      const faultyRoot = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: faultyRoot as any });
+      // Trigger init by reading a page (creates pages/ and meta/ dirs)
+      await b.readPage("/init", 0);
+
+      // Monkey-patch pagesDir to always throw SecurityError on getDirectoryHandle
+      const pagesDir = (b as any).pagesDir;
+      pagesDir.getDirectoryHandle = async () => {
+        throw new DOMException("Access denied", "SecurityError");
+      };
+
+      // readPage should propagate the SecurityError, not return null
+      await expect(b.readPage("/test", 0)).rejects.toThrow("Access denied");
+    });
+
+    it("readPage propagates non-NotFoundError from getFileHandle", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+
+      // Write a page first so the file dir exists
+      await b.writePage("/err-test", 0, filledPage(0x01));
+
+      // Sabotage the file directory to throw TypeMismatchError on getFileHandle
+      const pagesDir = (b as any).pagesDir;
+      const fileDir = await pagesDir.getDirectoryHandle(
+        // Encode the path the same way OpfsBackend does
+        Array.from(new TextEncoder().encode("/err-test"))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join(""),
+      );
+      const original = fileDir.getFileHandle.bind(fileDir);
+      fileDir.getFileHandle = async (
+        name: string,
+        options?: { create?: boolean },
+      ) => {
+        if (name === "0") {
+          throw new DOMException("Wrong type", "TypeMismatchError");
+        }
+        return original(name, options);
+      };
+
+      await expect(b.readPage("/err-test", 0)).rejects.toThrow("Wrong type");
+    });
+
+    it("deleteFile propagates non-NotFoundError", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+      await b.readPage("/init", 0); // trigger init
+
+      const pagesDir = (b as any).pagesDir;
+      const original = pagesDir.removeEntry.bind(pagesDir);
+      pagesDir.removeEntry = async (
+        name: string,
+        options?: { recursive?: boolean },
+      ) => {
+        throw new DOMException("Quota exceeded", "QuotaExceededError");
+      };
+
+      await expect(b.deleteFile("/any")).rejects.toThrow("Quota exceeded");
+      // Restore for cleanup
+      pagesDir.removeEntry = original;
+    });
+
+    it("deleteMeta propagates non-NotFoundError", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+      await b.readPage("/init", 0); // trigger init
+
+      const metaDir = (b as any).metaDir;
+      const original = metaDir.removeEntry.bind(metaDir);
+      metaDir.removeEntry = async (name: string) => {
+        throw new DOMException("IO error", "InvalidStateError");
+      };
+
+      await expect(b.deleteMeta("/any")).rejects.toThrow("IO error");
+      metaDir.removeEntry = original;
+    });
+
+    it("readMeta propagates non-NotFoundError", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+      await b.readPage("/init", 0); // trigger init
+
+      const metaDir = (b as any).metaDir;
+      const original = metaDir.getFileHandle.bind(metaDir);
+      metaDir.getFileHandle = async (
+        name: string,
+        options?: { create?: boolean },
+      ) => {
+        throw new DOMException("Locked", "InvalidStateError");
+      };
+
+      await expect(b.readMeta("/any")).rejects.toThrow("Locked");
+      metaDir.getFileHandle = original;
+    });
+  });
+
+  // -------------------------------------------------------------------
   // Lifecycle
   // -------------------------------------------------------------------
 
