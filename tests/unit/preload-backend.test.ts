@@ -478,4 +478,164 @@ describe("PreloadBackend", () => {
       expect(await remote.readPage("/f", 3)).toBeNull();
     });
   });
+
+  describe("crash recovery: pages beyond meta.size", () => {
+    it("@fast init loads pages that exist beyond meta.size", async () => {
+      // Simulate crash: pages were written to remote but metadata wasn't
+      // updated. meta.size says 1 page, but 3 pages exist.
+      const d0 = new Uint8Array(PAGE_SIZE); d0[0] = 0x10;
+      const d1 = new Uint8Array(PAGE_SIZE); d1[0] = 0x20;
+      const d2 = new Uint8Array(PAGE_SIZE); d2[0] = 0x30;
+      await remote.writePage("/f", 0, d0);
+      await remote.writePage("/f", 1, d1);
+      await remote.writePage("/f", 2, d2);
+      await remote.writeMeta("/f", {
+        size: PAGE_SIZE, // stale: only accounts for 1 page
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 1000,
+      });
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      // All 3 pages should be loaded, not just page 0
+      expect(backend.readPage("/f", 0)![0]).toBe(0x10);
+      expect(backend.readPage("/f", 1)![0]).toBe(0x20);
+      expect(backend.readPage("/f", 2)![0]).toBe(0x30);
+    });
+
+    it("init loads pages when meta.size is zero", async () => {
+      // meta.size is 0 but pages exist (e.g., file created and written
+      // but metadata never synced before crash)
+      const d0 = new Uint8Array(PAGE_SIZE); d0[0] = 0xaa;
+      await remote.writePage("/f", 0, d0);
+      await remote.writeMeta("/f", {
+        size: 0,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 1000,
+      });
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      expect(backend.readPage("/f", 0)![0]).toBe(0xaa);
+    });
+
+    it("init loads many pages beyond meta.size", async () => {
+      // meta.size says 1 page, but 20 pages exist — tests exponential probe
+      for (let i = 0; i < 20; i++) {
+        const d = new Uint8Array(PAGE_SIZE);
+        d[0] = i;
+        await remote.writePage("/f", i, d);
+      }
+      await remote.writeMeta("/f", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 1000,
+      });
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      for (let i = 0; i < 20; i++) {
+        const page = backend.readPage("/f", i);
+        expect(page).not.toBeNull();
+        expect(page![0]).toBe(i);
+      }
+      // Page 20 should not exist
+      expect(backend.readPage("/f", 20)).toBeNull();
+    });
+
+    it("init does not load extra pages when meta.size matches actual pages", async () => {
+      // No extra pages — init should work as before without loading extras
+      const d0 = new Uint8Array(PAGE_SIZE); d0[0] = 0x42;
+      await remote.writePage("/f", 0, d0);
+      await remote.writeMeta("/f", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 1000,
+      });
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      expect(backend.readPage("/f", 0)![0]).toBe(0x42);
+      expect(backend.readPage("/f", 1)).toBeNull();
+    });
+  });
+
+  describe("flush crash safety: write-before-delete ordering", () => {
+    it("rename flush writes new pages before deleting old", async () => {
+      // Seed remote with data at old path
+      const d = new Uint8Array(PAGE_SIZE); d[0] = 0xcc;
+      await remote.writePage("/old", 0, d);
+      await remote.writeMeta("/old", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      backend.renameFile("/old", "/new");
+      await backend.flush();
+
+      // New path should have the data
+      expect((await remote.readPage("/new", 0))![0]).toBe(0xcc);
+      // Old path should be cleaned up
+      expect(await remote.readPage("/old", 0)).toBeNull();
+    });
+
+    it("delete then recreate at same path preserves new data", async () => {
+      // Seed remote
+      const old = new Uint8Array(PAGE_SIZE); old[0] = 0x11;
+      await remote.writePage("/f", 0, old);
+      await remote.writeMeta("/f", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      // Delete then recreate with different data
+      backend.deleteFile("/f");
+      const fresh = new Uint8Array(PAGE_SIZE); fresh[0] = 0x99;
+      backend.writePage("/f", 0, fresh);
+
+      await backend.flush();
+
+      // Remote should have the NEW data, not old
+      const page = await remote.readPage("/f", 0);
+      expect(page).not.toBeNull();
+      expect(page![0]).toBe(0x99);
+    });
+
+    it("flush + re-init roundtrip after rename", async () => {
+      // Write data, flush, rename, flush, re-init — data should survive
+      const backend1 = new PreloadBackend(remote);
+      await backend1.init();
+
+      const d = new Uint8Array(PAGE_SIZE);
+      d[0] = 0xdd; d[PAGE_SIZE - 1] = 0xee;
+      backend1.writePage("/src", 0, d);
+      backend1.writeMeta("/src", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+      await backend1.flush();
+
+      // Rename in a new PreloadBackend session
+      const backend2 = new PreloadBackend(remote);
+      await backend2.init();
+      backend2.renameFile("/src", "/dst");
+      backend2.writeMeta("/dst", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+      backend2.deleteMeta("/src");
+      await backend2.flush();
+
+      // Re-init and verify
+      const backend3 = new PreloadBackend(remote);
+      await backend3.init();
+      expect(backend3.readPage("/src", 0)).toBeNull();
+      const page = backend3.readPage("/dst", 0);
+      expect(page).not.toBeNull();
+      expect(page![0]).toBe(0xdd);
+      expect(page![PAGE_SIZE - 1]).toBe(0xee);
+    });
+  });
 });

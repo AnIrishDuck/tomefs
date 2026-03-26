@@ -72,14 +72,66 @@ export class PreloadBackend implements SyncStorageBackend {
     // Load all pages for every file in batches
     for (const path of files) {
       const m = this.meta.get(path);
-      if (!m || m.size === 0) continue;
+      if (!m) continue;
 
-      const pageCount = Math.ceil(m.size / PAGE_SIZE);
-      const indices = Array.from({ length: pageCount }, (_, i) => i);
-      const pages = await this.remote.readPages(path, indices);
-      for (let i = 0; i < pages.length; i++) {
-        if (pages[i]) {
-          this.pages.set(pageKeyStr(path, i), new Uint8Array(pages[i]!));
+      const pageCount = m.size > 0 ? Math.ceil(m.size / PAGE_SIZE) : 0;
+
+      // Load pages accounted for by metadata
+      if (pageCount > 0) {
+        const indices = Array.from({ length: pageCount }, (_, i) => i);
+        const pages = await this.remote.readPages(path, indices);
+        for (let i = 0; i < pages.length; i++) {
+          if (pages[i]) {
+            this.pages.set(pageKeyStr(path, i), new Uint8Array(pages[i]!));
+          }
+        }
+      }
+
+      // Probe for pages beyond meta.size that may exist from a prior crash
+      // (pages written through the page cache but metadata not yet synced).
+      // Uses exponential probe + binary search (O(log n) reads) to find the
+      // true extent, then loads any discovered extra pages.
+      const nextPage = await this.remote.readPage(path, pageCount);
+      if (nextPage) {
+        this.pages.set(
+          pageKeyStr(path, pageCount),
+          new Uint8Array(nextPage),
+        );
+
+        // Exponential probe to find upper bound
+        let lo = pageCount;
+        let hi = pageCount + 1;
+        while (await this.remote.readPage(path, hi)) {
+          lo = hi;
+          hi *= 2;
+        }
+
+        // Binary search between lo (exists) and hi (missing)
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >>> 1;
+          if (await this.remote.readPage(path, mid)) {
+            lo = mid;
+          } else {
+            hi = mid;
+          }
+        }
+
+        // Load all extra pages in a batch (pageCount+1 through lo inclusive)
+        const extraStart = pageCount + 1;
+        if (lo >= extraStart) {
+          const extraIndices = Array.from(
+            { length: lo - extraStart + 1 },
+            (_, i) => extraStart + i,
+          );
+          const extraPages = await this.remote.readPages(path, extraIndices);
+          for (let i = 0; i < extraPages.length; i++) {
+            if (extraPages[i]) {
+              this.pages.set(
+                pageKeyStr(path, extraIndices[i]),
+                new Uint8Array(extraPages[i]!),
+              );
+            }
+          }
         }
       }
     }
@@ -237,56 +289,93 @@ export class PreloadBackend implements SyncStorageBackend {
   /**
    * Flush all dirty state to the remote backend.
    *
-   * This writes dirty pages and metadata, applies file deletions and
-   * truncations, then clears the dirty tracking state. Safe to call
-   * multiple times — no-op if nothing is dirty.
+   * Ordering is designed for crash safety: new data is written before
+   * old data is deleted. This way, a crash mid-flush leaves duplicate
+   * data (cleaned up on next syncfs) rather than losing data.
+   *
+   * For delete-then-recreate at the same path, we must delete first
+   * to avoid the subsequent deleteFile removing newly written pages.
+   * These are handled in a separate pass after deletions.
+   *
+   * Safe to call multiple times — no-op if nothing is dirty.
    */
   async flush(): Promise<void> {
     this.assertInitialized();
 
-    // 1. Delete files from remote
+    // Partition dirty pages: pages at paths pending deletion must be
+    // written AFTER the delete (to handle delete-then-recreate at the
+    // same path). All other dirty pages are written first for crash safety.
+    const earlyBatch: Array<{
+      path: string;
+      pageIndex: number;
+      data: Uint8Array;
+    }> = [];
+    const lateBatch: Array<{
+      path: string;
+      pageIndex: number;
+      data: Uint8Array;
+    }> = [];
+    for (const key of this.dirtyPages) {
+      const data = this.pages.get(key);
+      if (data) {
+        const nullIdx = key.indexOf("\0");
+        const path = key.substring(0, nullIdx);
+        const pageIndex = parseInt(key.substring(nullIdx + 1), 10);
+        const entry = { path, pageIndex, data };
+        if (this.deletedFiles.has(path)) {
+          lateBatch.push(entry);
+        } else {
+          earlyBatch.push(entry);
+        }
+      }
+    }
+    this.dirtyPages.clear();
+
+    // 1. Write new pages at non-deleted paths (crash-safe: new data first)
+    if (earlyBatch.length > 0) {
+      await this.remote.writePages(earlyBatch);
+    }
+
+    // 2. Write dirty metadata for non-deleted paths
+    const lateMeta: Array<{ path: string; meta: FileMeta }> = [];
+    for (const path of this.dirtyMeta) {
+      const m = this.meta.get(path);
+      if (m) {
+        if (this.deletedMeta.has(path)) {
+          lateMeta.push({ path, meta: m });
+        } else {
+          await this.remote.writeMeta(path, m);
+        }
+      }
+    }
+    this.dirtyMeta.clear();
+
+    // 3. Delete files from remote
     for (const path of this.deletedFiles) {
       await this.remote.deleteFile(path);
     }
     this.deletedFiles.clear();
 
-    // 2. Apply truncations
+    // 4. Apply truncations
     for (const [path, fromIndex] of this.truncations) {
       await this.remote.deletePagesFrom(path, fromIndex);
     }
     this.truncations.clear();
 
-    // 3. Delete metadata
+    // 5. Delete metadata
     for (const path of this.deletedMeta) {
       await this.remote.deleteMeta(path);
     }
     this.deletedMeta.clear();
 
-    // 4. Write dirty pages in batches
-    if (this.dirtyPages.size > 0) {
-      const batch: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
-      for (const key of this.dirtyPages) {
-        const data = this.pages.get(key);
-        if (data) {
-          const nullIdx = key.indexOf("\0");
-          const path = key.substring(0, nullIdx);
-          const pageIndex = parseInt(key.substring(nullIdx + 1), 10);
-          batch.push({ path, pageIndex, data });
-        }
-      }
-      if (batch.length > 0) {
-        await this.remote.writePages(batch);
-      }
-      this.dirtyPages.clear();
+    // 6. Write pages for delete-then-recreate paths
+    if (lateBatch.length > 0) {
+      await this.remote.writePages(lateBatch);
     }
 
-    // 5. Write dirty metadata
-    for (const path of this.dirtyMeta) {
-      const m = this.meta.get(path);
-      if (m) {
-        await this.remote.writeMeta(path, m);
-      }
+    // 7. Write metadata for delete-then-recreate paths
+    for (const { path, meta } of lateMeta) {
+      await this.remote.writeMeta(path, meta);
     }
-    this.dirtyMeta.clear();
   }
 }
