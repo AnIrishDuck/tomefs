@@ -110,13 +110,31 @@ export function encodeMessage(
 /**
  * Decode a message from the shared buffer.
  * Returns the parsed JSON and any remaining binary data.
+ *
+ * Validates that lengths are within buffer bounds to prevent
+ * reading garbage data from a corrupt or stale response.
  */
 export function decodeMessage(
   dataView: DataView,
   uint8View: Uint8Array,
   totalLen: number,
 ): { json: unknown; binary: Uint8Array } {
+  const bufferSize = uint8View.byteLength;
+  const maxDataLen = bufferSize - JSON_REGION_OFFSET;
+
+  if (totalLen < 4 || totalLen > maxDataLen) {
+    throw new Error(
+      `SAB decode error: totalLen ${totalLen} out of range [4, ${maxDataLen}]`,
+    );
+  }
+
   const jsonLen = dataView.getUint32(JSON_REGION_OFFSET, true);
+  if (jsonLen > totalLen - 4) {
+    throw new Error(
+      `SAB decode error: jsonLen ${jsonLen} exceeds totalLen ${totalLen} (max ${totalLen - 4})`,
+    );
+  }
+
   const jsonBytes = uint8View.slice(
     JSON_REGION_OFFSET + 4,
     JSON_REGION_OFFSET + 4 + jsonLen,

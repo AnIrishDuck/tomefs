@@ -747,3 +747,63 @@ describe("SAB bridge: protocol edge cases", () => {
     }).toThrow(/SAB buffer overflow/);
   });
 });
+
+describe("SAB bridge: decodeMessage validation", () => {
+  it("@fast rejects totalLen < 4 (minimum for JSON length prefix)", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 200);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    expect(() => decodeMessage(dataView, uint8View, 0)).toThrow(
+      /SAB decode error.*totalLen 0/,
+    );
+    expect(() => decodeMessage(dataView, uint8View, 3)).toThrow(
+      /SAB decode error.*totalLen 3/,
+    );
+  });
+
+  it("@fast rejects totalLen exceeding buffer capacity", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 100);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    expect(() => decodeMessage(dataView, uint8View, 200)).toThrow(
+      /SAB decode error.*totalLen 200/,
+    );
+  });
+
+  it("@fast rejects jsonLen exceeding totalLen", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 200);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    // Write a valid totalLen but corrupt jsonLen to be larger
+    const totalLen = 20;
+    dataView.setUint32(JSON_REGION_OFFSET, 9999, true); // jsonLen = 9999
+
+    expect(() => decodeMessage(dataView, uint8View, totalLen)).toThrow(
+      /SAB decode error.*jsonLen 9999/,
+    );
+  });
+
+  it("accepts valid messages at exact boundary", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 200);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    // Encode a real message, then decode with exact totalLen
+    const totalLen = encodeMessage(dataView, uint8View, { ok: true });
+    const decoded = decodeMessage(dataView, uint8View, totalLen);
+    expect(decoded.json).toEqual({ ok: true });
+  });
+
+  it("rejects negative totalLen", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 200);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    expect(() => decodeMessage(dataView, uint8View, -1)).toThrow(
+      /SAB decode error/,
+    );
+  });
+});

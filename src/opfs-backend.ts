@@ -10,6 +10,11 @@ interface IterableDirectoryHandle extends FileSystemDirectoryHandle {
   keys(): AsyncIterableIterator<string>;
 }
 
+/** Return true if the error is a DOMException with name "NotFoundError". */
+function isNotFoundError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "NotFoundError";
+}
+
 /** Subdirectory names within the OPFS root. */
 const PAGES_DIR = "pages";
 const META_DIR = "meta";
@@ -94,8 +99,9 @@ export class OpfsBackend implements StorageBackend {
     const encoded = encodePath(path);
     try {
       return await this.pagesDir!.getDirectoryHandle(encoded, { create });
-    } catch {
-      return null;
+    } catch (err) {
+      if (isNotFoundError(err)) return null;
+      throw err;
     }
   }
 
@@ -109,8 +115,9 @@ export class OpfsBackend implements StorageBackend {
     let handle: FileSystemFileHandle;
     try {
       handle = await fileDir.getFileHandle(String(pageIndex));
-    } catch {
-      return null;
+    } catch (err) {
+      if (isNotFoundError(err)) return null;
+      throw err;
     }
 
     const file = await handle.getFile();
@@ -130,8 +137,9 @@ export class OpfsBackend implements StorageBackend {
         let handle: FileSystemFileHandle;
         try {
           handle = await fileDir.getFileHandle(String(pageIndex));
-        } catch {
-          return null;
+        } catch (err) {
+          if (isNotFoundError(err)) return null;
+          throw err;
         }
         const file = await handle.getFile();
         const buffer = await file.arrayBuffer();
@@ -150,8 +158,11 @@ export class OpfsBackend implements StorageBackend {
       create: true,
     });
     const writable = await handle.createWritable();
-    await writable.write(new Uint8Array(data));
-    await writable.close();
+    try {
+      await writable.write(new Uint8Array(data));
+    } finally {
+      await writable.close();
+    }
   }
 
   async writePages(
@@ -174,8 +185,8 @@ export class OpfsBackend implements StorageBackend {
     const encoded = encodePath(path);
     try {
       await this.pagesDir!.removeEntry(encoded, { recursive: true });
-    } catch {
-      // Directory doesn't exist — no-op
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
     }
   }
 
@@ -187,17 +198,17 @@ export class OpfsBackend implements StorageBackend {
     // Remove destination if it already exists (overwrite semantics).
     try {
       await this.pagesDir!.removeEntry(newEncoded, { recursive: true });
-    } catch {
-      // Doesn't exist — no-op
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
     }
 
     // Move page files from old directory to new directory.
     let oldDir: FileSystemDirectoryHandle;
     try {
       oldDir = await this.pagesDir!.getDirectoryHandle(oldEncoded);
-    } catch {
-      // Source pages don't exist — nothing to move.
-      return;
+    } catch (err) {
+      if (isNotFoundError(err)) return;
+      throw err;
     }
 
     const newDir = await this.pagesDir!.getDirectoryHandle(newEncoded, {
@@ -218,8 +229,11 @@ export class OpfsBackend implements StorageBackend {
 
         const dstHandle = await newDir.getFileHandle(name, { create: true });
         const writable = await dstHandle.createWritable();
-        await writable.write(new Uint8Array(data));
-        await writable.close();
+        try {
+          await writable.write(new Uint8Array(data));
+        } finally {
+          await writable.close();
+        }
       }),
     );
 
@@ -254,8 +268,9 @@ export class OpfsBackend implements StorageBackend {
     let handle: FileSystemFileHandle;
     try {
       handle = await this.metaDir!.getFileHandle(encoded);
-    } catch {
-      return null;
+    } catch (err) {
+      if (isNotFoundError(err)) return null;
+      throw err;
     }
 
     const file = await handle.getFile();
@@ -270,8 +285,11 @@ export class OpfsBackend implements StorageBackend {
       create: true,
     });
     const writable = await handle.createWritable();
-    await writable.write(JSON.stringify(meta));
-    await writable.close();
+    try {
+      await writable.write(JSON.stringify(meta));
+    } finally {
+      await writable.close();
+    }
   }
 
   async deleteMeta(path: string): Promise<void> {
@@ -279,8 +297,8 @@ export class OpfsBackend implements StorageBackend {
     const encoded = encodePath(path);
     try {
       await this.metaDir!.removeEntry(encoded);
-    } catch {
-      // File doesn't exist — no-op
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
     }
   }
 
@@ -300,13 +318,13 @@ export class OpfsBackend implements StorageBackend {
     await this.init();
     try {
       await this.root!.removeEntry(PAGES_DIR, { recursive: true });
-    } catch {
-      // Already gone
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
     }
     try {
       await this.root!.removeEntry(META_DIR, { recursive: true });
-    } catch {
-      // Already gone
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
     }
     this.pagesDir = null;
     this.metaDir = null;
