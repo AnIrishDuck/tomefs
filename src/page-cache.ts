@@ -290,9 +290,12 @@ export class PageCache {
 
   /**
    * Zero-fill the tail of the last page after truncation to a smaller size.
-   * If the page is cached, modifies it in place. Does not load from backend.
+   * If the page is cached, modifies it in place. If the page is only in
+   * the backend (evicted from cache), loads it, zeros the tail, and writes
+   * it back. This prevents stale data from being served if the file is
+   * later extended without writing to the truncated region.
    */
-  zeroTailAfterTruncate(path: string, newSize: number): void {
+  async zeroTailAfterTruncate(path: string, newSize: number): Promise<void> {
     const lastPageIndex = Math.floor(newSize / PAGE_SIZE);
     const tailOffset = newSize % PAGE_SIZE;
     if (tailOffset === 0) return;
@@ -305,6 +308,66 @@ export class PageCache {
         page.dirty = true;
         this.dirtyKeys.add(key);
       }
+    } else {
+      // Page is not cached — check if it exists in the backend
+      const data = await this.backend.readPage(path, lastPageIndex);
+      if (data) {
+        const updated = new Uint8Array(data);
+        updated.fill(0, tailOffset);
+        await this.backend.writePage(path, lastPageIndex, updated);
+      }
+    }
+  }
+
+  /**
+   * Delete all pages for a file from both cache and backend.
+   * O(pages-for-file) via filePages index.
+   */
+  async deleteFile(path: string): Promise<void> {
+    // Remove from cache (no flush — file is being deleted)
+    const keys = this.filePages.get(path);
+    if (keys) {
+      for (const key of keys) {
+        this.cache.delete(key);
+        if (key === this.mruKey) this.mruKey = null;
+        this.dirtyKeys.delete(key);
+      }
+      this.filePages.delete(path);
+    }
+    await this.backend.deleteFile(path);
+  }
+
+  /**
+   * Rename a file's pages: flush, move in backend, update cache keys.
+   *
+   * Flushes dirty pages first so the backend has the latest data,
+   * then delegates to the backend's renameFile for an atomic re-key.
+   */
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    // Flush dirty pages so backend has the latest data before re-keying
+    await this.flushFile(oldPath);
+
+    // Re-key all pages in the backend
+    await this.backend.renameFile(oldPath, newPath);
+
+    // Collect all cached pages for old path via filePages index
+    const oldKeys = this.filePages.get(oldPath);
+    const toMove: CachedPage[] = [];
+    if (oldKeys) {
+      for (const key of oldKeys) {
+        toMove.push(this.cache.get(key)!);
+        this.cache.delete(key);
+        if (key === this.mruKey) this.mruKey = null;
+        this.dirtyKeys.delete(key);
+      }
+      this.filePages.delete(oldPath);
+    }
+    for (const page of toMove) {
+      page.path = newPath;
+      const newKey = pageKeyStr(newPath, page.pageIndex);
+      await this.ensureCapacity();
+      this.cache.set(newKey, page);
+      this.trackPage(newPath, newKey);
     }
   }
 
