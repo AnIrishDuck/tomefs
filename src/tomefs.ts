@@ -467,6 +467,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       }
     },
 
+    dup(stream: any) {
+      if (FS.isFile(stream.node.mode)) {
+        stream.node.openCount++;
+      }
+    },
+
     close(stream: any) {
       const node = stream.node;
       if (FS.isFile(node.mode)) {
