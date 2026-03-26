@@ -102,6 +102,11 @@ class FailingBackend implements StorageBackend {
     return this.inner.readPage(path, pageIndex);
   }
 
+  async readPages(path: string, pageIndices: number[]): Promise<Array<Uint8Array | null>> {
+    this.maybeThrow("readPages");
+    return this.inner.readPages(path, pageIndices);
+  }
+
   async writePage(path: string, pageIndex: number, data: Uint8Array): Promise<void> {
     this.maybeThrow("writePage");
     return this.inner.writePage(path, pageIndex, data);
@@ -161,6 +166,13 @@ class SlowBackend implements StorageBackend {
       await new Promise((r) => setTimeout(r, this.readDelay));
     }
     return this.inner.readPage(path, pageIndex);
+  }
+
+  async readPages(path: string, pageIndices: number[]): Promise<Array<Uint8Array | null>> {
+    if (this.readDelay > 0) {
+      await new Promise((r) => setTimeout(r, this.readDelay));
+    }
+    return this.inner.readPages(path, pageIndices);
   }
 
   async writePage(path: string, pageIndex: number, data: Uint8Array): Promise<void> {

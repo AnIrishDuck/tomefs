@@ -14,7 +14,7 @@ const client = new SabClient(sab);
 
 parentPort!.on("message", (msg: { cmd: string; args: unknown[]; id: number }) => {
   try {
-    const method = (client as Record<string, Function>)[msg.cmd];
+    const method = (client as unknown as Record<string, Function>)[msg.cmd];
     if (!method) throw new Error(`Unknown method: ${msg.cmd}`);
     const result = method.apply(client, msg.args);
     parentPort!.postMessage({ id: msg.id, result });

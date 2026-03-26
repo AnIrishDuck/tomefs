@@ -180,6 +180,42 @@ export async function createHarness(
     };
   }
 
+  async function syncStream(stream: TestStream, max: number): Promise<SyncStatus> {
+    const page = server.getBlobsPage(stream.streamKey, stream.syncIndex, max);
+
+    // Replay each blob's SQL within a transaction
+    if (page.blobs.length > 0) {
+      await pg.exec("BEGIN");
+      try {
+        for (const blob of page.blobs) {
+          await pg.exec(blob.data);
+        }
+
+        // Update sync state
+        const lastBlob = page.blobs[page.blobs.length - 1];
+        await pg.query(
+          `INSERT INTO "${stream.name}".sync_state (stream_key, last_sequence, last_hash, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (stream_key) DO UPDATE
+           SET last_sequence = $2, last_hash = $3, updated_at = NOW()`,
+          [stream.streamKey, lastBlob.sequence, lastBlob.hash],
+        );
+
+        await pg.exec("COMMIT");
+        stream.syncIndex = lastBlob.sequence;
+      } catch (e) {
+        await pg.exec("ROLLBACK");
+        throw e;
+      }
+    }
+
+    return {
+      fetched: page.blobs.length,
+      total: page.totalCount,
+      complete: !page.hasMore,
+    };
+  }
+
   return {
     pg,
     adapter,
@@ -203,52 +239,18 @@ export async function createHarness(
       );
       const stream = makeStream(name, streamKey);
       if (state.rows.length > 0) {
-        stream.syncIndex = state.rows[0].last_sequence;
+        stream.syncIndex = (state.rows[0] as { last_sequence: number }).last_sequence;
       }
       return stream;
     },
 
-    async syncStream(stream: TestStream, max: number): Promise<SyncStatus> {
-      const page = server.getBlobsPage(stream.streamKey, stream.syncIndex, max);
-
-      // Replay each blob's SQL within a transaction
-      if (page.blobs.length > 0) {
-        await pg.exec("BEGIN");
-        try {
-          for (const blob of page.blobs) {
-            await pg.exec(blob.data);
-          }
-
-          // Update sync state
-          const lastBlob = page.blobs[page.blobs.length - 1];
-          await pg.query(
-            `INSERT INTO "${stream.name}".sync_state (stream_key, last_sequence, last_hash, updated_at)
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (stream_key) DO UPDATE
-             SET last_sequence = $2, last_hash = $3, updated_at = NOW()`,
-            [stream.streamKey, lastBlob.sequence, lastBlob.hash],
-          );
-
-          await pg.exec("COMMIT");
-          stream.syncIndex = lastBlob.sequence;
-        } catch (e) {
-          await pg.exec("ROLLBACK");
-          throw e;
-        }
-      }
-
-      return {
-        fetched: page.blobs.length,
-        total: page.totalCount,
-        complete: !page.hasMore,
-      };
-    },
+    syncStream,
 
     async syncStreamFully(stream: TestStream, max: number): Promise<number> {
       let iterations = 0;
       let complete = false;
       while (!complete) {
-        const status = await this.syncStream(stream, max);
+        const status = await syncStream(stream, max);
         complete = status.complete;
         iterations++;
         if (iterations > 200) {
