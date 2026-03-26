@@ -262,12 +262,48 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async writeMetas(
+    entries: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    if (entries.length === 0) return;
+
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(META_STORE, "readwrite");
+      const store = tx.objectStore(META_STORE);
+
+      for (const { path, meta } of entries) {
+        store.put({ ...meta }, path);
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async deleteMeta(path: string): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(META_STORE, "readwrite");
       const store = tx.objectStore(META_STORE);
       store.delete(path);
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async deleteMetas(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(META_STORE, "readwrite");
+      const store = tx.objectStore(META_STORE);
+
+      for (const path of paths) {
+        store.delete(path);
+      }
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);

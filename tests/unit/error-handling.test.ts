@@ -75,8 +75,16 @@ class FailingSyncBackend implements SyncStorageBackend {
     this.inner.writeMeta(path, meta);
   }
 
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
+    this.inner.writeMetas(entries);
+  }
+
   deleteMeta(path: string): void {
     this.inner.deleteMeta(path);
+  }
+
+  deleteMetas(paths: string[]): void {
+    this.inner.deleteMetas(paths);
   }
 
   listFiles(): string[] {
@@ -144,8 +152,18 @@ class FailingAsyncBackend implements StorageBackend {
     return this.inner.writeMeta(path, meta);
   }
 
+  async writeMetas(
+    entries: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    return this.inner.writeMetas(entries);
+  }
+
   async deleteMeta(path: string): Promise<void> {
     return this.inner.deleteMeta(path);
+  }
+
+  async deleteMetas(paths: string[]): Promise<void> {
+    return this.inner.deleteMetas(paths);
   }
 
   async listFiles(): Promise<string[]> {

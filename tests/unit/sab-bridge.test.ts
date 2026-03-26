@@ -261,6 +261,36 @@ describe("SAB+Atomics Bridge", () => {
       const files = (await callClient(clientWorker, "listFiles", [])) as string[];
       expect(files.sort()).toEqual(["/a", "/b", "/c"]);
     });
+
+    it("@fast writeMetas batch writes multiple entries in one call", async () => {
+      await callClient(clientWorker, "writeMetas", [
+        [
+          { path: "/x", meta: { size: 10, mode: 0o644, ctime: 1, mtime: 2 } },
+          { path: "/y", meta: { size: 20, mode: 0o755, ctime: 3, mtime: 4 } },
+          { path: "/z", meta: { size: 0, mode: 0o40755, ctime: 5, mtime: 6 } },
+        ],
+      ]);
+
+      const x = await callClient(clientWorker, "readMeta", ["/x"]);
+      const y = await callClient(clientWorker, "readMeta", ["/y"]);
+      const z = await callClient(clientWorker, "readMeta", ["/z"]);
+      expect(x).toEqual({ size: 10, mode: 0o644, ctime: 1, mtime: 2 });
+      expect(y).toEqual({ size: 20, mode: 0o755, ctime: 3, mtime: 4 });
+      expect(z).toEqual({ size: 0, mode: 0o40755, ctime: 5, mtime: 6 });
+    });
+
+    it("@fast deleteMetas batch deletes multiple entries in one call", async () => {
+      const meta = { size: 0, mode: 0o644, ctime: 0, mtime: 0 };
+      await callClient(clientWorker, "writeMeta", ["/a", meta]);
+      await callClient(clientWorker, "writeMeta", ["/b", meta]);
+      await callClient(clientWorker, "writeMeta", ["/c", meta]);
+
+      await callClient(clientWorker, "deleteMetas", [["/a", "/c"]]);
+
+      expect(await callClient(clientWorker, "readMeta", ["/a"])).toBeNull();
+      expect(await callClient(clientWorker, "readMeta", ["/b"])).not.toBeNull();
+      expect(await callClient(clientWorker, "readMeta", ["/c"])).toBeNull();
+    });
   });
 
   describe("multi-file isolation", () => {

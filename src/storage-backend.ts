@@ -40,8 +40,14 @@ export interface StorageBackend {
   /** Write file metadata. */
   writeMeta(path: string, meta: FileMeta): Promise<void>;
 
+  /** Write multiple metadata entries in a single batch. */
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): Promise<void>;
+
   /** Delete file metadata. */
   deleteMeta(path: string): Promise<void>;
+
+  /** Delete multiple metadata entries in a single batch. */
+  deleteMetas(paths: string[]): Promise<void>;
 
   /** List all file paths that have metadata stored. */
   listFiles(): Promise<string[]>;

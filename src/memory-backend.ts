@@ -92,8 +92,22 @@ export class MemoryBackend implements StorageBackend {
     this.meta.set(path, { ...meta });
   }
 
+  async writeMetas(
+    entries: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    for (const { path, meta } of entries) {
+      this.meta.set(path, { ...meta });
+    }
+  }
+
   async deleteMeta(path: string): Promise<void> {
     this.meta.delete(path);
+  }
+
+  async deleteMetas(paths: string[]): Promise<void> {
+    for (const path of paths) {
+      this.meta.delete(path);
+    }
   }
 
   async listFiles(): Promise<string[]> {

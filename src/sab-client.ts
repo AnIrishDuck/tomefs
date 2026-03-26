@@ -126,8 +126,18 @@ export class SabClient implements SyncStorageBackend {
     this.call(OpCode.WRITE_META, { path, meta });
   }
 
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
+    if (entries.length === 0) return;
+    this.call(OpCode.WRITE_METAS, { entries });
+  }
+
   deleteMeta(path: string): void {
     this.call(OpCode.DELETE_META, { path });
+  }
+
+  deleteMetas(paths: string[]): void {
+    if (paths.length === 0) return;
+    this.call(OpCode.DELETE_METAS, { paths });
   }
 
   listFiles(): string[] {

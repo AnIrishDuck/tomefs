@@ -79,8 +79,20 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     this.meta.set(path, { ...meta });
   }
 
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
+    for (const { path, meta } of entries) {
+      this.meta.set(path, { ...meta });
+    }
+  }
+
   deleteMeta(path: string): void {
     this.meta.delete(path);
+  }
+
+  deleteMetas(paths: string[]): void {
+    for (const path of paths) {
+      this.meta.delete(path);
+    }
   }
 
   listFiles(): string[] {

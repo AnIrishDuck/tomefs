@@ -281,6 +281,29 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.WRITE_METAS: {
+        const entries = params.entries as Array<{
+          path: string;
+          meta: FileMeta;
+        }>;
+        await this.backend.writeMetas(entries);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          ok: true,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
+      case OpCode.DELETE_METAS: {
+        const paths = params.paths as string[];
+        await this.backend.deleteMetas(paths);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          ok: true,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       case OpCode.LIST_FILES: {
         const files = await this.backend.listFiles();
         const respLen = encodeMessage(this.dataView, this.uint8View, { files });

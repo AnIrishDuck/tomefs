@@ -251,11 +251,29 @@ export class PreloadBackend implements SyncStorageBackend {
     this.deletedMeta.delete(path);
   }
 
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
+    this.assertInitialized();
+    for (const { path, meta } of entries) {
+      this.meta.set(path, { ...meta });
+      this.dirtyMeta.add(path);
+      this.deletedMeta.delete(path);
+    }
+  }
+
   deleteMeta(path: string): void {
     this.assertInitialized();
     this.meta.delete(path);
     this.dirtyMeta.delete(path);
     this.deletedMeta.add(path);
+  }
+
+  deleteMetas(paths: string[]): void {
+    this.assertInitialized();
+    for (const path of paths) {
+      this.meta.delete(path);
+      this.dirtyMeta.delete(path);
+      this.deletedMeta.add(path);
+    }
   }
 
   listFiles(): string[] {

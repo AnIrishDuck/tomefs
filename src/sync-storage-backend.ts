@@ -40,8 +40,14 @@ export interface SyncStorageBackend {
   /** Write file metadata. */
   writeMeta(path: string, meta: FileMeta): void;
 
+  /** Write multiple metadata entries in a single batch. */
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void;
+
   /** Delete file metadata. */
   deleteMeta(path: string): void;
+
+  /** Delete multiple metadata entries in a single batch. */
+  deleteMetas(paths: string[]): void;
 
   /** Rename all pages from one path to another. */
   renameFile(oldPath: string, newPath: string): void;
