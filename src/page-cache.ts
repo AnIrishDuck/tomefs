@@ -9,7 +9,12 @@ import type { CachedPage } from "./types.js";
  * When the cache is full, the least-recently-used page is evicted. If the
  * evicted page is dirty, it is flushed to the backend before eviction.
  *
- * The cache is keyed by (path, pageIndex) and stores PAGE_SIZE-byte buffers.
+ * Maintains secondary indexes for efficient file-scoped operations:
+ * - filePages: maps file path → set of cache keys for that file
+ * - dirtyKeys: set of all dirty cache keys
+ *
+ * This avoids O(cache-size) scans in flushFile, evictFile, deleteFile,
+ * invalidatePagesFrom, flushAll, and dirtyCount.
  */
 export class PageCache {
   private readonly maxPages: number;
@@ -20,6 +25,12 @@ export class PageCache {
 
   /** Key of the most-recently-used page (last entry in Map). Skip LRU touch if hit. */
   private mruKey: string | null = null;
+
+  /** Secondary index: file path → set of cache keys belonging to that file. */
+  private filePages = new Map<string, Set<string>>();
+
+  /** Secondary index: set of cache keys for dirty pages. */
+  private dirtyKeys = new Set<string>();
 
   constructor(backend: StorageBackend, maxPages: number = DEFAULT_MAX_PAGES) {
     if (maxPages < 1) {
@@ -77,6 +88,7 @@ export class PageCache {
     await this.ensureCapacity();
     this.cache.set(key, page);
     this.mruKey = key;
+    this.trackPage(path, key);
     return page;
   }
 
@@ -156,7 +168,10 @@ export class PageCache {
         ),
         pageOffset,
       );
-      page.dirty = true;
+      if (!page.dirty) {
+        page.dirty = true;
+        this.dirtyKeys.add(pageKeyStr(path, pageIndex));
+      }
 
       bytesWritten += bytesInPage;
       pos += bytesInPage;
@@ -168,16 +183,21 @@ export class PageCache {
 
   /**
    * Flush all dirty pages for a specific file to the backend.
+   * O(pages-for-file) via filePages index instead of O(cache-size).
    */
   async flushFile(path: string): Promise<number> {
+    const keys = this.filePages.get(path);
+    if (!keys || keys.size === 0) return 0;
+
     const dirtyPages: Array<{
       path: string;
       pageIndex: number;
       data: Uint8Array;
     }> = [];
 
-    for (const page of this.cache.values()) {
-      if (page.path === path && page.dirty) {
+    for (const key of keys) {
+      if (this.dirtyKeys.has(key)) {
+        const page = this.cache.get(key)!;
         dirtyPages.push({
           path: page.path,
           pageIndex: page.pageIndex,
@@ -188,9 +208,10 @@ export class PageCache {
 
     if (dirtyPages.length > 0) {
       await this.backend.writePages(dirtyPages);
-      for (const page of this.cache.values()) {
-        if (page.path === path && page.dirty) {
-          page.dirty = false;
+      for (const key of keys) {
+        if (this.dirtyKeys.has(key)) {
+          this.cache.get(key)!.dirty = false;
+          this.dirtyKeys.delete(key);
         }
       }
     }
@@ -200,62 +221,70 @@ export class PageCache {
 
   /**
    * Flush all dirty pages across all files to the backend.
+   * O(dirty-count) via dirtyKeys index instead of O(cache-size).
    */
   async flushAll(): Promise<number> {
+    if (this.dirtyKeys.size === 0) return 0;
+
     const dirtyPages: Array<{
       path: string;
       pageIndex: number;
       data: Uint8Array;
     }> = [];
 
-    for (const page of this.cache.values()) {
-      if (page.dirty) {
-        dirtyPages.push({
-          path: page.path,
-          pageIndex: page.pageIndex,
-          data: page.data,
-        });
-      }
+    for (const key of this.dirtyKeys) {
+      const page = this.cache.get(key)!;
+      dirtyPages.push({
+        path: page.path,
+        pageIndex: page.pageIndex,
+        data: page.data,
+      });
     }
 
-    if (dirtyPages.length > 0) {
-      await this.backend.writePages(dirtyPages);
-      for (const page of this.cache.values()) {
-        if (page.dirty) {
-          page.dirty = false;
-        }
-      }
+    await this.backend.writePages(dirtyPages);
+    for (const key of this.dirtyKeys) {
+      this.cache.get(key)!.dirty = false;
     }
+    this.dirtyKeys.clear();
 
     return dirtyPages.length;
   }
 
   /**
    * Evict all cached pages for a file. Dirty pages are flushed first.
+   * O(pages-for-file) via filePages index.
    */
   async evictFile(path: string): Promise<void> {
     await this.flushFile(path);
-    const prefix = `${path}\0`;
-    for (const key of this.cache.keys()) {
-      if (key.startsWith(prefix)) {
-        this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
-      }
+    const keys = this.filePages.get(path);
+    if (!keys) return;
+    for (const key of keys) {
+      this.cache.delete(key);
+      if (key === this.mruKey) this.mruKey = null;
     }
+    this.filePages.delete(path);
   }
 
   /**
    * Invalidate cached pages for a file beyond a given page index.
    * Used after truncation to discard stale pages. Does NOT flush — caller
    * should handle backend deletion separately.
+   * O(pages-for-file) via filePages index.
    */
   invalidatePagesFrom(path: string, fromPageIndex: number): void {
-    const prefix = `${path}\0`;
-    for (const [key, page] of this.cache.entries()) {
-      if (key.startsWith(prefix) && page.pageIndex >= fromPageIndex) {
+    const keys = this.filePages.get(path);
+    if (!keys) return;
+    for (const key of keys) {
+      const page = this.cache.get(key)!;
+      if (page.pageIndex >= fromPageIndex) {
         this.cache.delete(key);
         if (key === this.mruKey) this.mruKey = null;
+        this.dirtyKeys.delete(key);
+        keys.delete(key);
       }
+    }
+    if (keys.size === 0) {
+      this.filePages.delete(path);
     }
   }
 
@@ -272,7 +301,10 @@ export class PageCache {
     const page = this.cache.get(key);
     if (page) {
       page.data.fill(0, tailOffset);
-      page.dirty = true;
+      if (!page.dirty) {
+        page.dirty = true;
+        this.dirtyKeys.add(key);
+      }
     }
   }
 
@@ -283,17 +315,24 @@ export class PageCache {
 
   /** Check if a specific page is dirty. Returns false if not cached. */
   isDirty(path: string, pageIndex: number): boolean {
-    const page = this.cache.get(pageKeyStr(path, pageIndex));
-    return page ? page.dirty : false;
+    return this.dirtyKeys.has(pageKeyStr(path, pageIndex));
   }
 
-  /** Count dirty pages in cache. */
+  /** Count dirty pages in cache. O(1) via dirtyKeys index. */
   get dirtyCount(): number {
-    let count = 0;
-    for (const page of this.cache.values()) {
-      if (page.dirty) count++;
+    return this.dirtyKeys.size;
+  }
+
+  /**
+   * Add a cache key to the filePages index for the given path.
+   */
+  private trackPage(path: string, key: string): void {
+    let keys = this.filePages.get(path);
+    if (!keys) {
+      keys = new Set();
+      this.filePages.set(path, keys);
     }
-    return count;
+    keys.add(key);
   }
 
   /**
@@ -315,10 +354,17 @@ export class PageCache {
           victim.data,
         );
         victim.dirty = false;
+        this.dirtyKeys.delete(firstKey);
       }
 
       this.cache.delete(firstKey);
       if (firstKey === this.mruKey) this.mruKey = null;
+
+      const fileKeys = this.filePages.get(victim.path);
+      if (fileKeys) {
+        fileKeys.delete(firstKey);
+        if (fileKeys.size === 0) this.filePages.delete(victim.path);
+      }
     }
   }
 }
