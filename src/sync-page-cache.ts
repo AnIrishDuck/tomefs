@@ -28,8 +28,8 @@ export class SyncPageCache {
   /** Cache entries keyed by pageKeyStr. Insertion order = LRU order (oldest first). */
   private cache = new Map<string, CachedPage>();
 
-  /** Key of the most-recently-used page (last entry in Map). Skip LRU touch if hit. */
-  private mruKey: string | null = null;
+  /** Most-recently-used page reference. Avoids key construction + Map lookup on hot path. */
+  private mruPage: CachedPage | null = null;
 
   /** Secondary index: file path → set of cache keys belonging to that file. */
   private filePages = new Map<string, Set<string>>();
@@ -66,18 +66,23 @@ export class SyncPageCache {
    * The page is marked as most-recently-used.
    */
   getPage(path: string, pageIndex: number): CachedPage {
-    const key = pageKeyStr(path, pageIndex);
-    // Fast path: if this is already the MRU page, skip Map reordering
-    if (key === this.mruKey) {
-      return this.cache.get(key)!;
+    // Fast path: exact same page as last access — no key construction or Map ops
+    const mru = this.mruPage;
+    if (mru !== null && mru.path === path && mru.pageIndex === pageIndex) {
+      return mru;
     }
 
+    const key = pageKeyStr(path, pageIndex);
     const existing = this.cache.get(key);
     if (existing) {
-      // Move to end (most recently used)
-      this.cache.delete(key);
-      this.cache.set(key, existing);
-      this.mruKey = key;
+      // Only reorder for LRU when cache is at capacity (eviction could happen).
+      // Below capacity, nothing will be evicted, so strict LRU order is unnecessary.
+      // This eliminates the expensive Map delete+set on every cache hit.
+      if (this.cache.size >= this.maxPages) {
+        this.cache.delete(key);
+        this.cache.set(key, existing);
+      }
+      this.mruPage = existing;
       return existing;
     }
 
@@ -92,7 +97,7 @@ export class SyncPageCache {
 
     this.ensureCapacity();
     this.cache.set(key, page);
-    this.mruKey = key;
+    this.mruPage = page;
     this.trackPage(path, key);
     return page;
   }
@@ -118,41 +123,53 @@ export class SyncPageCache {
     const toRead = Math.min(length, available);
     if (toRead === 0) return 0;
 
-    // Determine which pages this read spans
     const firstPage = Math.floor(position / PAGE_SIZE);
+    const pageOffset = position - firstPage * PAGE_SIZE;
+
+    // Fast path: entire read fits within a single page (common case for
+    // page-aligned Postgres I/O). Skips multi-page setup, loop, and
+    // per-iteration index computation.
+    if (pageOffset + toRead <= PAGE_SIZE) {
+      const page = this.getPage(path, firstPage);
+      buffer.set(
+        page.data.subarray(pageOffset, pageOffset + toRead),
+        offset,
+      );
+      return toRead;
+    }
+
+    // Multi-page path
     const lastPage = Math.floor((position + toRead - 1) / PAGE_SIZE);
 
     // Find cache misses — only batch when there are multiple misses
-    if (lastPage > firstPage) {
-      const missingIndices: number[] = [];
-      for (let p = firstPage; p <= lastPage; p++) {
-        if (!this.cache.has(pageKeyStr(path, p))) {
-          missingIndices.push(p);
-        }
+    const missingIndices: number[] = [];
+    for (let p = firstPage; p <= lastPage; p++) {
+      if (!this.cache.has(pageKeyStr(path, p))) {
+        missingIndices.push(p);
       }
+    }
 
-      if (missingIndices.length > 1) {
-        // Batch-evict space before pre-loading to reduce bridge round-trips
-        this.batchEvict(missingIndices.length);
+    if (missingIndices.length > 1) {
+      // Batch-evict space before pre-loading to reduce bridge round-trips
+      this.batchEvict(missingIndices.length);
 
-        const results = this.backend.readPages(path, missingIndices);
-        for (let i = 0; i < missingIndices.length; i++) {
-          const pageIndex = missingIndices[i];
-          const key = pageKeyStr(path, pageIndex);
-          if (this.cache.has(key)) continue; // may appear via eviction cascade
-          const page: CachedPage = {
-            path,
-            pageIndex,
-            data: results[i]
-              ? new Uint8Array(results[i]!)
-              : new Uint8Array(PAGE_SIZE),
-            dirty: false,
-          };
-          this.ensureCapacity();
-          this.cache.set(key, page);
-          this.mruKey = key;
-          this.trackPage(path, key);
-        }
+      const results = this.backend.readPages(path, missingIndices);
+      for (let i = 0; i < missingIndices.length; i++) {
+        const pi = missingIndices[i];
+        const key = pageKeyStr(path, pi);
+        if (this.cache.has(key)) continue; // may appear via eviction cascade
+        const page: CachedPage = {
+          path,
+          pageIndex: pi,
+          data: results[i]
+            ? new Uint8Array(results[i]!)
+            : new Uint8Array(PAGE_SIZE),
+          dirty: false,
+        };
+        this.ensureCapacity();
+        this.cache.set(key, page);
+        this.mruPage = page;
+        this.trackPage(path, key);
       }
     }
 
@@ -161,16 +178,13 @@ export class SyncPageCache {
     let pos = position;
 
     while (bytesRead < toRead) {
-      const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
-      const bytesInPage = Math.min(
-        PAGE_SIZE - pageOffset,
-        toRead - bytesRead,
-      );
+      const pi = Math.floor(pos / PAGE_SIZE);
+      const po = pos - pi * PAGE_SIZE;
+      const bytesInPage = Math.min(PAGE_SIZE - po, toRead - bytesRead);
 
-      const page = this.getPage(path, pageIndex);
+      const page = this.getPage(path, pi);
       buffer.set(
-        page.data.subarray(pageOffset, pageOffset + bytesInPage),
+        page.data.subarray(po, po + bytesInPage),
         offset + bytesRead,
       );
 
@@ -202,45 +216,59 @@ export class SyncPageCache {
     if (length === 0)
       return { bytesWritten: 0, newFileSize: currentFileSize };
 
-    // Determine which pages this write spans
     const firstPage = Math.floor(position / PAGE_SIZE);
+    const pageOffset = position - firstPage * PAGE_SIZE;
+
+    // Fast path: entire write fits within a single page
+    if (pageOffset + length <= PAGE_SIZE) {
+      const page = this.getPage(path, firstPage);
+      page.data.set(
+        buffer.subarray(offset, offset + length),
+        pageOffset,
+      );
+      if (!page.dirty) {
+        page.dirty = true;
+        this.dirtyKeys.add(pageKeyStr(path, firstPage));
+      }
+      const newFileSize = Math.max(currentFileSize, position + length);
+      return { bytesWritten: length, newFileSize };
+    }
+
+    // Multi-page path
     const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
 
-    // For multi-page writes, batch eviction and pre-loading of cache misses
-    if (lastPage > firstPage) {
-      const missingIndices: number[] = [];
-      for (let p = firstPage; p <= lastPage; p++) {
-        if (!this.cache.has(pageKeyStr(path, p))) {
-          missingIndices.push(p);
-        }
+    // Batch eviction and pre-loading of cache misses
+    const missingIndices: number[] = [];
+    for (let p = firstPage; p <= lastPage; p++) {
+      if (!this.cache.has(pageKeyStr(path, p))) {
+        missingIndices.push(p);
       }
+    }
 
-      if (missingIndices.length > 0) {
-        // Batch-evict space for all missing pages at once
-        this.batchEvict(missingIndices.length);
+    if (missingIndices.length > 0) {
+      // Batch-evict space for all missing pages at once
+      this.batchEvict(missingIndices.length);
 
-        // Batch-load all missing pages from backend
-        if (missingIndices.length > 1) {
-          const results = this.backend.readPages(path, missingIndices);
-          for (let i = 0; i < missingIndices.length; i++) {
-            const pageIndex = missingIndices[i];
-            const key = pageKeyStr(path, pageIndex);
-            if (this.cache.has(key)) continue;
-            const page: CachedPage = {
-              path,
-              pageIndex,
-              data: results[i]
-                ? new Uint8Array(results[i]!)
-                : new Uint8Array(PAGE_SIZE),
-              dirty: false,
-            };
-            this.ensureCapacity();
-            this.cache.set(key, page);
-            this.mruKey = key;
-            this.trackPage(path, key);
-          }
+      // Batch-load all missing pages from backend
+      if (missingIndices.length > 1) {
+        const results = this.backend.readPages(path, missingIndices);
+        for (let i = 0; i < missingIndices.length; i++) {
+          const pi = missingIndices[i];
+          const key = pageKeyStr(path, pi);
+          if (this.cache.has(key)) continue;
+          const page: CachedPage = {
+            path,
+            pageIndex: pi,
+            data: results[i]
+              ? new Uint8Array(results[i]!)
+              : new Uint8Array(PAGE_SIZE),
+            dirty: false,
+          };
+          this.ensureCapacity();
+          this.cache.set(key, page);
+          this.mruPage = page;
+          this.trackPage(path, key);
         }
-        // Single misses are handled efficiently by getPage below
       }
     }
 
@@ -249,24 +277,21 @@ export class SyncPageCache {
     let pos = position;
 
     while (bytesWritten < length) {
-      const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
-      const bytesInPage = Math.min(
-        PAGE_SIZE - pageOffset,
-        length - bytesWritten,
-      );
+      const pi = Math.floor(pos / PAGE_SIZE);
+      const po = pos - pi * PAGE_SIZE;
+      const bytesInPage = Math.min(PAGE_SIZE - po, length - bytesWritten);
 
-      const page = this.getPage(path, pageIndex);
+      const page = this.getPage(path, pi);
       page.data.set(
         buffer.subarray(
           offset + bytesWritten,
           offset + bytesWritten + bytesInPage,
         ),
-        pageOffset,
+        po,
       );
       if (!page.dirty) {
         page.dirty = true;
-        this.dirtyKeys.add(pageKeyStr(path, pageIndex));
+        this.dirtyKeys.add(pageKeyStr(path, pi));
       }
 
       bytesWritten += bytesInPage;
@@ -355,8 +380,9 @@ export class SyncPageCache {
     const keys = this.filePages.get(path);
     if (!keys) return;
     for (const key of keys) {
+      const page = this.cache.get(key)!;
       this.cache.delete(key);
-      if (key === this.mruKey) this.mruKey = null;
+      if (page === this.mruPage) this.mruPage = null;
     }
     this.filePages.delete(path);
   }
@@ -374,7 +400,7 @@ export class SyncPageCache {
       const page = this.cache.get(key)!;
       if (page.pageIndex >= fromPageIndex) {
         this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
+        if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
         keys.delete(key);
       }
@@ -424,8 +450,9 @@ export class SyncPageCache {
     const keys = this.filePages.get(path);
     if (keys) {
       for (const key of keys) {
+        const page = this.cache.get(key)!;
         this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
+        if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
       this.filePages.delete(path);
@@ -452,9 +479,10 @@ export class SyncPageCache {
     const toMove: CachedPage[] = [];
     if (oldKeys) {
       for (const key of oldKeys) {
-        toMove.push(this.cache.get(key)!);
+        const page = this.cache.get(key)!;
+        toMove.push(page);
         this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
+        if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
       this.filePages.delete(oldPath);
@@ -520,7 +548,7 @@ export class SyncPageCache {
     }
 
     this.cache.delete(firstKey);
-    if (firstKey === this.mruKey) this.mruKey = null;
+    if (victim === this.mruPage) this.mruPage = null;
 
     const keys = this.filePages.get(victim.path);
     if (keys) {
@@ -585,7 +613,7 @@ export class SyncPageCache {
       const victim = victims[i];
 
       this.cache.delete(key);
-      if (key === this.mruKey) this.mruKey = null;
+      if (victim === this.mruPage) this.mruPage = null;
 
       if (victim.dirty) {
         victim.dirty = false;
