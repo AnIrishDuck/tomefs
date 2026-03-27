@@ -916,4 +916,106 @@ describe("PreloadBackend", () => {
       expect(totalCalls).toBe(0);
     });
   });
+
+  describe("flush error recovery", () => {
+    /**
+     * Backend fake that fails writePages on demand.
+     * Not a mock — delegates to a real MemoryBackend for all operations.
+     */
+    class FailingRemote implements StorageBackend {
+      private inner = new MemoryBackend();
+      writePagesFailCount = 0;
+
+      async readPage(path: string, pageIndex: number) { return this.inner.readPage(path, pageIndex); }
+      async readPages(path: string, pageIndices: number[]) { return this.inner.readPages(path, pageIndices); }
+      async writePage(path: string, pageIndex: number, data: Uint8Array) { return this.inner.writePage(path, pageIndex, data); }
+      async writePages(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) {
+        if (this.writePagesFailCount > 0) {
+          this.writePagesFailCount--;
+          throw new Error("injected writePages failure");
+        }
+        return this.inner.writePages(pages);
+      }
+      async deleteFile(path: string) { return this.inner.deleteFile(path); }
+      async deletePagesFrom(path: string, fromPageIndex: number) { return this.inner.deletePagesFrom(path, fromPageIndex); }
+      async renameFile(oldPath: string, newPath: string) { return this.inner.renameFile(oldPath, newPath); }
+      async readMeta(path: string) { return this.inner.readMeta(path); }
+      async writeMeta(path: string, meta: FileMeta) { return this.inner.writeMeta(path, meta); }
+      async writeMetas(entries: Array<{ path: string; meta: FileMeta }>) { return this.inner.writeMetas(entries); }
+      async deleteMeta(path: string) { return this.inner.deleteMeta(path); }
+      async deleteMetas(paths: string[]) { return this.inner.deleteMetas(paths); }
+      async listFiles() { return this.inner.listFiles(); }
+    }
+
+    it("retains dirty tracking when writePages fails so retry succeeds", async () => {
+      const failing = new FailingRemote();
+      const backend = new PreloadBackend(failing);
+      await backend.init();
+
+      // Write a page and metadata
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0xaa;
+      data[1] = 0xbb;
+      backend.writePage("/file", 0, data);
+      backend.writeMeta("/file", { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 1000 });
+
+      expect(backend.dirtyPageCount).toBe(1);
+      expect(backend.dirtyMetaCount).toBe(1);
+
+      // First flush fails
+      failing.writePagesFailCount = 1;
+      await expect(backend.flush()).rejects.toThrow("injected writePages failure");
+
+      // Dirty tracking must be preserved for retry
+      expect(backend.dirtyPageCount).toBe(1);
+      expect(backend.dirtyMetaCount).toBe(1);
+
+      // Retry succeeds
+      await backend.flush();
+      expect(backend.dirtyPageCount).toBe(0);
+      expect(backend.dirtyMetaCount).toBe(0);
+
+      // Verify data reached the remote backend
+      const stored = await failing.readPage("/file", 0);
+      expect(stored).not.toBeNull();
+      expect(stored![0]).toBe(0xaa);
+      expect(stored![1]).toBe(0xbb);
+    });
+
+    it("preserves new writes made during a failed flush", async () => {
+      const failing = new FailingRemote();
+      const backend = new PreloadBackend(failing);
+      await backend.init();
+
+      // Write initial data
+      const data1 = new Uint8Array(PAGE_SIZE);
+      data1[0] = 0x11;
+      backend.writePage("/a", 0, data1);
+      backend.writeMeta("/a", { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 1000 });
+
+      // Fail the first flush
+      failing.writePagesFailCount = 1;
+      await expect(backend.flush()).rejects.toThrow("injected writePages failure");
+
+      // Write new data while first flush's dirty entries are still pending
+      const data2 = new Uint8Array(PAGE_SIZE);
+      data2[0] = 0x22;
+      backend.writePage("/b", 0, data2);
+      backend.writeMeta("/b", { size: PAGE_SIZE, mode: 0o100644, ctime: 2000, mtime: 2000 });
+
+      // Both original and new entries should be dirty
+      expect(backend.dirtyPageCount).toBe(2);
+      expect(backend.dirtyMetaCount).toBe(2);
+
+      // Retry succeeds — both files flushed
+      await backend.flush();
+      expect(backend.dirtyPageCount).toBe(0);
+      expect(backend.dirtyMetaCount).toBe(0);
+
+      const storedA = await failing.readPage("/a", 0);
+      expect(storedA![0]).toBe(0x11);
+      const storedB = await failing.readPage("/b", 0);
+      expect(storedB![0]).toBe(0x22);
+    });
+  });
 });

@@ -339,6 +339,12 @@ export class PreloadBackend implements SyncStorageBackend {
     // Partition dirty pages: pages at paths pending deletion must be
     // written AFTER the delete (to handle delete-then-recreate at the
     // same path). All other dirty pages are written first for crash safety.
+    // Snapshot the dirty keys we intend to flush. We must NOT clear
+    // dirtyPages/dirtyMeta until all operations succeed — otherwise a
+    // mid-flush failure loses dirty tracking and the data is never retried.
+    const flushedPageKeys = new Set(this.dirtyPages);
+    const flushedMetaPaths = new Set(this.dirtyMeta);
+
     const earlyBatch: Array<{
       path: string;
       pageIndex: number;
@@ -349,7 +355,7 @@ export class PreloadBackend implements SyncStorageBackend {
       pageIndex: number;
       data: Uint8Array;
     }> = [];
-    for (const key of this.dirtyPages) {
+    for (const key of flushedPageKeys) {
       const data = this.pages.get(key);
       if (data) {
         const nullIdx = key.indexOf("\0");
@@ -363,12 +369,11 @@ export class PreloadBackend implements SyncStorageBackend {
         }
       }
     }
-    this.dirtyPages.clear();
 
     // Partition dirty metadata the same way as pages.
     const earlyMeta: Array<{ path: string; meta: FileMeta }> = [];
     const lateMeta: Array<{ path: string; meta: FileMeta }> = [];
-    for (const path of this.dirtyMeta) {
+    for (const path of flushedMetaPaths) {
       const m = this.meta.get(path);
       if (m) {
         if (this.deletedMeta.has(path)) {
@@ -378,7 +383,6 @@ export class PreloadBackend implements SyncStorageBackend {
         }
       }
     }
-    this.dirtyMeta.clear();
 
     // 1. Write new pages at non-deleted paths (crash-safe: new data first)
     if (earlyBatch.length > 0) {
@@ -422,6 +426,16 @@ export class PreloadBackend implements SyncStorageBackend {
     // 7. Batch-write metadata for delete-then-recreate paths
     if (lateMeta.length > 0) {
       await this.remote.writeMetas(lateMeta);
+    }
+
+    // 8. All operations succeeded — clear dirty tracking for flushed entries.
+    // We clear individual entries (not the whole set) so that writes that
+    // occurred during flush are preserved for the next flush cycle.
+    for (const key of flushedPageKeys) {
+      this.dirtyPages.delete(key);
+    }
+    for (const path of flushedMetaPaths) {
+      this.dirtyMeta.delete(path);
     }
   }
 }
