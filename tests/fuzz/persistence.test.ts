@@ -70,17 +70,26 @@ class Rng {
 interface FileState {
   /** Full file content (ground truth). */
   content: Uint8Array;
+  /** Permission bits (e.g. 0o644). Excludes type bits (S_IFREG). */
+  mode: number;
 }
 
 interface Model {
   files: Map<string, FileState>;
   dirs: Set<string>;
+  /** Directory permission bits: path → mode (excludes type bits). */
+  dirModes: Map<string, number>;
   /** Symlinks: path → target string. */
   symlinks: Map<string, string>;
 }
 
+/** Default file mode after creation (Emscripten default umask = 0). */
+const DEFAULT_FILE_MODE = 0o666;
+/** Default directory mode (Emscripten passes 0o777 as-is). */
+const DEFAULT_DIR_MODE = 0o777;
+
 function newModel(): Model {
-  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map() };
+  return { files: new Map(), dirs: new Set(["/"]), dirModes: new Map(), symlinks: new Map() };
 }
 
 function filesInDir(model: Model, dir: string): string[] {
@@ -128,6 +137,8 @@ type Op =
   | { type: "renameDir"; oldPath: string; newPath: string }
   | { type: "symlink"; target: string; path: string }
   | { type: "unlinkSymlink"; path: string }
+  | { type: "chmodFile"; path: string; mode: number }
+  | { type: "chmodDir"; path: string; mode: number }
   | { type: "checkpoint" };
 
 const DIR_NAMES = ["aa", "bb", "cc"];
@@ -151,6 +162,8 @@ function generateOp(rng: Rng, model: Model): Op {
     ["renameDir", allDirs.length > 0 ? 6 : 0],
     ["symlink", allFiles.length > 0 ? 8 : 0],
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
+    ["chmodFile", allFiles.length > 0 ? 6 : 0],
+    ["chmodDir", allDirs.length > 0 ? 4 : 0],
     ["checkpoint", 8], // ~8% chance of checkpoint
   ];
 
@@ -234,6 +247,18 @@ function generateOp(rng: Rng, model: Model): Op {
     case "unlinkSymlink":
       return { type: "unlinkSymlink", path: rng.pick(allSymlinks) };
 
+    case "chmodFile": {
+      const path = rng.pick(allFiles);
+      const modeChoices = [0o444, 0o644, 0o666, 0o755, 0o700, 0o600, 0o400];
+      return { type: "chmodFile", path, mode: rng.pick(modeChoices) };
+    }
+
+    case "chmodDir": {
+      const path = rng.pick(allDirs);
+      const modeChoices = [0o555, 0o755, 0o777, 0o700, 0o750];
+      return { type: "chmodDir", path, mode: rng.pick(modeChoices) };
+    }
+
     case "checkpoint":
     default:
       return { type: "checkpoint" };
@@ -252,6 +277,8 @@ function formatOp(op: Op, index: number): string {
     case "rmdir": return `[${index}] rmdir(${op.path})`;
     case "symlink": return `[${index}] symlink(${op.target} -> ${op.path})`;
     case "unlinkSymlink": return `[${index}] unlinkSymlink(${op.path})`;
+    case "chmodFile": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
+    case "chmodDir": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
     case "checkpoint": return `[${index}] CHECKPOINT`;
   }
 }
@@ -265,7 +292,7 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
 
   switch (op.type) {
     case "createFile": {
-      model.files.set(op.path, { content: new Uint8Array(op.data) });
+      model.files.set(op.path, { content: new Uint8Array(op.data), mode: DEFAULT_FILE_MODE });
       break;
     }
     case "writeAt": {
@@ -299,9 +326,11 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       break;
     case "mkdir":
       model.dirs.add(op.path);
+      model.dirModes.set(op.path, DEFAULT_DIR_MODE);
       break;
     case "rmdir":
       model.dirs.delete(op.path);
+      model.dirModes.delete(op.path);
       break;
     case "renameDir": {
       const oldPrefix = op.oldPath + "/";
@@ -314,7 +343,14 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       for (const dir of [...model.dirs]) {
         if (dir === op.oldPath || dir.startsWith(oldPrefix)) {
           model.dirs.delete(dir);
-          model.dirs.add(op.newPath + dir.slice(op.oldPath.length));
+          const newDir = op.newPath + dir.slice(op.oldPath.length);
+          model.dirs.add(newDir);
+          // Move directory mode
+          const dirMode = model.dirModes.get(dir);
+          if (dirMode !== undefined) {
+            model.dirModes.delete(dir);
+            model.dirModes.set(newDir, dirMode);
+          }
         }
       }
       for (const [path, target] of [...model.symlinks]) {
@@ -331,6 +367,14 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       break;
     case "unlinkSymlink":
       model.symlinks.delete(op.path);
+      break;
+    case "chmodFile": {
+      const state = model.files.get(op.path);
+      if (state) state.mode = op.mode;
+      break;
+    }
+    case "chmodDir":
+      model.dirModes.set(op.path, op.mode);
       break;
   }
 }
@@ -460,6 +504,10 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
       case "rmdir":
         FS.rmdir(op.path);
         return true;
+      case "chmodFile":
+      case "chmodDir":
+        FS.chmod(op.path, op.mode);
+        return true;
       default:
         return true;
     }
@@ -472,6 +520,9 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
 // Verify all model files against FS
 // ---------------------------------------------------------------
 
+/** Extract permission bits (lower 12 bits, excluding type). */
+const PERM_MASK = 0o7777;
+
 function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
   for (const [path, state] of model.files) {
     let stat: any;
@@ -482,6 +533,13 @@ function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
     }
 
     expect(stat.size, `${context}: size mismatch for ${path}`).toBe(state.content.length);
+
+    // Verify permission mode survived persistence
+    const actualPerm = stat.mode & PERM_MASK;
+    expect(
+      actualPerm,
+      `${context}: mode mismatch for ${path}: expected 0o${state.mode.toString(8)}, got 0o${actualPerm.toString(8)}`,
+    ).toBe(state.mode);
 
     if (state.content.length > 0) {
       const buf = new Uint8Array(stat.size);
@@ -503,12 +561,20 @@ function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
     }
   }
 
-  // Verify directories exist
+  // Verify directories exist and modes match
   for (const dir of model.dirs) {
     if (dir === "/") continue;
     try {
       const stat = FS.stat(dir);
       expect(FS.isDir(stat.mode), `${context}: ${dir} should be a directory`).toBe(true);
+      const expectedMode = model.dirModes.get(dir);
+      if (expectedMode !== undefined) {
+        const actualPerm = stat.mode & PERM_MASK;
+        expect(
+          actualPerm,
+          `${context}: dir mode mismatch for ${dir}: expected 0o${expectedMode.toString(8)}, got 0o${actualPerm.toString(8)}`,
+        ).toBe(expectedMode);
+      }
     } catch (e: any) {
       throw new Error(`${context}: directory ${dir} should exist but stat failed: ${e.message}`);
     }
@@ -622,6 +688,28 @@ describe("fuzz: persistence through syncfs + remount cycles", () => {
 
     it("150 ops, small cache, seed 256", async () => {
       await runPersistenceFuzz(256, 150, 16);
+    }, 60_000);
+  });
+
+  describe("chmod + mode persistence through remount cycles", () => {
+    it("seed 11111 — tiny cache, mode changes between checkpoints @fast", async () => {
+      await runPersistenceFuzz(11111, 80, 4);
+    }, 30_000);
+
+    it("seed 22222 — small cache, chmod + rename + persist", async () => {
+      await runPersistenceFuzz(22222, 80, 16);
+    }, 30_000);
+
+    it("seed 33333 — dir chmod + renameDir + persist", async () => {
+      await runPersistenceFuzz(33333, 80, 16);
+    }, 30_000);
+
+    it("seed 44444 — large cache, chmod interleaved with writes", async () => {
+      await runPersistenceFuzz(44444, 100, 4096);
+    }, 30_000);
+
+    it("150 ops, tiny cache, seed 55555 — extended chmod sequence", async () => {
+      await runPersistenceFuzz(55555, 150, 4);
     }, 60_000);
   });
 });
