@@ -447,8 +447,10 @@ describe("SyncPageCache", () => {
       expect(cb.counts.writePage).toBe(0);
       expect(cb.counts.writePages).toBe(1);
 
-      // Should batch the read of missing pages (1 readPages, not 4 readPage)
-      expect(cb.counts.readPages).toBe(1);
+      // File B is new (currentFileSize=0), so all pages are beyond the file
+      // extent — no backend reads needed (skip-read optimization).
+      expect(cb.counts.readPages).toBe(0);
+      expect(cb.counts.readPage).toBe(0);
 
       // Verify data integrity: read back file B
       const buf = new Uint8Array(PAGE_SIZE * 4);
@@ -693,6 +695,214 @@ describe("SyncPageCache", () => {
 
       // 3 pages should be loaded (misses)
       expect(cache.getStats().misses).toBe(3);
+    });
+  });
+
+  describe("skip backend reads for pages beyond file extent", () => {
+    /**
+     * Counting wrapper around SyncMemoryBackend that tracks readPage
+     * and readPages calls to verify the optimization.
+     */
+    function createCountingBackend() {
+      const inner = new SyncMemoryBackend();
+      let readPageCalls = 0;
+      let readPagesCalls = 0;
+      let readPagesIndicesTotal = 0;
+
+      const counting: SyncMemoryBackend & {
+        readPageCalls: number;
+        readPagesCalls: number;
+        readPagesIndicesTotal: number;
+        resetCounts(): void;
+      } = Object.create(inner);
+
+      Object.defineProperty(counting, "readPageCalls", {
+        get: () => readPageCalls,
+      });
+      Object.defineProperty(counting, "readPagesCalls", {
+        get: () => readPagesCalls,
+      });
+      Object.defineProperty(counting, "readPagesIndicesTotal", {
+        get: () => readPagesIndicesTotal,
+      });
+      counting.resetCounts = () => {
+        readPageCalls = 0;
+        readPagesCalls = 0;
+        readPagesIndicesTotal = 0;
+      };
+      counting.readPage = (path: string, pageIndex: number) => {
+        readPageCalls++;
+        return inner.readPage(path, pageIndex);
+      };
+      counting.readPages = (path: string, pageIndices: number[]) => {
+        readPagesCalls++;
+        readPagesIndicesTotal += pageIndices.length;
+        return inner.readPages(path, pageIndices);
+      };
+      return counting;
+    }
+
+    it("single-page write to new file skips backend read", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      // Write to a brand-new file (currentFileSize=0)
+      const data = new Uint8Array([1, 2, 3]);
+      cb.resetCounts();
+      cache.write("/file", data, 0, 3, 0, 0);
+
+      // No backend reads — file has no existing pages
+      expect(cb.readPageCalls).toBe(0);
+      expect(cb.readPagesCalls).toBe(0);
+    });
+
+    it("multi-page extending write skips backend reads for new pages", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 16);
+
+      // Write initial page
+      const init = new Uint8Array(PAGE_SIZE);
+      init.fill(0xaa);
+      cache.write("/file", init, 0, PAGE_SIZE, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+
+      // Now write 4 pages starting at position 0 (1 existing + 3 new)
+      const data = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < data.length; i++) data[i] = (i * 7) & 0xff;
+
+      cb.resetCounts();
+      cache.write("/file", data, 0, data.length, 0, PAGE_SIZE);
+
+      // Only page 0 should be read from backend (it exists).
+      // Pages 1-3 are beyond file extent and should be skipped.
+      // The single existing miss goes through getPageInternal(readBackend=true).
+      expect(cb.readPageCalls).toBe(1);
+      expect(cb.readPagesCalls).toBe(0);
+
+      // Verify data integrity
+      const buf = new Uint8Array(data.length);
+      cache.read("/file", buf, 0, data.length, 0, PAGE_SIZE * 4);
+      expect(buf).toEqual(data);
+    });
+
+    it("batch read only includes pages within file extent", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 16);
+
+      // Write 3 pages to establish file extent
+      const init = new Uint8Array(PAGE_SIZE * 3);
+      init.fill(0xbb);
+      cache.write("/file", init, 0, init.length, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+
+      // Write 6 pages starting at page 1 (2 existing + 3 new)
+      const data = new Uint8Array(PAGE_SIZE * 5);
+      for (let i = 0; i < data.length; i++) data[i] = (i * 11) & 0xff;
+
+      cb.resetCounts();
+      cache.write("/file", data, 0, data.length, PAGE_SIZE, PAGE_SIZE * 3);
+
+      // Pages 1-2 exist in backend → batch read of 2 pages.
+      // Pages 3-5 are beyond file extent → no backend read.
+      expect(cb.readPagesIndicesTotal).toBe(2);
+
+      // Verify data integrity: page 0 still has original data
+      const fullBuf = new Uint8Array(PAGE_SIZE * 6);
+      cache.read("/file", fullBuf, 0, PAGE_SIZE * 6, 0, PAGE_SIZE * 6);
+      // Page 0: original 0xbb fill
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        expect(fullBuf[i]).toBe(0xbb);
+      }
+      // Pages 1-5: new data
+      for (let i = 0; i < data.length; i++) {
+        expect(fullBuf[PAGE_SIZE + i]).toBe(data[i]);
+      }
+    });
+
+    it("appending write to existing file skips backend read", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      // Write some initial data
+      const init = new Uint8Array(100);
+      init.fill(0xcc);
+      cache.write("/file", init, 0, 100, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+
+      // Append at the end (next page boundary)
+      const append = new Uint8Array(PAGE_SIZE);
+      append.fill(0xdd);
+
+      cb.resetCounts();
+      cache.write("/file", append, 0, PAGE_SIZE, PAGE_SIZE, 100);
+
+      // Page 1 is beyond the file extent (100 bytes = 1 page).
+      // ceil(100/8192) = 1, so page index 1 >= firstNewPage.
+      // No backend reads needed.
+      expect(cb.readPageCalls).toBe(0);
+      expect(cb.readPagesCalls).toBe(0);
+    });
+
+    it("write within existing extent still reads from backend", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      // Write 2 pages
+      const init = new Uint8Array(PAGE_SIZE * 2);
+      init.fill(0xee);
+      cache.write("/file", init, 0, init.length, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+
+      // Overwrite page 0 (within existing extent)
+      const overwrite = new Uint8Array(PAGE_SIZE);
+      overwrite.fill(0xff);
+
+      cb.resetCounts();
+      cache.write("/file", overwrite, 0, PAGE_SIZE, 0, PAGE_SIZE * 2);
+
+      // Page 0 exists in backend → should be read
+      expect(cb.readPageCalls).toBe(1);
+    });
+
+    it("extending write preserves data integrity under cache pressure", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 4); // Tiny cache
+
+      // Write 2 pages
+      const init = new Uint8Array(PAGE_SIZE * 2);
+      for (let i = 0; i < init.length; i++) init[i] = (i * 3) & 0xff;
+      cache.write("/file", init, 0, init.length, 0, 0);
+      cache.flushAll();
+
+      // Extend by 8 more pages (far exceeds cache)
+      const extend = new Uint8Array(PAGE_SIZE * 8);
+      for (let i = 0; i < extend.length; i++)
+        extend[i] = ((i + 1000) * 7) & 0xff;
+
+      cb.resetCounts();
+      cache.write("/file", extend, 0, extend.length, PAGE_SIZE * 2, PAGE_SIZE * 2);
+
+      // Pages 2-9 are all new → no backend reads for them
+      // (Some reads may occur from eviction cascading, but no reads for new pages)
+      expect(cb.readPagesIndicesTotal).toBe(0);
+
+      // Verify all data survives (original + extension)
+      const total = PAGE_SIZE * 10;
+      const buf = new Uint8Array(total);
+      cache.read("/file", buf, 0, total, 0, total);
+
+      // Pages 0-1: original data
+      for (let i = 0; i < PAGE_SIZE * 2; i++) {
+        expect(buf[i]).toBe((i * 3) & 0xff);
+      }
+      // Pages 2-9: extension data
+      for (let i = 0; i < PAGE_SIZE * 8; i++) {
+        expect(buf[PAGE_SIZE * 2 + i]).toBe(((i + 1000) * 7) & 0xff);
+      }
     });
   });
 });
