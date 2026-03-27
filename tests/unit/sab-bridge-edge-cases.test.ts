@@ -824,4 +824,54 @@ describe("SAB bridge: decodeMessage validation", () => {
       /SAB decode error/,
     );
   });
+
+  it("@fast rejects corrupted JSON with descriptive error", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 200);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    // Write a valid length prefix but garbage JSON bytes
+    const invalidJson = new TextEncoder().encode("{broken json!!!");
+    const jsonLen = invalidJson.length;
+    dataView.setUint32(JSON_REGION_OFFSET, jsonLen, true);
+    uint8View.set(invalidJson, JSON_REGION_OFFSET + 4);
+
+    const totalLen = 4 + jsonLen;
+
+    expect(() => decodeMessage(dataView, uint8View, totalLen)).toThrow(
+      /SAB decode error: invalid JSON/,
+    );
+  });
+
+  it("rejects truncated JSON with descriptive error", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 200);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    // Truncated JSON: opening brace but no closing
+    const truncated = new TextEncoder().encode('{"key": "val');
+    const jsonLen = truncated.length;
+    dataView.setUint32(JSON_REGION_OFFSET, jsonLen, true);
+    uint8View.set(truncated, JSON_REGION_OFFSET + 4);
+
+    const totalLen = 4 + jsonLen;
+
+    expect(() => decodeMessage(dataView, uint8View, totalLen)).toThrow(
+      /SAB decode error: invalid JSON/,
+    );
+  });
+
+  it("rejects empty string as JSON with descriptive error", () => {
+    const buf = new ArrayBuffer(CONTROL_BYTES + 200);
+    const dataView = new DataView(buf);
+    const uint8View = new Uint8Array(buf);
+
+    // Zero-length JSON (jsonLen = 0, but totalLen = 4 so length check passes)
+    dataView.setUint32(JSON_REGION_OFFSET, 0, true);
+    const totalLen = 4;
+
+    expect(() => decodeMessage(dataView, uint8View, totalLen)).toThrow(
+      /SAB decode error: invalid JSON/,
+    );
+  });
 });
