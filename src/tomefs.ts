@@ -811,34 +811,39 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             if (node.unlinked) continue;
             const path = nodeStoragePath(node, mountPrefix);
             currentPaths.add(path);
-            if (!backend.readMeta(path)) {
-              // flushAll() already flushed dirty pages, but detached nodes
-              // may not have been flushed if their storagePath differs.
-              pageCache.flushFile(node.storagePath);
-              metaBatch.push({
-                path,
-                meta: {
-                  size: node.usedBytes,
-                  mode: node.mode,
-                  ctime: node.ctime,
-                  mtime: node.mtime,
-                  atime: node.atime,
-                },
-              });
-            }
+            // Always persist metadata for detached nodes — not just on first
+            // sync. Without this, metadata (size, timestamps, mode) becomes
+            // stale after the first sync if the file is modified between cycles.
+            // flushAll() already flushed dirty pages, but detached nodes
+            // may not have been flushed if their storagePath differs.
+            pageCache.flushFile(node.storagePath);
+            metaBatch.push({
+              path,
+              meta: {
+                size: node.usedBytes,
+                mode: node.mode,
+                ctime: node.ctime,
+                mtime: node.mtime,
+                atime: node.atime,
+              },
+            });
           }
 
           // Also persist parent directories for detached nodes
           // so restoreTree can recreate the full tree structure.
+          // Use currentPaths (in-memory set) instead of backend.readMeta()
+          // to check for already-collected directories. This avoids O(depth)
+          // synchronous backend reads per detached node — each of which is
+          // a SAB bridge round-trip in production.
           for (const node of allFileNodes) {
             if (visited.has(node)) continue;
             if (node.unlinked) continue;
             // Walk up from node's parent to the mount boundary,
-            // persisting any directories not already in metadata.
+            // persisting any directories not already collected.
             let dir = node.parent;
             while (dir && dir.parent && dir.parent !== dir) {
               const dirPath = nodeStoragePath(dir, mountPrefix);
-              if (backend.readMeta(dirPath)) break; // already persisted
+              if (currentPaths.has(dirPath)) break; // already collected
               currentPaths.add(dirPath);
               if (FS.isDir(dir.mode)) {
                 metaBatch.push({
