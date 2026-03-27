@@ -245,11 +245,26 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.renameFile(targetStoragePath, tempPath);
           new_node.storagePath = tempPath;
           new_node.unlinked = true;
+          // Write marker metadata so the orphaned pages are discoverable
+          // after a crash. On normal close, this metadata is deleted along
+          // with the pages. After a crash, syncfs orphan cleanup finds it
+          // via listFiles() and removes both pages and metadata.
+          backend.writeMeta(tempPath, {
+            size: new_node.usedBytes,
+            mode: new_node.mode,
+            ctime: new_node.ctime,
+            mtime: new_node.mtime,
+            atime: new_node.atime,
+          });
         } else {
           pageCache.deleteFile(targetStoragePath);
         }
         backend.deleteMeta(targetStoragePath);
-        allFileNodes.delete(new_node);
+        // Keep node tracked if it has open fds — syncfs needs to
+        // preserve its /__deleted_* path until the last fd closes.
+        if (new_node.openCount === 0) {
+          allFileNodes.delete(new_node);
+        }
       }
       FS.hashRemoveNode(new_node);
     }
@@ -317,8 +332,21 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         pageCache.renameFile(originalPath, tempPath);
         node.storagePath = tempPath;
         backend.deleteMeta(originalPath);
+        // Write marker metadata so orphaned pages are discoverable after
+        // a crash. Cleaned up on last fd close or by syncfs orphan cleanup.
+        backend.writeMeta(tempPath, {
+          size: node.usedBytes,
+          mode: node.mode,
+          ctime: node.ctime,
+          mtime: node.mtime,
+          atime: node.atime,
+        });
       }
-      allFileNodes.delete(node);
+      // Only remove from tracking if no open fds — syncfs needs to
+      // preserve /__deleted_* paths for nodes with live fds.
+      if (node.openCount === 0) {
+        allFileNodes.delete(node);
+      }
     } else if (node && FS.isLink(node.mode)) {
       const sp = computeStoragePath(parent, name);
       backend.deleteMeta(sp);
@@ -502,9 +530,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (FS.isFile(node.mode)) {
         node.openCount--;
         if (node.unlinked && node.openCount === 0) {
-          // Last fd closed on an unlinked file — clean up pages + metadata
+          // Last fd closed on an unlinked file — clean up pages + marker metadata
           pageCache.deleteFile(node.storagePath);
-          backend.deleteMeta(node.storagePath);
+          backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
         } else {
           pageCache.flushFile(node.storagePath);
@@ -656,6 +684,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     });
 
     for (const path of paths) {
+      // Skip /__deleted_* marker entries — these are orphaned pages from
+      // files that had open fds when the process crashed. They'll be
+      // cleaned up by the first syncfs call (orphan cleanup pass).
+      if (path.startsWith("/__deleted_")) continue;
+
       const meta = backend.readMeta(path);
       if (!meta) continue;
 
@@ -858,6 +891,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
                 });
               }
               dir = dir.parent;
+            }
+          }
+
+          // Preserve /__deleted_* paths for unlinked nodes that still have
+          // open fds. These have marker metadata in the backend; without
+          // adding them to currentPaths, orphan cleanup would delete their
+          // pages while fds are still reading them.
+          for (const node of allFileNodes) {
+            if (node.unlinked && node.openCount > 0) {
+              currentPaths.add(node.storagePath);
             }
           }
 
