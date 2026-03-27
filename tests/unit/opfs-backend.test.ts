@@ -680,6 +680,164 @@ describe("OpfsBackend", () => {
   });
 
   // -------------------------------------------------------------------
+  // Batch failure handling
+  // -------------------------------------------------------------------
+
+  describe("batch failure handling", () => {
+    /** Encode a path as hex (same as OpfsBackend internal encodePath). */
+    function encodePath(path: string): string {
+      const bytes = new TextEncoder().encode(path);
+      let hex = "";
+      for (const b of bytes) {
+        hex += b.toString(16).padStart(2, "0");
+      }
+      return hex;
+    }
+
+    it("renameFile cleans up partial new dir on copy failure", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+
+      // Write 3 pages to source
+      await b.writePage("/src", 0, filledPage(0x01));
+      await b.writePage("/src", 1, filledPage(0x02));
+      await b.writePage("/src", 2, filledPage(0x03));
+
+      // Sabotage: make the file dir for /src return a faulty getFileHandle
+      // that fails on the third page read, simulating an I/O error mid-copy
+      const pagesDir = (b as any).pagesDir;
+      const srcEncoded = encodePath("/src");
+      const srcDir = await pagesDir.getDirectoryHandle(srcEncoded);
+      const originalGetFile = srcDir.getFileHandle.bind(srcDir);
+      let callCount = 0;
+      srcDir.getFileHandle = async (name: string, options?: { create?: boolean }) => {
+        // Fail on the 3rd access (one of the parallel copies will fail)
+        callCount++;
+        if (callCount >= 3 && !options?.create) {
+          throw new DOMException("Disk error", "InvalidStateError");
+        }
+        return originalGetFile(name, options);
+      };
+
+      // Rename should fail
+      await expect(b.renameFile("/src", "/dst")).rejects.toThrow("Disk error");
+
+      // The partial new dir should be cleaned up — no /dst pages should exist
+      // Restore the source dir to verify the source data is still intact
+      srcDir.getFileHandle = originalGetFile;
+
+      // Source pages should still be readable (not deleted)
+      expect(await b.readPage("/src", 0)).toEqual(filledPage(0x01));
+      expect(await b.readPage("/src", 1)).toEqual(filledPage(0x02));
+      expect(await b.readPage("/src", 2)).toEqual(filledPage(0x03));
+
+      // Destination should not exist (cleaned up)
+      expect(await b.readPage("/dst", 0)).toBeNull();
+      expect(await b.readPage("/dst", 1)).toBeNull();
+
+      await b.destroy();
+    });
+
+    it("renameFile preserves source data on copy failure (no data loss)", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+
+      // Write pages to both source and pre-existing destination
+      await b.writePage("/old", 0, filledPage(0xaa));
+      await b.writePage("/old", 1, filledPage(0xbb));
+      await b.writePage("/existing", 0, filledPage(0xcc));
+
+      // Sabotage: make creating writable on destination fail
+      const pagesDir = (b as any).pagesDir;
+      const dstEncoded = encodePath("/existing");
+
+      // The rename first removes destination, then copies. Intercept after
+      // the destination removal by making the new dir's getFileHandle(create)
+      // fail. We need to let the destination removal succeed first.
+      const originalGetDir = pagesDir.getDirectoryHandle.bind(pagesDir);
+      let intercepted = false;
+      pagesDir.getDirectoryHandle = async (name: string, options?: { create?: boolean }) => {
+        const dir = await originalGetDir(name, options);
+        if (name === dstEncoded && options?.create && !intercepted) {
+          intercepted = true;
+          const origGetFile = dir.getFileHandle.bind(dir);
+          dir.getFileHandle = async (fname: string, opts?: { create?: boolean }) => {
+            if (opts?.create) {
+              throw new DOMException("Disk full", "QuotaExceededError");
+            }
+            return origGetFile(fname, opts);
+          };
+        }
+        return dir;
+      };
+
+      await expect(b.renameFile("/old", "/existing")).rejects.toThrow("Disk full");
+
+      // Restore
+      pagesDir.getDirectoryHandle = originalGetDir;
+
+      // Source still intact
+      expect(await b.readPage("/old", 0)).toEqual(filledPage(0xaa));
+      expect(await b.readPage("/old", 1)).toEqual(filledPage(0xbb));
+
+      await b.destroy();
+    });
+
+    it("deletePagesFrom reports partial removal failures", async () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+
+      // Write 5 pages
+      for (let i = 0; i < 5; i++) {
+        await b.writePage("/file", i, filledPage(i));
+      }
+
+      // Sabotage: make removeEntry fail for one specific page
+      const pagesDir = (b as any).pagesDir;
+      const fileEncoded = encodePath("/file");
+      const fileDir = await pagesDir.getDirectoryHandle(fileEncoded);
+      const originalRemove = fileDir.removeEntry.bind(fileDir);
+      fileDir.removeEntry = async (name: string) => {
+        if (name === "3") {
+          throw new DOMException("Locked by another process", "InvalidStateError");
+        }
+        return originalRemove(name);
+      };
+
+      // Should throw reporting the failure
+      await expect(b.deletePagesFrom("/file", 2)).rejects.toThrow(
+        /page removals failed/,
+      );
+
+      // Restore and verify: pages 0-1 untouched, page 3 still exists (failed to delete),
+      // pages 2 and 4 were successfully deleted
+      fileDir.removeEntry = originalRemove;
+      expect(await b.readPage("/file", 0)).toEqual(filledPage(0));
+      expect(await b.readPage("/file", 1)).toEqual(filledPage(1));
+      expect(await b.readPage("/file", 2)).toBeNull(); // deleted before failure
+      expect(await b.readPage("/file", 3)).toEqual(filledPage(3)); // failed to delete
+      expect(await b.readPage("/file", 4)).toBeNull(); // deleted
+
+      await b.destroy();
+    });
+
+    it("deletePagesFrom succeeds when all removals succeed", async () => {
+      // Verify normal behavior still works with Promise.allSettled
+      for (let i = 0; i < 5; i++) {
+        await backend.writePage("/file", i, filledPage(i));
+      }
+
+      await backend.deletePagesFrom("/file", 3);
+
+      expect(await backend.readPage("/file", 0)).toEqual(filledPage(0));
+      expect(await backend.readPage("/file", 1)).toEqual(filledPage(1));
+      expect(await backend.readPage("/file", 2)).toEqual(filledPage(2));
+      expect(await backend.readPage("/file", 3)).toBeNull();
+      expect(await backend.readPage("/file", 4)).toBeNull();
+    });
+  });
+
+  // -------------------------------------------------------------------
   // Lifecycle
   // -------------------------------------------------------------------
 
