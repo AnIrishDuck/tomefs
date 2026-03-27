@@ -54,6 +54,141 @@ function syncAndUnmount(FS: any, tomefs: any) {
   FS.unmount(MOUNT);
 }
 
+describe("restoreTree crash recovery: pages missing below metadata (truncation + crash)", () => {
+  let backend: SyncMemoryBackend;
+
+  beforeEach(() => {
+    backend = new SyncMemoryBackend();
+  });
+
+  it("adjusts file size down when pages were truncated after last sync @fast", async () => {
+    // Phase 1: create file with 3 pages, sync normally
+    const { FS, tomefs } = await mountTome(backend);
+    const data = new Uint8Array(PAGE_SIZE * 3);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 7) & 0xff;
+    const s = FS.open(`${MOUNT}/file`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, data, 0, data.length);
+    FS.close(s);
+    syncAndUnmount(FS, tomefs);
+
+    // Verify metadata says 3 pages
+    const meta = backend.readMeta("/file");
+    expect(meta!.size).toBe(PAGE_SIZE * 3);
+
+    // Simulate crash after truncation: delete pages 1, 2 from backend
+    // (as if resizeFileStorage ran but syncfs didn't update metadata)
+    backend.deletePagesFrom("/file", 1);
+
+    // Phase 2: remount — restoreTree should detect missing pages
+    const { FS: FS2 } = await mountTome(backend);
+    const stat = FS2.stat(`${MOUNT}/file`);
+    // File size should be adjusted down to 1 page
+    expect(stat.size).toBe(PAGE_SIZE);
+
+    // Verify page 0 data is intact
+    const buf = new Uint8Array(PAGE_SIZE);
+    const s2 = FS2.open(`${MOUNT}/file`, O.RDONLY);
+    FS2.read(s2, buf, 0, PAGE_SIZE);
+    FS2.close(s2);
+    expect(buf).toEqual(data.subarray(0, PAGE_SIZE));
+  });
+
+  it("adjusts to zero when all pages were deleted after last sync", async () => {
+    // Create file with 2 pages, sync
+    const { FS, tomefs } = await mountTome(backend);
+    const data = new Uint8Array(PAGE_SIZE * 2);
+    data.fill(0xab);
+    const s = FS.open(`${MOUNT}/gone`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, data, 0, data.length);
+    FS.close(s);
+    syncAndUnmount(FS, tomefs);
+
+    // Simulate complete truncation to 0 + crash
+    backend.deleteFile("/gone");
+    // But metadata still exists (deleteFile only removes pages in this simulation;
+    // we need to re-add the metadata as if only pages were deleted)
+    backend.writeMeta("/gone", {
+      size: PAGE_SIZE * 2,
+      mode: 0o100666,
+      ctime: Date.now(),
+      mtime: Date.now(),
+      atime: Date.now(),
+    });
+
+    // Remount
+    const { FS: FS2 } = await mountTome(backend);
+    const stat = FS2.stat(`${MOUNT}/gone`);
+    expect(stat.size).toBe(0);
+  });
+
+  it("handles partial truncation mid-file correctly", async () => {
+    // Create file with 5 pages, sync, then delete pages 3, 4
+    const { FS, tomefs } = await mountTome(backend);
+    const data = new Uint8Array(PAGE_SIZE * 5);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 11) & 0xff;
+    const s = FS.open(`${MOUNT}/partial`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, data, 0, data.length);
+    FS.close(s);
+    syncAndUnmount(FS, tomefs);
+
+    // Simulate truncation to 3 pages + crash
+    backend.deletePagesFrom("/partial", 3);
+
+    // Remount
+    const { FS: FS2 } = await mountTome(backend);
+    const stat = FS2.stat(`${MOUNT}/partial`);
+    expect(stat.size).toBe(PAGE_SIZE * 3);
+
+    // Verify first 3 pages are intact
+    const buf = new Uint8Array(PAGE_SIZE * 3);
+    const s2 = FS2.open(`${MOUNT}/partial`, O.RDONLY);
+    FS2.read(s2, buf, 0, PAGE_SIZE * 3);
+    FS2.close(s2);
+    expect(buf).toEqual(data.subarray(0, PAGE_SIZE * 3));
+  });
+
+  it("does not affect files with correct metadata", async () => {
+    // Create two files, sync, truncate only one
+    const { FS, tomefs } = await mountTome(backend);
+    for (const name of ["intact", "truncated"]) {
+      const d = new Uint8Array(PAGE_SIZE * 2);
+      d.fill(name === "intact" ? 0x11 : 0x22);
+      const s = FS.open(`${MOUNT}/${name}`, O.RDWR | O.CREAT, 0o666);
+      FS.write(s, d, 0, d.length);
+      FS.close(s);
+    }
+    syncAndUnmount(FS, tomefs);
+
+    // Only truncate "truncated"
+    backend.deletePagesFrom("/truncated", 1);
+
+    // Remount
+    const { FS: FS2 } = await mountTome(backend);
+    expect(FS2.stat(`${MOUNT}/intact`).size).toBe(PAGE_SIZE * 2);
+    expect(FS2.stat(`${MOUNT}/truncated`).size).toBe(PAGE_SIZE);
+  });
+
+  it("handles sub-page metadata size with missing last page", async () => {
+    // File with meta.size not page-aligned, and last page missing
+    const { FS, tomefs } = await mountTome(backend);
+    const data = new Uint8Array(PAGE_SIZE + 100); // 1 full page + 100 bytes
+    for (let i = 0; i < data.length; i++) data[i] = (i * 3) & 0xff;
+    const s = FS.open(`${MOUNT}/subpage`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, data, 0, data.length);
+    FS.close(s);
+    syncAndUnmount(FS, tomefs);
+
+    // meta.size = PAGE_SIZE + 100, so pagesFromMeta = 2
+    // Delete page 1 (the partial last page)
+    backend.deletePagesFrom("/subpage", 1);
+
+    // Remount — should detect page 1 is missing and adjust size
+    const { FS: FS2 } = await mountTome(backend);
+    const stat = FS2.stat(`${MOUNT}/subpage`);
+    expect(stat.size).toBe(PAGE_SIZE); // rounded to last existing page
+  });
+});
+
 describe("restoreTree crash recovery: pages beyond metadata", () => {
   let backend: SyncMemoryBackend;
 

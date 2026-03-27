@@ -659,6 +659,35 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         let fileSize = meta.size;
         const storagePath = computeStoragePath(parent, name);
         const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
+
+        // Verify that pages below metadata actually exist. If a file was
+        // truncated (pages deleted from backend) but metadata wasn't synced
+        // before a crash, the backend has fewer pages than meta.size claims.
+        // Detect this by checking the last expected page exists.
+        if (pagesFromMeta > 0) {
+          const lastExpectedPage = pagesFromMeta - 1;
+          if (!backend.readPage(storagePath, lastExpectedPage)) {
+            // Stale metadata: pages were truncated after last sync.
+            if (!backend.readPage(storagePath, 0)) {
+              // No pages at all — file was fully truncated
+              fileSize = 0;
+            } else {
+              // Binary search for actual last page: 0 exists, lastExpectedPage doesn't
+              let lo = 0;
+              let hi = lastExpectedPage;
+              while (hi - lo > 1) {
+                const mid = (lo + hi) >>> 1;
+                if (backend.readPage(storagePath, mid)) {
+                  lo = mid;
+                } else {
+                  hi = mid;
+                }
+              }
+              fileSize = (lo + 1) * PAGE_SIZE;
+            }
+          }
+        }
+
         // Check if a page exists beyond what metadata accounts for
         const nextPage = backend.readPage(storagePath, pagesFromMeta);
         if (nextPage) {
