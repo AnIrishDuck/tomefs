@@ -41,7 +41,7 @@ function decode(buf: Uint8Array, length?: number): string {
  */
 class RecordingBackend extends SyncMemoryBackend {
   operations: Array<{
-    op: "writeMeta" | "deleteMeta" | "deleteFile";
+    op: "writeMeta" | "deleteMeta" | "deleteFile" | "readMeta";
     path: string;
   }> = [];
   recording = false;
@@ -92,6 +92,13 @@ class RecordingBackend extends SyncMemoryBackend {
       this.operations.push({ op: "deleteFile", path });
     }
     super.deleteFile(path);
+  }
+
+  readMeta(path: string): FileMeta | null {
+    if (this.recording) {
+      this.operations.push({ op: "readMeta", path });
+    }
+    return super.readMeta(path);
   }
 }
 
@@ -420,6 +427,186 @@ describe("syncfs safety", () => {
     expect(stored).toContain("/a");
     expect(stored).not.toContain("/b");
     expect(stored).toContain("/c");
+
+    FS.unmount(MOUNT);
+  });
+
+  it("syncfs does not call readMeta during persist phase @fast", async () => {
+    // Verify that syncfs uses in-memory tracking (currentPaths set) instead
+    // of backend.readMeta() calls. Each readMeta is a synchronous SAB bridge
+    // round-trip in production, so eliminating them improves sync performance.
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create nested directory structure
+    FS.mkdir(`${MOUNT}/dir`);
+    FS.mkdir(`${MOUNT}/dir/sub`);
+    let s = FS.open(`${MOUNT}/dir/sub/file`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("data"), 0, 4);
+    FS.close(s);
+
+    // First sync
+    syncfs(FS, tomefs);
+
+    // Second sync — should NOT call readMeta during persist
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+
+    const readMetaCalls = backend.operations.filter(
+      (o) => o.op === "readMeta",
+    );
+    expect(readMetaCalls.length).toBe(0);
+
+    FS.unmount(MOUNT);
+  });
+
+  it("syncfs updates metadata on every cycle (not just first sync)", async () => {
+    // Regression test: metadata must be refreshed on each syncfs call, not
+    // cached from the first sync. Previously, detached node metadata was only
+    // written when backend.readMeta() returned null (first sync), so
+    // subsequent syncs left stale metadata in the backend.
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create a file and sync
+    let s = FS.open(`${MOUNT}/growing`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("small"), 0, 5);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    const meta1 = backend.readMeta("/growing");
+    expect(meta1).not.toBeNull();
+    expect(meta1!.size).toBe(5);
+
+    // Modify the file (grow it) and sync again
+    s = FS.open(`${MOUNT}/growing`, O.RDWR);
+    FS.write(s, encode("much larger content here"), 0, 24);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    // Metadata should reflect the updated size
+    const meta2 = backend.readMeta("/growing");
+    expect(meta2).not.toBeNull();
+    expect(meta2!.size).toBe(24);
+    // mtime should have been updated
+    expect(meta2!.mtime).toBeGreaterThanOrEqual(meta1!.mtime);
+
+    FS.unmount(MOUNT);
+  });
+
+  it("syncfs updates directory metadata timestamps across cycles", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    FS.mkdir(`${MOUNT}/dir`);
+    syncfs(FS, tomefs);
+    const meta1 = backend.readMeta("/dir");
+    expect(meta1).not.toBeNull();
+
+    // Adding a child to the directory updates its mtime
+    const s = FS.open(`${MOUNT}/dir/child`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("x"), 0, 1);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    const meta2 = backend.readMeta("/dir");
+    expect(meta2).not.toBeNull();
+    expect(meta2!.mtime).toBeGreaterThanOrEqual(meta1!.mtime);
+
+    FS.unmount(MOUNT);
+  });
+});
+
+describe("syncfs detached node handling", () => {
+  let backend: RecordingBackend;
+
+  beforeEach(() => {
+    backend = new RecordingBackend();
+  });
+
+  it("detached file node metadata is updated on every sync cycle", async () => {
+    // Simulate a "detached" node: one that is tracked by allFileNodes but
+    // not reachable from mount.root's subtree. This happens in PGlite when
+    // Emscripten's path resolution routes through MEMFS parent nodes.
+    const { FS, tomefs } = await mountTome(backend);
+    const mountNode = FS.lookupPath(MOUNT).node;
+
+    // Create a file node directly via tomefs.createNode — this adds it to
+    // allFileNodes. Then detach it from the mount tree by removing it from
+    // the parent's contents and re-parenting it under a MEMFS directory.
+    const fileNode = tomefs.createNode(mountNode, "detached", 0o100666, 0);
+
+    // Write initial data via the page cache
+    const path = fileNode.storagePath;
+    tomefs.pageCache.write(path, encode("initial"), 0, 7, 0, 0);
+    fileNode.usedBytes = 7;
+
+    // Remove from mount tree so persistTree won't find it
+    delete mountNode.contents["detached"];
+
+    // Re-parent under a MEMFS node to simulate PGlite's preloading behavior.
+    // The node is still in allFileNodes but not in mount.root's subtree.
+    FS.mkdir("/memfs_parent");
+    const memfsParent = FS.lookupPath("/memfs_parent").node;
+    fileNode.parent = memfsParent;
+    fileNode.name = "detached";
+    memfsParent.contents["detached"] = fileNode;
+
+    // First sync — should persist the detached node's metadata
+    syncfs(FS, tomefs);
+    const meta1 = backend.readMeta(
+      // The detached node's metadata path is computed via nodeStoragePath,
+      // which walks up through the MEMFS parent chain
+      path,
+    );
+    // The detached node may or may not be found by nodeStoragePath depending
+    // on mount prefix stripping. Check the backend for any metadata with size 7.
+    const allFiles = backend.listFiles();
+    const detachedMeta = allFiles
+      .map((f) => ({ path: f, meta: backend.readMeta(f) }))
+      .find((f) => f.meta && f.meta.size === 7);
+    expect(detachedMeta).toBeDefined();
+
+    // Modify the file's size (simulate Postgres writing more data)
+    const detachedPath = fileNode.storagePath;
+    tomefs.pageCache.write(detachedPath, encode("much longer data"), 0, 16, 0, 7);
+    fileNode.usedBytes = 16;
+
+    // Second sync — metadata MUST be updated (this was the bug)
+    syncfs(FS, tomefs);
+
+    const updatedMeta = allFiles
+      .map((f) => ({ path: f, meta: backend.readMeta(f) }))
+      .find((f) => f.meta && f.meta.size === 16);
+    expect(updatedMeta).toBeDefined();
+
+    FS.unmount(MOUNT);
+  });
+
+  it("detached node parent directories persisted without readMeta calls", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    const mountNode = FS.lookupPath(MOUNT).node;
+
+    // Create a nested directory and file outside mount tree
+    FS.mkdir("/ext_parent");
+    FS.mkdir("/ext_parent/sub");
+    const extSub = FS.lookupPath("/ext_parent/sub").node;
+
+    const fileNode = tomefs.createNode(extSub, "file", 0o100666, 0);
+    fileNode.usedBytes = 0;
+    delete mountNode.contents["file"]; // remove if accidentally added
+
+    // First sync
+    syncfs(FS, tomefs);
+
+    // Second sync — should NOT use readMeta for parent directory checks
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+
+    // readMeta should not be called during the persist phase
+    const readMetaCalls = backend.operations.filter(
+      (o) => o.op === "readMeta",
+    );
+    expect(readMetaCalls.length).toBe(0);
 
     FS.unmount(MOUNT);
   });
