@@ -76,11 +76,11 @@ export class PreloadBackend implements SyncStorageBackend {
   private async doInit(): Promise<void> {
     const files = await this.remote.listFiles();
 
-    // Load all metadata
-    for (const path of files) {
-      const m = await this.remote.readMeta(path);
-      if (m) {
-        this.meta.set(path, m);
+    // Batch-read all metadata in a single call to reduce round-trips
+    const allMeta = await this.remote.readMetas(files);
+    for (let i = 0; i < files.length; i++) {
+      if (allMeta[i]) {
+        this.meta.set(files[i], allMeta[i]!);
       }
     }
 
@@ -299,6 +299,14 @@ export class PreloadBackend implements SyncStorageBackend {
     this.assertInitialized();
     const m = this.meta.get(path);
     return m ? { ...m } : null;
+  }
+
+  readMetas(paths: string[]): Array<FileMeta | null> {
+    this.assertInitialized();
+    return paths.map((path) => {
+      const m = this.meta.get(path);
+      return m ? { ...m } : null;
+    });
   }
 
   writeMeta(path: string, meta: FileMeta): void {

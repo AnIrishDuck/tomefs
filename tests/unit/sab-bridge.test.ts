@@ -291,6 +291,26 @@ describe("SAB+Atomics Bridge", () => {
       expect(z).toEqual({ size: 0, mode: 0o40755, ctime: 5, mtime: 6 });
     });
 
+    it("@fast readMetas batch reads multiple entries in one call", async () => {
+      await callClient(clientWorker, "writeMetas", [
+        [
+          { path: "/p", meta: { size: 10, mode: 0o644, ctime: 1, mtime: 2 } },
+          { path: "/q", meta: { size: 20, mode: 0o755, ctime: 3, mtime: 4 } },
+        ],
+      ]);
+
+      const results = await callClient(clientWorker, "readMetas", [["/p", "/q", "/missing"]]);
+      expect(results).toHaveLength(3);
+      expect(results[0]).toEqual({ size: 10, mode: 0o644, ctime: 1, mtime: 2 });
+      expect(results[1]).toEqual({ size: 20, mode: 0o755, ctime: 3, mtime: 4 });
+      expect(results[2]).toBeNull();
+    });
+
+    it("@fast readMetas returns empty array for empty input", async () => {
+      const results = await callClient(clientWorker, "readMetas", [[]]);
+      expect(results).toEqual([]);
+    });
+
     it("@fast deleteMetas batch deletes multiple entries in one call", async () => {
       const meta = { size: 0, mode: 0o644, ctime: 0, mtime: 0 };
       await callClient(clientWorker, "writeMeta", ["/a", meta]);

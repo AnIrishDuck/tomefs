@@ -278,6 +278,41 @@ describe("MemoryBackend", () => {
     });
   });
 
+  describe("batch metadata read", () => {
+    it("@fast reads multiple metadata entries in one call", async () => {
+      const metaA = { size: 100, mode: 0o644, ctime: 1, mtime: 2 };
+      const metaB = { size: 200, mode: 0o755, ctime: 3, mtime: 4 };
+      await backend.writeMeta("/a", metaA);
+      await backend.writeMeta("/b", metaB);
+
+      const results = await backend.readMetas(["/a", "/b", "/nonexistent"]);
+      expect(results).toHaveLength(3);
+      expect(results[0]).toEqual(metaA);
+      expect(results[1]).toEqual(metaB);
+      expect(results[2]).toBeNull();
+    });
+
+    it("returns empty array for empty input", async () => {
+      const results = await backend.readMetas([]);
+      expect(results).toEqual([]);
+    });
+
+    it("returns all nulls for non-existent paths", async () => {
+      const results = await backend.readMetas(["/x", "/y"]);
+      expect(results).toEqual([null, null]);
+    });
+
+    it("returns independent copies", async () => {
+      const meta = { size: 100, mode: 0o644, ctime: 1, mtime: 2 };
+      await backend.writeMeta("/a", meta);
+
+      const results = await backend.readMetas(["/a", "/a"]);
+      expect(results[0]).toEqual(results[1]);
+      results[0]!.size = 999;
+      expect(results[1]!.size).toBe(100);
+    });
+  });
+
   describe("batch metadata delete", () => {
     it("@fast deletes multiple metadata entries in one call", async () => {
       const meta = { size: 0, mode: 0o644, ctime: 0, mtime: 0 };

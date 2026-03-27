@@ -209,6 +209,12 @@ export class SabClient implements SyncStorageBackend {
     this.call(OpCode.DELETE_META, { path });
   }
 
+  readMetas(paths: string[]): Array<FileMeta | null> {
+    if (paths.length === 0) return [];
+    const { json } = this.call(OpCode.READ_METAS, { paths });
+    return (json as { metas: Array<FileMeta | null> }).metas;
+  }
+
   deleteMetas(paths: string[]): void {
     if (paths.length === 0) return;
     this.call(OpCode.DELETE_METAS, { paths });

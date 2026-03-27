@@ -313,6 +313,14 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.READ_METAS: {
+        const paths = params.paths as string[];
+        const metas = await this.backend.readMetas(paths);
+        const respLen = encodeMessage(this.dataView, this.uint8View, { metas });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       case OpCode.DELETE_METAS: {
         const paths = params.paths as string[];
         await this.backend.deleteMetas(paths);

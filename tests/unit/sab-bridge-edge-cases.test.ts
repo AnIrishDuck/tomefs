@@ -137,6 +137,11 @@ class FailingBackend implements StorageBackend {
     return this.inner.readMeta(path);
   }
 
+  async readMetas(paths: string[]): Promise<Array<FileMeta | null>> {
+    this.maybeThrow("readMetas");
+    return this.inner.readMetas(paths);
+  }
+
   async writeMeta(path: string, meta: FileMeta): Promise<void> {
     this.maybeThrow("writeMeta");
     return this.inner.writeMeta(path, meta);
@@ -212,6 +217,10 @@ class SlowBackend implements StorageBackend {
 
   async readMeta(path: string): Promise<FileMeta | null> {
     return this.inner.readMeta(path);
+  }
+
+  async readMetas(paths: string[]): Promise<Array<FileMeta | null>> {
+    return this.inner.readMetas(paths);
   }
 
   async writeMeta(path: string, meta: FileMeta): Promise<void> {

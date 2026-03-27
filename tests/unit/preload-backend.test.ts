@@ -65,6 +65,10 @@ class CountingBackend implements StorageBackend {
     this.count("readMeta");
     return this.inner.readMeta(path);
   }
+  async readMetas(paths: string[]) {
+    this.count("readMetas");
+    return this.inner.readMetas(paths);
+  }
   async writeMeta(path: string, meta: FileMeta) {
     this.count("writeMeta");
     return this.inner.writeMeta(path, meta);
@@ -789,6 +793,38 @@ describe("PreloadBackend", () => {
     });
   });
 
+  describe("init batching", () => {
+    it("@fast batches metadata reads into a single readMetas call during init", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+
+      // Seed 5 files with metadata
+      for (let i = 0; i < 5; i++) {
+        await inner.writeMeta(`/file${i}`, {
+          size: 0,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+
+      counting.resetCounts();
+      const backend = new PreloadBackend(counting);
+      await backend.init();
+
+      // Should use 1 readMetas call, not 5 individual readMeta calls
+      expect(counting.calls["readMetas"]).toBe(1);
+      expect(counting.calls["readMeta"] ?? 0).toBe(0);
+
+      // Verify all metadata was loaded
+      for (let i = 0; i < 5; i++) {
+        const meta = backend.readMeta(`/file${i}`);
+        expect(meta).not.toBeNull();
+        expect(meta!.mode).toBe(0o100644);
+      }
+    });
+  });
+
   describe("flush batching", () => {
     it("@fast batches multiple metadata writes into a single writeMetas call", async () => {
       const inner = new MemoryBackend();
@@ -978,6 +1014,7 @@ describe("PreloadBackend", () => {
       async deletePagesFrom(path: string, fromPageIndex: number) { return this.inner.deletePagesFrom(path, fromPageIndex); }
       async renameFile(oldPath: string, newPath: string) { return this.inner.renameFile(oldPath, newPath); }
       async readMeta(path: string) { return this.inner.readMeta(path); }
+      async readMetas(paths: string[]) { return this.inner.readMetas(paths); }
       async writeMeta(path: string, meta: FileMeta) { return this.inner.writeMeta(path, meta); }
       async writeMetas(entries: Array<{ path: string; meta: FileMeta }>) { return this.inner.writeMetas(entries); }
       async deleteMeta(path: string) { return this.inner.deleteMeta(path); }

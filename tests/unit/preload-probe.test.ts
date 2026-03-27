@@ -99,6 +99,9 @@ class ReadCountingBackend implements StorageBackend {
   async readMeta(path: string) {
     return this.inner.readMeta(path);
   }
+  async readMetas(paths: string[]) {
+    return this.inner.readMetas(paths);
+  }
   async writeMeta(path: string, meta: FileMeta) {
     return this.inner.writeMeta(path, meta);
   }

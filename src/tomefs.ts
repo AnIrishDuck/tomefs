@@ -738,13 +738,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       return da - db || a.localeCompare(b);
     });
 
-    for (const path of paths) {
-      // Skip /__deleted_* marker entries — these are orphaned pages from
-      // files that had open fds when the process crashed. They'll be
-      // cleaned up by the first syncfs call (orphan cleanup pass).
-      if (path.startsWith("/__deleted_")) continue;
+    // Filter out /__deleted_* marker entries — these are orphaned pages from
+    // files that had open fds when the process crashed. They'll be
+    // cleaned up by the first syncfs call (orphan cleanup pass).
+    const livePaths = paths.filter((p) => !p.startsWith("/__deleted_"));
 
-      const meta = backend.readMeta(path);
+    // Batch-read all metadata in a single backend call to reduce SAB bridge
+    // round-trips from O(n) to O(1) during mount/restore.
+    const allMeta = backend.readMetas(livePaths);
+
+    for (let i = 0; i < livePaths.length; i++) {
+      const path = livePaths[i];
+      const meta = allMeta[i];
       if (!meta) continue;
 
       // Split path into parent + name
