@@ -141,7 +141,14 @@ export function decodeMessage(
     JSON_REGION_OFFSET + 4,
     JSON_REGION_OFFSET + 4 + jsonLen,
   );
-  const json = JSON.parse(decoder.decode(jsonBytes));
+  let json: unknown;
+  try {
+    json = JSON.parse(decoder.decode(jsonBytes));
+  } catch (err) {
+    throw new Error(
+      `SAB decode error: invalid JSON in response (${(err as Error).message})`,
+    );
+  }
 
   const binaryStart = JSON_REGION_OFFSET + 4 + jsonLen;
   const binaryEnd = JSON_REGION_OFFSET + totalLen;

@@ -73,12 +73,24 @@ export class SabClient implements SyncStorageBackend {
       pageIndices,
     });
     const result = json as { sizes: number[] };
+    if (!Array.isArray(result.sizes) || result.sizes.length !== pageIndices.length) {
+      throw new Error(
+        `SAB bridge readPages: expected ${pageIndices.length} size entries, got ${
+          Array.isArray(result.sizes) ? result.sizes.length : "non-array"
+        }`,
+      );
+    }
     const pages: Array<Uint8Array | null> = [];
     let offset = 0;
     for (const size of result.sizes) {
       if (size < 0) {
         pages.push(null);
       } else {
+        if (offset + size > binary.length) {
+          throw new Error(
+            `SAB bridge readPages: binary data underflow at offset ${offset} + size ${size} > ${binary.length}`,
+          );
+        }
         pages.push(new Uint8Array(binary.slice(offset, offset + size)));
         offset += size;
       }
@@ -188,6 +200,14 @@ export class SabClient implements SyncStorageBackend {
       }
       status = Atomics.load(this.controlView, SLOT_STATUS);
     } while (status === STATUS_REQUEST);
+
+    if (status !== STATUS_RESPONSE && status !== STATUS_ERROR) {
+      // Reset to idle so the bridge can recover
+      Atomics.store(this.controlView, SLOT_STATUS, STATUS_IDLE);
+      throw new Error(
+        `SAB bridge unexpected status: ${status} (expected ${STATUS_RESPONSE} or ${STATUS_ERROR})`,
+      );
+    }
 
     if (status === STATUS_ERROR) {
       const responseLen = Atomics.load(this.controlView, SLOT_DATA_LEN);
