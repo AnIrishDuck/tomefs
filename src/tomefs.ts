@@ -264,16 +264,30 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const newStoragePath = computeStoragePath(new_dir, new_name);
       pageCache.renameFile(oldStoragePath, newStoragePath);
       old_node.storagePath = newStoragePath;
-      // Update metadata key
+      // Move metadata to new path (matching how renameDescendantPaths
+      // handles symlinks and directories). Without this, a crash between
+      // rename and syncfs would lose the file's metadata — pages exist
+      // under the new path but metadata is gone from both old and new.
+      const oldMeta = backend.readMeta(oldStoragePath);
+      if (oldMeta) {
+        backend.writeMeta(newStoragePath, oldMeta);
+      }
       backend.deleteMeta(oldStoragePath);
     } else if (FS.isDir(old_node.mode)) {
-      // Delete old directory metadata
+      // Move directory metadata to the new path before recursing into
+      // children. This mirrors the pattern used inside renameDescendantPaths
+      // for subdirectories and ensures a crash between rename and syncfs
+      // doesn't orphan the directory.
+      const oldDirMeta = backend.readMeta(oldStoragePath);
+      const newDirPath = computeStoragePath(new_dir, new_name);
+      if (oldDirMeta) {
+        backend.writeMeta(newDirPath, oldDirMeta);
+      }
       backend.deleteMeta(oldStoragePath);
       // Recursively update storagePaths for all file descendants.
       // Without this, pages remain keyed by old paths in the cache/backend,
       // causing data loss on syncfs → remount when metadata is persisted
       // under the new tree-computed paths but pages are under old paths.
-      const newDirPath = computeStoragePath(new_dir, new_name);
       renameDescendantPaths(old_node, oldStoragePath, newDirPath);
     }
 
@@ -352,6 +366,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         const newPath = newDirPath + oldPath.substring(oldDirPath.length);
         pageCache.renameFile(oldPath, newPath);
         child.storagePath = newPath;
+        // Move file metadata to the new path, matching how symlinks and
+        // directories below are handled. Without this, a crash between
+        // directory rename and syncfs leaves file metadata at the old path
+        // while pages are at the new path — restoreTree would recreate the
+        // file at the old path with no pages, losing data.
+        const fileMeta = backend.readMeta(oldPath);
+        if (fileMeta) {
+          backend.writeMeta(newPath, fileMeta);
+          backend.deleteMeta(oldPath);
+        }
       } else if (FS.isLink(child.mode)) {
         // Symlinks have no page data, but their metadata is keyed by path.
         // Move metadata to the new path so a crash before syncfs doesn't
