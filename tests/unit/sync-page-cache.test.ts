@@ -580,4 +580,119 @@ describe("SyncPageCache", () => {
       );
     });
   });
+
+  describe("getStats", () => {
+    it("@fast starts at zero", () => {
+      const cache = new SyncPageCache(backend, 4);
+      const stats = cache.getStats();
+      expect(stats).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+    });
+
+    it("@fast counts cache miss on first getPage", () => {
+      const cache = new SyncPageCache(backend, 4);
+      cache.getPage("/file", 0);
+      expect(cache.getStats().misses).toBe(1);
+      expect(cache.getStats().hits).toBe(0);
+    });
+
+    it("@fast counts cache hit on repeated getPage", () => {
+      const cache = new SyncPageCache(backend, 4);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 0);
+      expect(cache.getStats().misses).toBe(1);
+      expect(cache.getStats().hits).toBe(1);
+    });
+
+    it("counts MRU fast-path as a hit", () => {
+      const cache = new SyncPageCache(backend, 4);
+      cache.getPage("/file", 0);
+      // Second call hits MRU fast path
+      cache.getPage("/file", 0);
+      // Third call also hits MRU fast path
+      cache.getPage("/file", 0);
+      expect(cache.getStats().hits).toBe(2);
+    });
+
+    it("counts eviction when cache is full", () => {
+      const cache = new SyncPageCache(backend, 2);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 1);
+      // Third page triggers eviction
+      cache.getPage("/file", 2);
+      expect(cache.getStats().evictions).toBe(1);
+    });
+
+    it("counts dirty flush on eviction", () => {
+      const cache = new SyncPageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      cache.write("/file", data, 0, 1, 0, 0);
+      cache.getPage("/file", 1);
+      // Third page evicts dirty page 0
+      cache.getPage("/file", 2);
+      expect(cache.getStats().flushes).toBe(1);
+      expect(cache.getStats().evictions).toBe(1);
+    });
+
+    it("counts flushFile", () => {
+      const cache = new SyncPageCache(backend, 4);
+      const data = new Uint8Array([1, 2, 3]);
+      cache.write("/file", data, 0, 3, 0, 0);
+      cache.write("/file", data, 0, 3, PAGE_SIZE, 3);
+      cache.flushFile("/file");
+      expect(cache.getStats().flushes).toBe(2);
+    });
+
+    it("counts flushAll", () => {
+      const cache = new SyncPageCache(backend, 4);
+      const data = new Uint8Array([1]);
+      cache.write("/a", data, 0, 1, 0, 0);
+      cache.write("/b", data, 0, 1, 0, 0);
+      cache.flushAll();
+      expect(cache.getStats().flushes).toBe(2);
+    });
+
+    it("resetStats clears all counters", () => {
+      const cache = new SyncPageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      cache.write("/file", data, 0, 1, 0, 0);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 1);
+      cache.getPage("/file", 2); // eviction
+      cache.flushAll();
+      // Verify counters are non-zero
+      const before = cache.getStats();
+      expect(before.hits + before.misses + before.evictions + before.flushes).toBeGreaterThan(0);
+
+      cache.resetStats();
+      expect(cache.getStats()).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+    });
+
+    it("getStats returns a snapshot (not a live reference)", () => {
+      const cache = new SyncPageCache(backend, 4);
+      const snap = cache.getStats();
+      cache.getPage("/file", 0);
+      // Snapshot should not change
+      expect(snap.misses).toBe(0);
+      expect(cache.getStats().misses).toBe(1);
+    });
+
+    it("counts multi-page read misses correctly", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write 3 pages of data so read spans multiple pages
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      cache.write("/file", data, 0, size, 0, 0);
+      cache.flushAll();
+
+      // Evict and re-read to force cache misses
+      cache.evictFile("/file");
+      cache.resetStats();
+
+      const buf = new Uint8Array(size);
+      cache.read("/file", buf, 0, size, 0, size);
+
+      // 3 pages should be loaded (misses)
+      expect(cache.getStats().misses).toBe(3);
+    });
+  });
 });

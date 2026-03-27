@@ -42,3 +42,15 @@ export type PageKey = [string, number];
 export function pageKeyStr(path: string, pageIndex: number): string {
   return `${path}\0${pageIndex}`;
 }
+
+/** Snapshot of page cache performance counters. */
+export interface CacheStats {
+  /** Total cache hits (page found in cache). */
+  hits: number;
+  /** Total cache misses (page loaded from backend). */
+  misses: number;
+  /** Total pages evicted from the cache. */
+  evictions: number;
+  /** Total dirty pages flushed to the backend. */
+  flushes: number;
+}

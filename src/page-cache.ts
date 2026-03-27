@@ -1,6 +1,6 @@
 import type { StorageBackend } from "./storage-backend.js";
 import { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
-import type { CachedPage } from "./types.js";
+import type { CachedPage, CacheStats } from "./types.js";
 
 /**
  * LRU page cache with dirty tracking.
@@ -31,6 +31,12 @@ export class PageCache {
 
   /** Secondary index: set of cache keys for dirty pages. */
   private dirtyKeys = new Set<string>();
+
+  /** Performance counters. */
+  private _hits = 0;
+  private _misses = 0;
+  private _evictions = 0;
+  private _flushes = 0;
 
   constructor(backend: StorageBackend, maxPages: number = DEFAULT_MAX_PAGES) {
     if (maxPages < 1) {
@@ -64,11 +70,13 @@ export class PageCache {
     const key = pageKeyStr(path, pageIndex);
     // Fast path: if this is already the MRU page, skip Map reordering
     if (key === this.mruKey) {
+      this._hits++;
       return this.cache.get(key)!;
     }
 
     const existing = this.cache.get(key);
     if (existing) {
+      this._hits++;
       // Move to end (most recently used)
       this.cache.delete(key);
       this.cache.set(key, existing);
@@ -76,6 +84,7 @@ export class PageCache {
       return existing;
     }
 
+    this._misses++;
     // Cache miss — load from backend
     const data = await this.backend.readPage(path, pageIndex);
     const page: CachedPage = {
@@ -131,6 +140,7 @@ export class PageCache {
         // Batch-evict space before pre-loading
         await this.batchEvict(missingIndices.length);
 
+        this._misses += missingIndices.length;
         const results = await this.backend.readPages(path, missingIndices);
         for (let i = 0; i < missingIndices.length; i++) {
           const pageIndex = missingIndices[i];
@@ -213,6 +223,7 @@ export class PageCache {
 
         // Batch-load all missing pages from backend
         if (missingIndices.length > 1) {
+          this._misses += missingIndices.length;
           const results = await this.backend.readPages(path, missingIndices);
           for (let i = 0; i < missingIndices.length; i++) {
             const pageIndex = missingIndices[i];
@@ -296,6 +307,7 @@ export class PageCache {
 
     if (dirtyPages.length > 0) {
       await this.backend.writePages(dirtyPages);
+      this._flushes += dirtyPages.length;
       for (const key of keys) {
         if (this.dirtyKeys.has(key)) {
           this.cache.get(key)!.dirty = false;
@@ -330,6 +342,7 @@ export class PageCache {
     }
 
     await this.backend.writePages(dirtyPages);
+    this._flushes += dirtyPages.length;
     for (const key of this.dirtyKeys) {
       this.cache.get(key)!.dirty = false;
     }
@@ -474,6 +487,24 @@ export class PageCache {
     return this.dirtyKeys.size;
   }
 
+  /** Snapshot of performance counters (hits, misses, evictions, flushes). */
+  getStats(): CacheStats {
+    return {
+      hits: this._hits,
+      misses: this._misses,
+      evictions: this._evictions,
+      flushes: this._flushes,
+    };
+  }
+
+  /** Reset all performance counters to zero. */
+  resetStats(): void {
+    this._hits = 0;
+    this._misses = 0;
+    this._evictions = 0;
+    this._flushes = 0;
+  }
+
   /**
    * Add a cache key to the filePages index for the given path.
    */
@@ -512,8 +543,10 @@ export class PageCache {
       );
       victim.dirty = false;
       this.dirtyKeys.delete(firstKey);
+      this._flushes++;
     }
 
+    this._evictions++;
     this.cache.delete(firstKey);
     if (firstKey === this.mruKey) this.mruKey = null;
 
@@ -571,8 +604,10 @@ export class PageCache {
     } else if (dirtyPages.length > 1) {
       await this.backend.writePages(dirtyPages);
     }
+    this._flushes += dirtyPages.length;
 
     // Remove victims from cache and indexes
+    this._evictions += victimKeys.length;
     for (let i = 0; i < victimKeys.length; i++) {
       const key = victimKeys[i];
       const victim = victims[i];
