@@ -726,4 +726,103 @@ describe("PageCache", () => {
       expect(Array.from(buf)).toEqual(Array.from(data));
     });
   });
+
+  describe("getStats", () => {
+    it("@fast starts at zero", () => {
+      const stats = cache.getStats();
+      expect(stats).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+    });
+
+    it("@fast counts cache miss on first getPage", async () => {
+      await cache.getPage("/test", 0);
+      expect(cache.getStats().misses).toBe(1);
+      expect(cache.getStats().hits).toBe(0);
+    });
+
+    it("@fast counts cache hit on repeated getPage", async () => {
+      await cache.getPage("/test", 0);
+      await cache.getPage("/test", 0);
+      expect(cache.getStats().misses).toBe(1);
+      expect(cache.getStats().hits).toBe(1);
+    });
+
+    it("counts MRU fast-path as a hit", async () => {
+      await cache.getPage("/test", 0);
+      await cache.getPage("/test", 0);
+      await cache.getPage("/test", 0);
+      expect(cache.getStats().hits).toBe(2);
+    });
+
+    it("counts eviction when cache is full", async () => {
+      const small = new PageCache(backend, 2);
+      await small.getPage("/test", 0);
+      await small.getPage("/test", 1);
+      await small.getPage("/test", 2);
+      expect(small.getStats().evictions).toBe(1);
+    });
+
+    it("counts dirty flush on eviction", async () => {
+      const small = new PageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      await small.write("/test", data, 0, 1, 0, 0);
+      await small.getPage("/test", 1);
+      // Third page evicts dirty page 0
+      await small.getPage("/test", 2);
+      expect(small.getStats().flushes).toBe(1);
+      expect(small.getStats().evictions).toBe(1);
+    });
+
+    it("counts flushFile", async () => {
+      const data = new Uint8Array([1, 2, 3]);
+      await cache.write("/test", data, 0, 3, 0, 0);
+      await cache.write("/test", data, 0, 3, PAGE_SIZE, 3);
+      await cache.flushFile("/test");
+      expect(cache.getStats().flushes).toBe(2);
+    });
+
+    it("counts flushAll", async () => {
+      const data = new Uint8Array([1]);
+      await cache.write("/a", data, 0, 1, 0, 0);
+      await cache.write("/b", data, 0, 1, 0, 0);
+      await cache.flushAll();
+      expect(cache.getStats().flushes).toBe(2);
+    });
+
+    it("resetStats clears all counters", async () => {
+      const small = new PageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      await small.write("/test", data, 0, 1, 0, 0);
+      await small.getPage("/test", 0);
+      await small.getPage("/test", 1);
+      await small.getPage("/test", 2); // eviction
+      await small.flushAll();
+
+      const before = small.getStats();
+      expect(before.hits + before.misses + before.evictions + before.flushes).toBeGreaterThan(0);
+
+      small.resetStats();
+      expect(small.getStats()).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+    });
+
+    it("getStats returns a snapshot (not a live reference)", async () => {
+      const snap = cache.getStats();
+      await cache.getPage("/test", 0);
+      expect(snap.misses).toBe(0);
+      expect(cache.getStats().misses).toBe(1);
+    });
+
+    it("counts multi-page read misses correctly", async () => {
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      await cache.write("/test", data, 0, size, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/test");
+      cache.resetStats();
+
+      const buf = new Uint8Array(size);
+      await cache.read("/test", buf, 0, size, 0, size);
+
+      expect(cache.getStats().misses).toBe(3);
+    });
+  });
 });

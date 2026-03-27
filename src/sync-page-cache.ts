@@ -1,6 +1,6 @@
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
 import { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
-import type { CachedPage } from "./types.js";
+import type { CachedPage, CacheStats } from "./types.js";
 
 /**
  * Synchronous LRU page cache with dirty tracking.
@@ -37,6 +37,12 @@ export class SyncPageCache {
   /** Secondary index: set of cache keys for dirty pages. */
   private dirtyKeys = new Set<string>();
 
+  /** Performance counters. */
+  private _hits = 0;
+  private _misses = 0;
+  private _evictions = 0;
+  private _flushes = 0;
+
   constructor(
     backend: SyncStorageBackend,
     maxPages: number = DEFAULT_MAX_PAGES,
@@ -69,12 +75,14 @@ export class SyncPageCache {
     // Fast path: exact same page as last access — no key construction or Map ops
     const mru = this.mruPage;
     if (mru !== null && mru.path === path && mru.pageIndex === pageIndex) {
+      this._hits++;
       return mru;
     }
 
     const key = pageKeyStr(path, pageIndex);
     const existing = this.cache.get(key);
     if (existing) {
+      this._hits++;
       // Only reorder for LRU when cache is at capacity (eviction could happen).
       // Below capacity, nothing will be evicted, so strict LRU order is unnecessary.
       // This eliminates the expensive Map delete+set on every cache hit.
@@ -86,6 +94,7 @@ export class SyncPageCache {
       return existing;
     }
 
+    this._misses++;
     // Cache miss — load from backend
     const data = this.backend.readPage(path, pageIndex);
     const page: CachedPage = {
@@ -153,6 +162,7 @@ export class SyncPageCache {
       // Batch-evict space before pre-loading to reduce bridge round-trips
       this.batchEvict(missingIndices.length);
 
+      this._misses += missingIndices.length;
       const results = this.backend.readPages(path, missingIndices);
       for (let i = 0; i < missingIndices.length; i++) {
         const pi = missingIndices[i];
@@ -251,6 +261,7 @@ export class SyncPageCache {
 
       // Batch-load all missing pages from backend
       if (missingIndices.length > 1) {
+        this._misses += missingIndices.length;
         const results = this.backend.readPages(path, missingIndices);
         for (let i = 0; i < missingIndices.length; i++) {
           const pi = missingIndices[i];
@@ -329,6 +340,7 @@ export class SyncPageCache {
 
     if (dirtyPages.length > 0) {
       this.backend.writePages(dirtyPages);
+      this._flushes += dirtyPages.length;
       for (const key of keys) {
         if (this.dirtyKeys.has(key)) {
           this.cache.get(key)!.dirty = false;
@@ -363,6 +375,7 @@ export class SyncPageCache {
     }
 
     this.backend.writePages(dirtyPages);
+    this._flushes += dirtyPages.length;
     for (const key of this.dirtyKeys) {
       this.cache.get(key)!.dirty = false;
     }
@@ -511,6 +524,24 @@ export class SyncPageCache {
     return this.dirtyKeys.size;
   }
 
+  /** Snapshot of performance counters (hits, misses, evictions, flushes). */
+  getStats(): CacheStats {
+    return {
+      hits: this._hits,
+      misses: this._misses,
+      evictions: this._evictions,
+      flushes: this._flushes,
+    };
+  }
+
+  /** Reset all performance counters to zero. */
+  resetStats(): void {
+    this._hits = 0;
+    this._misses = 0;
+    this._evictions = 0;
+    this._flushes = 0;
+  }
+
   /**
    * Add a cache key to the filePages index for the given path.
    */
@@ -545,8 +576,10 @@ export class SyncPageCache {
       this.backend.writePage(victim.path, victim.pageIndex, victim.data);
       victim.dirty = false;
       this.dirtyKeys.delete(firstKey);
+      this._flushes++;
     }
 
+    this._evictions++;
     this.cache.delete(firstKey);
     if (victim === this.mruPage) this.mruPage = null;
 
@@ -606,8 +639,10 @@ export class SyncPageCache {
     } else if (dirtyPages.length > 1) {
       this.backend.writePages(dirtyPages);
     }
+    this._flushes += dirtyPages.length;
 
     // Remove victims from cache and indexes
+    this._evictions += victimKeys.length;
     for (let i = 0; i < victimKeys.length; i++) {
       const key = victimKeys[i];
       const victim = victims[i];
