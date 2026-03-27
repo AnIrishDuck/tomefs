@@ -20,7 +20,7 @@ import { createTomeFS } from "../../src/tomefs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import type { EmscriptenFS, EmscriptenStream } from "../harness/emscripten-fs.js";
-import { O } from "../harness/emscripten-fs.js";
+import { O, SEEK_SET, SEEK_CUR, SEEK_END } from "../harness/emscripten-fs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -162,6 +162,10 @@ type Op =
   | { type: "readFd"; fdId: number }
   | { type: "writeFd"; fdId: number; data: Uint8Array; offset: number }
   | { type: "closeFd"; fdId: number }
+  | { type: "dupFd"; srcFdId: number; newFdId: number }
+  | { type: "seekFd"; fdId: number; offset: number; whence: number }
+  | { type: "appendWrite"; path: string; data: Uint8Array }
+  | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -201,6 +205,10 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["readFd", model.openFds.size > 0 ? 8 : 0],
     ["writeFd", model.openFds.size > 0 ? 8 : 0],
     ["closeFd", model.openFds.size > 0 ? 6 : 0],
+    ["dupFd", model.openFds.size > 0 && model.openFds.size < 8 ? 6 : 0],
+    ["seekFd", model.openFds.size > 0 ? 6 : 0],
+    ["appendWrite", allFiles.length > 0 ? 8 : 0],
+    ["ftruncateFd", model.openFds.size > 0 ? 5 : 0],
     ["syncfs", 3],
   ];
 
@@ -370,6 +378,58 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "closeFd", fdId: rng.pick(fds) };
     }
 
+    case "dupFd": {
+      const fds = [...model.openFds.keys()];
+      const srcFdId = rng.pick(fds);
+      const newFdId = model.nextFdId;
+      return { type: "dupFd", srcFdId, newFdId };
+    }
+
+    case "seekFd": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const whenceChoices = [SEEK_SET, SEEK_CUR, SEEK_END];
+      const whence = rng.pick(whenceChoices);
+      const fdInfo = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+      // Generate an offset that makes sense for the whence mode
+      let offset: number;
+      if (whence === SEEK_SET) {
+        offset = rng.int(currentSize + PAGE_SIZE + 1);
+      } else if (whence === SEEK_CUR) {
+        // SEEK_CUR: offset relative to current position (may be negative)
+        offset = rng.int(PAGE_SIZE * 2 + 1) - PAGE_SIZE;
+      } else {
+        // SEEK_END: offset relative to end (typically 0 or negative)
+        offset = rng.int(currentSize + 1) * -1;
+      }
+      return { type: "seekFd", fdId, offset, whence };
+    }
+
+    case "appendWrite": {
+      const path = rng.pick(allFiles);
+      const sizeChoices = [1, 50, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1];
+      const size = rng.pick(sizeChoices);
+      const data = rng.bytes(size);
+      return { type: "appendWrite", path, data };
+    }
+
+    case "ftruncateFd": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const fdInfo = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+      const sizeChoices = [
+        0,
+        Math.max(0, currentSize - PAGE_SIZE),
+        Math.max(0, currentSize - 1),
+        currentSize,
+        currentSize + 1,
+        currentSize + PAGE_SIZE,
+      ];
+      return { type: "ftruncateFd", fdId, size: rng.pick(sizeChoices) };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -526,6 +586,37 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         return { error: null };
       }
 
+      case "dupFd": {
+        const srcStream = fdStreams?.get(op.srcFdId);
+        if (!srcStream) return { error: "no-fd" };
+        const dupStream = FS.dupStream(srcStream);
+        if (fdStreams) fdStreams.set(op.newFdId, dupStream);
+        return { error: null };
+      }
+
+      case "seekFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        const pos = FS.llseek(stream, op.offset, op.whence);
+        return { error: null, size: pos };
+      }
+
+      case "appendWrite": {
+        const s = FS.open(op.path, O.WRONLY | O.APPEND);
+        FS.write(s, op.data, 0, op.data.length);
+        const stat = FS.stat(op.path);
+        FS.close(s);
+        return { error: null, size: stat.size };
+      }
+
+      case "ftruncateFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        FS.ftruncate(stream.fd ?? stream, op.size);
+        const fstatResult = FS.fstat(stream.fd ?? stream);
+        return { error: null, size: fstatResult.size };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -637,7 +728,27 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
     case "closeFd":
       model.openFds.delete(op.fdId);
       break;
-    // readFd, readlink, readThroughSymlink don't modify state
+    case "dupFd": {
+      const srcFd = model.openFds.get(op.srcFdId);
+      if (srcFd) {
+        model.openFds.set(op.newFdId, { id: op.newFdId, path: srcFd.path, currentPath: srcFd.currentPath });
+        model.nextFdId++;
+      }
+      break;
+    }
+    case "appendWrite": {
+      const currentSize = model.files.get(op.path) ?? 0;
+      model.files.set(op.path, currentSize + op.data.length);
+      break;
+    }
+    case "ftruncateFd": {
+      const fdInfo = model.openFds.get(op.fdId);
+      if (fdInfo) {
+        model.files.set(fdInfo.currentPath, op.size);
+      }
+      break;
+    }
+    // readFd, readlink, readThroughSymlink, seekFd don't modify file state
   }
 }
 
@@ -684,6 +795,16 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] writeFd(fdId=${op.fdId}, offset=${op.offset}, ${op.data.length}B)`;
     case "closeFd":
       return `[${index}] closeFd(fdId=${op.fdId})`;
+    case "dupFd":
+      return `[${index}] dupFd(src=${op.srcFdId}, new=${op.newFdId})`;
+    case "seekFd": {
+      const whenceName = op.whence === SEEK_SET ? "SET" : op.whence === SEEK_CUR ? "CUR" : "END";
+      return `[${index}] seekFd(fdId=${op.fdId}, offset=${op.offset}, SEEK_${whenceName})`;
+    }
+    case "appendWrite":
+      return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
+    case "ftruncateFd":
+      return `[${index}] ftruncateFd(fdId=${op.fdId}, size=${op.size})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -920,6 +1041,16 @@ async function runFuzzSequence(
       ).toBe(new Date(memStat.mtime).getTime());
     }
 
+    // For seek operations, compare returned positions
+    if (op.type === "seekFd" && !memResult.error) {
+      expect(tomeResult.size, `${desc}: seek position mismatch`).toBe(memResult.size);
+    }
+
+    // For ftruncate and appendWrite, compare resulting file sizes
+    if ((op.type === "ftruncateFd" || op.type === "appendWrite") && !memResult.error) {
+      expect(tomeResult.size, `${desc}: size mismatch`).toBe(memResult.size);
+    }
+
     // For chmod operations, verify mode was set identically
     if (op.type === "chmod" && !memResult.error) {
       const memStat = memFS.stat(op.path);
@@ -1050,6 +1181,29 @@ describe("fuzz: randomized differential testing", () => {
 
     it("seed 8192 tiny cache", async () => {
       await runFuzzSequence(8192, 100, 4);
+    }, 30_000);
+  });
+
+  describe("fd-heavy operations (dup, seek, append, ftruncate)", () => {
+    // Seeds chosen to generate sequences that frequently exercise the new
+    // fd-centric operations: dupFd, seekFd, appendWrite, ftruncateFd.
+    // These target tomefs stream_ops code paths (dup openCount tracking,
+    // llseek with SEEK_CUR/SEEK_END, O_APPEND writes, ftruncate via fd).
+
+    it("seed 77777 tiny cache @fast", async () => {
+      await runFuzzSequence(77777, 120, 4);
+    }, 30_000);
+
+    it("seed 88888 tiny cache", async () => {
+      await runFuzzSequence(88888, 120, 4);
+    }, 30_000);
+
+    it("seed 99999 small cache", async () => {
+      await runFuzzSequence(99999, 150, 16);
+    }, 30_000);
+
+    it("seed 12321 tiny cache", async () => {
+      await runFuzzSequence(12321, 120, 4);
     }, 30_000);
   });
 });
