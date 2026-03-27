@@ -879,4 +879,65 @@ describe("PageCache", () => {
       expect(stats.hits).toBe(0);
     });
   });
+
+  describe("skip backend reads for pages beyond file extent", () => {
+    it("extending write skips backend reads for new pages", async () => {
+      // Write 1 page to establish file extent
+      const init = new Uint8Array(PAGE_SIZE);
+      init.fill(0xaa);
+      await cache.write("/file", init, 0, PAGE_SIZE, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/file");
+
+      // Spy on readPages
+      let readPagesIndicesTotal = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, indices: number[]) => {
+        readPagesIndicesTotal += indices.length;
+        return origReadPages(path, indices);
+      };
+      let readPageCalls = 0;
+      const origReadPage = backend.readPage.bind(backend);
+      backend.readPage = async (path: string, pageIndex: number) => {
+        readPageCalls++;
+        return origReadPage(path, pageIndex);
+      };
+
+      // Write 4 pages starting at page 0 (1 existing + 3 new)
+      const data = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < data.length; i++) data[i] = (i * 7) & 0xff;
+      await cache.write("/file", data, 0, data.length, 0, PAGE_SIZE);
+
+      // Only page 0 should be read from backend (it exists).
+      // Pages 1-3 are beyond file extent → skip backend read.
+      expect(readPageCalls).toBe(1);
+      expect(readPagesIndicesTotal).toBe(0);
+
+      // Verify data integrity
+      const buf = new Uint8Array(data.length);
+      await cache.read("/file", buf, 0, data.length, 0, PAGE_SIZE * 4);
+      expect(buf).toEqual(data);
+    });
+
+    it("write to new file skips all backend reads", async () => {
+      let readPageCalls = 0;
+      const origReadPage = backend.readPage.bind(backend);
+      backend.readPage = async (path: string, pageIndex: number) => {
+        readPageCalls++;
+        return origReadPage(path, pageIndex);
+      };
+
+      // Write 3 pages to a brand-new file (currentFileSize=0)
+      const data = new Uint8Array(PAGE_SIZE * 3);
+      data.fill(0xbb);
+      await cache.write("/new", data, 0, data.length, 0, 0);
+
+      // No backend reads — all pages are new
+      expect(readPageCalls).toBe(0);
+
+      const buf = new Uint8Array(data.length);
+      await cache.read("/new", buf, 0, data.length, 0, PAGE_SIZE * 3);
+      expect(buf).toEqual(data);
+    });
+  });
 });

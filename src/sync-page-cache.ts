@@ -72,6 +72,20 @@ export class SyncPageCache {
    * The page is marked as most-recently-used.
    */
   getPage(path: string, pageIndex: number): CachedPage {
+    return this.getPageInternal(path, pageIndex, true);
+  }
+
+  /**
+   * Get or create a page. When readBackend is false, skips the backend read
+   * and creates a zero-filled page on cache miss. Used for pages beyond the
+   * current file extent during writes — we know these pages don't exist in
+   * the backend, so the read would be a wasted round-trip.
+   */
+  private getPageInternal(
+    path: string,
+    pageIndex: number,
+    readBackend: boolean,
+  ): CachedPage {
     // Fast path: exact same page as last access — no key construction or Map ops
     const mru = this.mruPage;
     if (mru !== null && mru.path === path && mru.pageIndex === pageIndex) {
@@ -95,8 +109,10 @@ export class SyncPageCache {
     }
 
     this._misses++;
-    // Cache miss — load from backend
-    const data = this.backend.readPage(path, pageIndex);
+    // Cache miss — load from backend (or create zero-filled if beyond file extent)
+    const data = readBackend
+      ? this.backend.readPage(path, pageIndex)
+      : null;
     const page: CachedPage = {
       path,
       pageIndex,
@@ -236,9 +252,20 @@ export class SyncPageCache {
     const firstPage = Math.floor(position / PAGE_SIZE);
     const pageOffset = position - firstPage * PAGE_SIZE;
 
+    // Pages at or beyond this index don't exist in the backend, so we can
+    // skip the readPage call and create zero-filled pages directly. This
+    // avoids wasted SAB round-trips when extending files (the common case
+    // for sequential Postgres writes).
+    const firstNewPage =
+      currentFileSize > 0 ? Math.ceil(currentFileSize / PAGE_SIZE) : 0;
+
     // Fast path: entire write fits within a single page
     if (pageOffset + length <= PAGE_SIZE) {
-      const page = this.getPage(path, firstPage);
+      const page = this.getPageInternal(
+        path,
+        firstPage,
+        firstPage < firstNewPage,
+      );
       page.data.set(
         buffer.subarray(offset, offset + length),
         pageOffset,
@@ -254,24 +281,29 @@ export class SyncPageCache {
     // Multi-page path
     const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
 
-    // Batch eviction and pre-loading of cache misses
-    const missingIndices: number[] = [];
+    // Separate cache misses into pages that might exist in the backend
+    // (need readPages) vs pages beyond the file extent (skip backend read).
+    const existingMissing: number[] = [];
+    let totalMissing = 0;
     for (let p = firstPage; p <= lastPage; p++) {
       if (!this.cache.has(pageKeyStr(path, p))) {
-        missingIndices.push(p);
+        totalMissing++;
+        if (p < firstNewPage) {
+          existingMissing.push(p);
+        }
       }
     }
 
-    if (missingIndices.length > 0) {
+    if (totalMissing > 0) {
       // Batch-evict space for all missing pages at once
-      this.batchEvict(missingIndices.length);
+      this.batchEvict(totalMissing);
 
-      // Batch-load all missing pages from backend
-      if (missingIndices.length > 1) {
-        this._misses += missingIndices.length;
-        const results = this.backend.readPages(path, missingIndices);
-        for (let i = 0; i < missingIndices.length; i++) {
-          const pi = missingIndices[i];
+      // Batch-load only pages that exist in the backend
+      if (existingMissing.length > 1) {
+        this._misses += existingMissing.length;
+        const results = this.backend.readPages(path, existingMissing);
+        for (let i = 0; i < existingMissing.length; i++) {
+          const pi = existingMissing[i];
           const key = pageKeyStr(path, pi);
           if (this.cache.has(key)) continue;
           const page: CachedPage = {
@@ -288,9 +320,12 @@ export class SyncPageCache {
           this.trackPage(path, key);
         }
       }
+      // Single existing misses and all new pages are handled by
+      // getPageInternal in the write loop below.
     }
 
-    // Write data into pages (all multi-miss pages are pre-loaded)
+    // Write data into pages (pre-loaded existing pages are cache hits;
+    // new pages beyond file extent skip the backend read)
     let bytesWritten = 0;
     let pos = position;
 
@@ -299,7 +334,7 @@ export class SyncPageCache {
       const po = pos - pi * PAGE_SIZE;
       const bytesInPage = Math.min(PAGE_SIZE - po, length - bytesWritten);
 
-      const page = this.getPage(path, pi);
+      const page = this.getPageInternal(path, pi, pi < firstNewPage);
       page.data.set(
         buffer.subarray(
           offset + bytesWritten,
@@ -317,10 +352,10 @@ export class SyncPageCache {
     }
 
     // Compensate for false hits: batch-loaded pages were counted as misses
-    // above, but getPage() also counted them as hits when it found them
-    // in cache. Subtract the false hits to keep stats accurate.
-    if (missingIndices.length > 1) {
-      this._hits -= missingIndices.length;
+    // above, but getPageInternal() also counted them as hits when it found
+    // them in cache. Subtract the false hits to keep stats accurate.
+    if (existingMissing.length > 1) {
+      this._hits -= existingMissing.length;
     }
 
     const newFileSize = Math.max(currentFileSize, position + length);

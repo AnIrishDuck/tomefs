@@ -66,3 +66,23 @@ jobs:
 
       - name: Full test suite (tomefs)
         run: TOMEFS_BACKEND=tomefs npm test
+
+  small-cache-tests:
+    name: Small-cache conformance
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Conformance tests (tomefs, 4-page cache)
+        run: TOMEFS_BACKEND=tomefs TOMEFS_MAX_PAGES=4 npx vitest run tests/conformance/
+
+      - name: Workload tests (tomefs, 4-page cache)
+        run: TOMEFS_BACKEND=tomefs TOMEFS_MAX_PAGES=4 npx vitest run tests/workload/ tests/scribe-data/
