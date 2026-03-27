@@ -16,7 +16,7 @@
  *   FS.mount(tomefs, {}, '/data');
  */
 
-import { PAGE_SIZE } from "./types.js";
+import { PAGE_SIZE, MAX_PROBE_PAGE } from "./types.js";
 import type { FileMeta } from "./types.js";
 import { SyncPageCache } from "./sync-page-cache.js";
 import { SyncMemoryBackend } from "./sync-memory-backend.js";
@@ -663,7 +663,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // Exponential probe: double the step until we find a missing page
           while (backend.readPage(storagePath, hi)) {
             lo = hi;
-            hi *= 2;
+            hi = Math.min(hi * 2, MAX_PROBE_PAGE);
+            if (hi === lo) break; // hit cap — lo is the last known page
           }
           // Binary search between lo (exists) and hi (missing)
           while (hi - lo > 1) {
