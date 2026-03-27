@@ -128,6 +128,7 @@ export class PageCache {
     const lastPage = Math.floor((position + toRead - 1) / PAGE_SIZE);
 
     // Find cache misses — only batch when there are multiple misses
+    let batchLoadedRead = 0;
     if (lastPage > firstPage) {
       const missingIndices: number[] = [];
       for (let p = firstPage; p <= lastPage; p++) {
@@ -137,6 +138,7 @@ export class PageCache {
       }
 
       if (missingIndices.length > 1) {
+        batchLoadedRead = missingIndices.length;
         // Batch-evict space before pre-loading
         await this.batchEvict(missingIndices.length);
 
@@ -181,6 +183,13 @@ export class PageCache {
       pos += bytesInPage;
     }
 
+    // Compensate for false hits: batch-loaded pages were counted as misses
+    // above, but getPage() also counted them as hits when it found them
+    // in cache. Subtract the false hits to keep stats accurate.
+    if (batchLoadedRead > 0) {
+      this._hits -= batchLoadedRead;
+    }
+
     return bytesRead;
   }
 
@@ -209,6 +218,7 @@ export class PageCache {
     const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
 
     // For multi-page writes, batch eviction and pre-loading of cache misses
+    let batchLoadedWrite = 0;
     if (lastPage > firstPage) {
       const missingIndices: number[] = [];
       for (let p = firstPage; p <= lastPage; p++) {
@@ -223,6 +233,7 @@ export class PageCache {
 
         // Batch-load all missing pages from backend
         if (missingIndices.length > 1) {
+          batchLoadedWrite = missingIndices.length;
           this._misses += missingIndices.length;
           const results = await this.backend.readPages(path, missingIndices);
           for (let i = 0; i < missingIndices.length; i++) {
@@ -274,6 +285,13 @@ export class PageCache {
 
       bytesWritten += bytesInPage;
       pos += bytesInPage;
+    }
+
+    // Compensate for false hits: batch-loaded pages were counted as misses
+    // above, but getPage() also counted them as hits when it found them
+    // in cache. Subtract the false hits to keep stats accurate.
+    if (batchLoadedWrite > 0) {
+      this._hits -= batchLoadedWrite;
     }
 
     const newFileSize = Math.max(currentFileSize, position + length);
