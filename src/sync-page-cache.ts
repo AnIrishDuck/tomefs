@@ -202,6 +202,13 @@ export class SyncPageCache {
       pos += bytesInPage;
     }
 
+    // Compensate for false hits: batch-loaded pages were counted as misses
+    // above, but getPage() also counted them as hits when it found them
+    // in cache. Subtract the false hits to keep stats accurate.
+    if (missingIndices.length > 1) {
+      this._hits -= missingIndices.length;
+    }
+
     return bytesRead;
   }
 
@@ -307,6 +314,13 @@ export class SyncPageCache {
 
       bytesWritten += bytesInPage;
       pos += bytesInPage;
+    }
+
+    // Compensate for false hits: batch-loaded pages were counted as misses
+    // above, but getPage() also counted them as hits when it found them
+    // in cache. Subtract the false hits to keep stats accurate.
+    if (missingIndices.length > 1) {
+      this._hits -= missingIndices.length;
     }
 
     const newFileSize = Math.max(currentFileSize, position + length);

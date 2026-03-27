@@ -824,5 +824,59 @@ describe("PageCache", () => {
 
       expect(cache.getStats().misses).toBe(3);
     });
+
+    it("multi-page read does not double-count batch-loaded pages as hits", async () => {
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      await cache.write("/test", data, 0, size, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/test");
+      cache.resetStats();
+
+      const buf = new Uint8Array(size);
+      await cache.read("/test", buf, 0, size, 0, size);
+
+      const stats = cache.getStats();
+      expect(stats.misses).toBe(3);
+      // No pages should be counted as hits — they were all loaded fresh
+      expect(stats.hits).toBe(0);
+    });
+
+    it("multi-page read counts hits correctly for partially cached pages", async () => {
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      await cache.write("/test", data, 0, size, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/test");
+      // Load page 1 back into cache
+      await cache.getPage("/test", 1);
+      cache.resetStats();
+
+      const buf = new Uint8Array(size);
+      await cache.read("/test", buf, 0, size, 0, size);
+
+      const stats = cache.getStats();
+      // Pages 0 and 2 are misses
+      expect(stats.misses).toBe(2);
+      // Page 1 is a legitimate hit
+      expect(stats.hits).toBe(1);
+    });
+
+    it("multi-page write does not double-count batch-loaded pages as hits", async () => {
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      await cache.write("/test", data, 0, size, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/test");
+      cache.resetStats();
+
+      const writeData = new Uint8Array(size);
+      writeData.fill(0x42);
+      await cache.write("/test", writeData, 0, size, 0, size);
+
+      const stats = cache.getStats();
+      expect(stats.misses).toBe(3);
+      expect(stats.hits).toBe(0);
+    });
   });
 });

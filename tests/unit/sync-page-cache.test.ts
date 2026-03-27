@@ -694,5 +694,74 @@ describe("SyncPageCache", () => {
       // 3 pages should be loaded (misses)
       expect(cache.getStats().misses).toBe(3);
     });
+
+    it("multi-page read does not double-count batch-loaded pages as hits", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write 3 pages of data
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      cache.write("/file", data, 0, size, 0, 0);
+      cache.flushAll();
+
+      // Evict all, then re-read all 3 pages in one call
+      cache.evictFile("/file");
+      cache.resetStats();
+
+      const buf = new Uint8Array(size);
+      cache.read("/file", buf, 0, size, 0, size);
+
+      const stats = cache.getStats();
+      // All 3 pages were cache misses (loaded from backend)
+      expect(stats.misses).toBe(3);
+      // No pages should be counted as hits — they were all loaded fresh
+      expect(stats.hits).toBe(0);
+    });
+
+    it("multi-page read counts hits correctly for partially cached pages", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write 3 pages of data
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      cache.write("/file", data, 0, size, 0, 0);
+      cache.flushAll();
+
+      // Evict all, then load page 1 back into cache
+      cache.evictFile("/file");
+      cache.getPage("/file", 1);
+      cache.resetStats();
+
+      // Read all 3 pages — page 1 is cached, pages 0 and 2 are not
+      const buf = new Uint8Array(size);
+      cache.read("/file", buf, 0, size, 0, size);
+
+      const stats = cache.getStats();
+      // Pages 0 and 2 are misses (batch-loaded from backend)
+      expect(stats.misses).toBe(2);
+      // Page 1 is a legitimate hit (was already in cache)
+      expect(stats.hits).toBe(1);
+    });
+
+    it("multi-page write does not double-count batch-loaded pages as hits", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Pre-populate 3 pages in backend
+      const size = PAGE_SIZE * 3;
+      const data = new Uint8Array(size);
+      cache.write("/file", data, 0, size, 0, 0);
+      cache.flushAll();
+
+      // Evict all, then write across all 3 pages
+      cache.evictFile("/file");
+      cache.resetStats();
+
+      const writeData = new Uint8Array(size);
+      writeData.fill(0x42);
+      cache.write("/file", writeData, 0, size, 0, size);
+
+      const stats = cache.getStats();
+      // All 3 pages were cache misses (loaded from backend for read-modify-write)
+      expect(stats.misses).toBe(3);
+      // No pages should be counted as hits
+      expect(stats.hits).toBe(0);
+    });
   });
 });
