@@ -72,7 +72,8 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   }
 
   readMeta(path: string): FileMeta | null {
-    return this.meta.get(path) ?? null;
+    const m = this.meta.get(path);
+    return m ? { ...m } : null;
   }
 
   writeMeta(path: string, meta: FileMeta): void {
