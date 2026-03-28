@@ -89,6 +89,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    */
   const allFileNodes = new Set<any>();
 
+  // True when the backend may contain stale metadata not in the live tree.
+  // Set on mount (crash recovery may have left orphans) and cleared after
+  // a successful orphan cleanup pass in syncfs. Operations that directly
+  // modify backend metadata (rename, unlink-with-open-fds) re-set this
+  // flag since a crash between their backend writes could leave orphans.
+  let needsOrphanCleanup = true;
+
   // ---------------------------------------------------------------
   // Page-cached file I/O
   // ---------------------------------------------------------------
@@ -221,6 +228,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (new_name.length > NAME_MAX) {
       throw new FS.ErrnoError(ENAMETOOLONG);
     }
+    // Rename writes metadata directly to the backend (for both source
+    // and target paths). A crash between these writes could leave
+    // orphaned metadata, so flag that orphan cleanup is needed.
+    needsOrphanCleanup = true;
+
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
@@ -321,6 +333,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   }
 
   function unlink(parent: any, name: string) {
+    // Unlink modifies backend metadata directly (deletes or writes
+    // /__deleted_* markers). A crash could leave orphaned entries.
+    needsOrphanCleanup = true;
     const node = parent.contents[name];
     if (node && FS.isFile(node.mode)) {
       node.unlinked = true;
@@ -365,6 +380,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     for (const _i in node.contents) {
       throw new FS.ErrnoError(55); // ENOTEMPTY
     }
+    // rmdir deletes directory metadata from backend directly.
+    needsOrphanCleanup = true;
     const sp = computeStoragePath(parent, name);
     backend.deleteMeta(sp);
     delete parent.contents[name];
@@ -954,16 +971,24 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // On restart, restoreTree recreates the file from stale metadata, but
           // the pages may already be gone — or they may still exist if the crash
           // happened before backend.deleteFile completed.  Either way, clean up both.
-          const orphanPaths: string[] = [];
-          for (const path of backend.listFiles()) {
-            if (!currentPaths.has(path)) {
-              orphanPaths.push(path);
+          //
+          // Skip this scan when no orphans are possible — avoids a full
+          // backend.listFiles() round-trip on every sync (the common case).
+          if (needsOrphanCleanup) {
+            const orphanPaths: string[] = [];
+            for (const path of backend.listFiles()) {
+              if (!currentPaths.has(path)) {
+                orphanPaths.push(path);
+              }
             }
+            if (orphanPaths.length > 0) {
+              for (const path of orphanPaths) {
+                backend.deleteFile(path);
+              }
+              backend.deleteMetas(orphanPaths);
+            }
+            needsOrphanCleanup = false;
           }
-          for (const path of orphanPaths) {
-            backend.deleteFile(path);
-          }
-          backend.deleteMetas(orphanPaths);
         }
         callback(null);
       } catch (err) {

@@ -388,10 +388,12 @@ describe("PageCache", () => {
       expect(cache.isDirty("/test", 0)).toBe(false);
     });
 
-    it("no-op when page not in cache and not in backend", async () => {
-      // No pages loaded or stored — should not throw
+    it("loads zero-filled page into cache when page not in backend", async () => {
+      // No pages loaded or stored — should load a zero-filled page into cache
       await cache.zeroTailAfterTruncate("/test", 100);
-      expect(cache.size).toBe(0);
+      expect(cache.size).toBe(1);
+      // Page should be dirty (tail was zeroed)
+      expect(cache.isDirty("/test", 0)).toBe(true);
     });
 
     it("zeros tail of evicted page in backend", async () => {
