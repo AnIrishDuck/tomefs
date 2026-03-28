@@ -390,6 +390,40 @@ describe("PreloadBackend", () => {
       expect(await remote.readPage("/old", 0)).toBeNull();
       expect((await remote.readPage("/new", 0))![0]).toBe(0xbb);
     });
+
+    it("cleans up extra destination pages when source has fewer pages", async () => {
+      // Destination has 4 pages, source has 2 — extra pages must not survive.
+      const filledPage = (v: number) => { const d = new Uint8Array(PAGE_SIZE); d.fill(v); return d; };
+      for (let i = 0; i < 4; i++) {
+        await remote.writePage("/dest", i, filledPage(0xdd));
+      }
+      await remote.writeMeta("/dest", { size: 4 * PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+      await remote.writePage("/src", 0, filledPage(0xaa));
+      await remote.writePage("/src", 1, filledPage(0xbb));
+      await remote.writeMeta("/src", { size: 2 * PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      backend.renameFile("/src", "/dest");
+
+      // Source pages moved to destination
+      expect(backend.readPage("/dest", 0)).toEqual(filledPage(0xaa));
+      expect(backend.readPage("/dest", 1)).toEqual(filledPage(0xbb));
+      // Orphan pages from old destination must be gone
+      expect(backend.readPage("/dest", 2)).toBeNull();
+      expect(backend.readPage("/dest", 3)).toBeNull();
+      // Source is gone
+      expect(backend.readPage("/src", 0)).toBeNull();
+
+      // After flush, remote should also be clean
+      await backend.flush();
+      expect(await remote.readPage("/dest", 0)).toEqual(filledPage(0xaa));
+      expect(await remote.readPage("/dest", 1)).toEqual(filledPage(0xbb));
+      expect(await remote.readPage("/dest", 2)).toBeNull();
+      expect(await remote.readPage("/dest", 3)).toBeNull();
+      expect(await remote.readPage("/src", 0)).toBeNull();
+    });
   });
 
   describe("flush", () => {

@@ -229,6 +229,19 @@ export class PreloadBackend implements SyncStorageBackend {
       return;
     }
 
+    // Clear any pre-existing destination pages to prevent orphans when the
+    // destination has more pages than the source (matches IDB/OPFS behavior).
+    const destKeys = this.filePageKeys.get(newPath);
+    if (destKeys) {
+      for (const key of destKeys) {
+        this.pages.delete(key);
+        this.dirtyPages.delete(key);
+      }
+      this.filePageKeys.delete(newPath);
+      this.deletedFiles.add(newPath);
+      this.truncations.delete(newPath);
+    }
+
     const oldPrefix = `${oldPath}\0`;
     const toAdd: Array<[string, Uint8Array]> = [];
     for (const key of oldKeys) {
