@@ -309,6 +309,21 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // causing data loss on syncfs → remount when metadata is persisted
       // under the new tree-computed paths but pages are under old paths.
       renameDescendantPaths(old_node, oldStoragePath, newDirPath);
+    } else if (FS.isLink(old_node.mode)) {
+      // Move symlink metadata eagerly for crash safety — same rationale
+      // as file and directory renames. Without this, a crash between the
+      // rename and the next syncfs would lose the rename: metadata stays
+      // at the old path while the node tree has it at the new path.
+      const newLinkPath = computeStoragePath(new_dir, new_name);
+      backend.writeMeta(newLinkPath, {
+        size: 0,
+        mode: old_node.mode,
+        ctime: old_node.ctime,
+        mtime: old_node.mtime,
+        atime: old_node.atime,
+        link: old_node.link,
+      });
+      backend.deleteMeta(oldStoragePath);
     }
 
     // Rewire the node tree
