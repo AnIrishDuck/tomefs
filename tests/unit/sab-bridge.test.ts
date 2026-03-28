@@ -299,7 +299,7 @@ describe("SAB+Atomics Bridge", () => {
         ],
       ]);
 
-      const results = await callClient(clientWorker, "readMetas", [["/p", "/q", "/missing"]]);
+      const results = await callClient(clientWorker, "readMetas", [["/p", "/q", "/missing"]]) as unknown[];
       expect(results).toHaveLength(3);
       expect(results[0]).toEqual({ size: 10, mode: 0o644, ctime: 1, mtime: 2 });
       expect(results[1]).toEqual({ size: 20, mode: 0o755, ctime: 3, mtime: 4 });
