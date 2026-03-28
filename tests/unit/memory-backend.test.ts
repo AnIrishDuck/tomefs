@@ -210,6 +210,47 @@ describe("MemoryBackend", () => {
       await backend.renameFile("/nonexistent", "/new");
       expect(await backend.readPage("/new", 0)).toBeNull();
     });
+
+    it("overwrites existing pages at destination", async () => {
+      const d0 = new Uint8Array(PAGE_SIZE);
+      d0[0] = 0x11;
+      await backend.writePage("/dest", 0, d0);
+
+      const d1 = new Uint8Array(PAGE_SIZE);
+      d1[0] = 0x22;
+      await backend.writePage("/src", 0, d1);
+
+      await backend.renameFile("/src", "/dest");
+
+      expect((await backend.readPage("/dest", 0))![0]).toBe(0x22);
+      expect(await backend.readPage("/src", 0)).toBeNull();
+    });
+
+    it("cleans up extra destination pages when source has fewer pages", async () => {
+      // Destination has 4 pages, source has 2 — extra pages must not survive.
+      for (let i = 0; i < 4; i++) {
+        const d = new Uint8Array(PAGE_SIZE);
+        d.fill(0xdd);
+        await backend.writePage("/dest", i, d);
+      }
+      const s0 = new Uint8Array(PAGE_SIZE);
+      s0.fill(0xaa);
+      const s1 = new Uint8Array(PAGE_SIZE);
+      s1.fill(0xbb);
+      await backend.writePage("/src", 0, s0);
+      await backend.writePage("/src", 1, s1);
+
+      await backend.renameFile("/src", "/dest");
+
+      expect((await backend.readPage("/dest", 0))![0]).toBe(0xaa);
+      expect((await backend.readPage("/dest", 1))![0]).toBe(0xbb);
+      // Orphan pages from old destination must be gone
+      expect(await backend.readPage("/dest", 2)).toBeNull();
+      expect(await backend.readPage("/dest", 3)).toBeNull();
+      // Source is gone
+      expect(await backend.readPage("/src", 0)).toBeNull();
+      expect(await backend.readPage("/src", 1)).toBeNull();
+    });
   });
 
   describe("metadata operations", () => {
