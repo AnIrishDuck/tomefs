@@ -410,25 +410,12 @@ export class PreloadBackend implements SyncStorageBackend {
       }
     }
 
-    // 1. Write new pages at non-deleted paths (crash-safe: new data first)
-    if (earlyBatch.length > 0) {
-      await this.remote.writePages(earlyBatch);
-    }
-
-    // 2. Batch-write dirty metadata for non-deleted paths
-    if (earlyMeta.length > 0) {
-      await this.remote.writeMetas(earlyMeta);
-    }
-
-    // 3. Delete files from remote (parallel — independent operations)
-    if (this.deletedFiles.size > 0) {
-      await Promise.all(
-        [...this.deletedFiles].map((path) => this.remote.deleteFile(path)),
-      );
-    }
-    this.deletedFiles.clear();
-
-    // 4. Apply truncations (parallel — independent operations)
+    // 1. Apply truncations FIRST — before page writes.
+    // Truncations delete stale tail pages from the remote. If a file was
+    // truncated and then extended (e.g., truncate to 100 bytes then write
+    // at offset 8192), the new page at the truncation point is dirty and
+    // will be written in step 3. Without this ordering, page writes would
+    // go to the remote first, then the truncation would delete them.
     if (this.truncations.size > 0) {
       await Promise.all(
         [...this.truncations].map(([path, fromIndex]) =>
@@ -437,6 +424,24 @@ export class PreloadBackend implements SyncStorageBackend {
       );
     }
     this.truncations.clear();
+
+    // 2. Write new pages at non-deleted paths (after truncation cleanup)
+    if (earlyBatch.length > 0) {
+      await this.remote.writePages(earlyBatch);
+    }
+
+    // 3. Batch-write dirty metadata for non-deleted paths
+    if (earlyMeta.length > 0) {
+      await this.remote.writeMetas(earlyMeta);
+    }
+
+    // 4. Delete files from remote (parallel — independent operations)
+    if (this.deletedFiles.size > 0) {
+      await Promise.all(
+        [...this.deletedFiles].map((path) => this.remote.deleteFile(path)),
+      );
+    }
+    this.deletedFiles.clear();
 
     // 5. Batch-delete metadata
     if (this.deletedMeta.size > 0) {
