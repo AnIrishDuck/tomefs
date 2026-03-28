@@ -111,6 +111,9 @@ class ReadCountingBackend implements StorageBackend {
   async deleteMetas(paths: string[]) {
     return this.inner.deleteMetas(paths);
   }
+  async countPages(path: string) {
+    return this.inner.countPages(path);
+  }
   async listFiles() {
     return this.inner.listFiles();
   }

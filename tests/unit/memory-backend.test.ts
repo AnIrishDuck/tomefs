@@ -150,6 +150,42 @@ describe("MemoryBackend", () => {
     });
   });
 
+  describe("countPages", () => {
+    it("@fast returns 0 for non-existent file", async () => {
+      expect(await backend.countPages("/nonexistent")).toBe(0);
+    });
+
+    it("@fast counts pages for a file", async () => {
+      await backend.writePage("/test", 0, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/test", 1, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/test", 2, new Uint8Array(PAGE_SIZE));
+      expect(await backend.countPages("/test")).toBe(3);
+    });
+
+    it("does not count pages from other files", async () => {
+      await backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/a", 1, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/b", 0, new Uint8Array(PAGE_SIZE));
+      expect(await backend.countPages("/a")).toBe(2);
+      expect(await backend.countPages("/b")).toBe(1);
+    });
+
+    it("returns 0 after deleteFile", async () => {
+      await backend.writePage("/test", 0, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/test", 1, new Uint8Array(PAGE_SIZE));
+      await backend.deleteFile("/test");
+      expect(await backend.countPages("/test")).toBe(0);
+    });
+
+    it("reflects deletePagesFrom", async () => {
+      await backend.writePage("/test", 0, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/test", 1, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/test", 2, new Uint8Array(PAGE_SIZE));
+      await backend.deletePagesFrom("/test", 1);
+      expect(await backend.countPages("/test")).toBe(1);
+    });
+  });
+
   describe("renameFile", () => {
     it("moves all pages from old path to new path", async () => {
       const d0 = new Uint8Array(PAGE_SIZE);

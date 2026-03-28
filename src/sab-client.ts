@@ -128,6 +128,11 @@ export class SabClient implements SyncStorageBackend {
     this.call(OpCode.RENAME_FILE, { oldPath, newPath });
   }
 
+  countPages(path: string): number {
+    const { json } = this.call(OpCode.COUNT_PAGES, { path });
+    return (json as { count: number }).count;
+  }
+
   readMeta(path: string): FileMeta | null {
     const { json } = this.call(OpCode.READ_META, { path });
     const result = json as { meta: FileMeta | null };

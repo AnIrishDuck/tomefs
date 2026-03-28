@@ -220,6 +220,18 @@ describe("SAB+Atomics Bridge", () => {
     });
   });
 
+  describe("countPages", () => {
+    it("@fast returns 0 for non-existent file", async () => {
+      expect(await callClient(clientWorker, "countPages", ["/test"])).toBe(0);
+    });
+
+    it("counts pages after writes", async () => {
+      await callClient(clientWorker, "writePage", ["/test", 0, new Uint8Array(PAGE_SIZE)]);
+      await callClient(clientWorker, "writePage", ["/test", 1, new Uint8Array(PAGE_SIZE)]);
+      expect(await callClient(clientWorker, "countPages", ["/test"])).toBe(2);
+    });
+  });
+
   describe("metadata operations", () => {
     it("@fast readMeta returns null for non-existent file", async () => {
       const result = await callClient(clientWorker, "readMeta", ["/test"]);

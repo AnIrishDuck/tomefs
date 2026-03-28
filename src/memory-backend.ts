@@ -68,6 +68,17 @@ export class MemoryBackend implements StorageBackend {
     }
   }
 
+  async countPages(path: string): Promise<number> {
+    const prefix = `${path}\0`;
+    let count = 0;
+    for (const key of this.pages.keys()) {
+      if (key.startsWith(prefix)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     const prefix = `${oldPath}\0`;
     const toAdd: Array<[string, Uint8Array]> = [];

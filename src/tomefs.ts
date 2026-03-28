@@ -16,7 +16,7 @@
  *   FS.mount(tomefs, {}, '/data');
  */
 
-import { PAGE_SIZE, MAX_PROBE_PAGE } from "./types.js";
+import { PAGE_SIZE } from "./types.js";
 import type { FileMeta } from "./types.js";
 import { SyncPageCache } from "./sync-page-cache.js";
 import { SyncMemoryBackend } from "./sync-memory-backend.js";
@@ -752,62 +752,26 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         const node = TOMEFS.createNode(parent, name, meta.mode, 0);
         // Use metadata size, but verify against actual backend pages.
         // Pages may extend beyond meta.size if writes occurred after the
-        // last metadata sync (e.g., Postgres shutdown writes during close).
-        let fileSize = meta.size;
+        // last metadata sync (e.g., Postgres shutdown writes during close),
+        // or may be fewer if a truncation wasn't synced before a crash.
+        // A single countPages call replaces the previous O(log n)
+        // readPage-based binary search probing — no data transfer needed,
+        // just a count query on the backend's page store.
         const storagePath = computeStoragePath(parent, name);
+        const actualPageCount = backend.countPages(storagePath);
         const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
 
-        // Verify that pages below metadata actually exist. If a file was
-        // truncated (pages deleted from backend) but metadata wasn't synced
-        // before a crash, the backend has fewer pages than meta.size claims.
-        // Detect this by checking the last expected page exists.
-        if (pagesFromMeta > 0) {
-          const lastExpectedPage = pagesFromMeta - 1;
-          if (!backend.readPage(storagePath, lastExpectedPage)) {
-            // Stale metadata: pages were truncated after last sync.
-            if (!backend.readPage(storagePath, 0)) {
-              // No pages at all — file was fully truncated
-              fileSize = 0;
-            } else {
-              // Binary search for actual last page: 0 exists, lastExpectedPage doesn't
-              let lo = 0;
-              let hi = lastExpectedPage;
-              while (hi - lo > 1) {
-                const mid = (lo + hi) >>> 1;
-                if (backend.readPage(storagePath, mid)) {
-                  lo = mid;
-                } else {
-                  hi = mid;
-                }
-              }
-              fileSize = (lo + 1) * PAGE_SIZE;
-            }
-          }
-        }
-
-        // Check if a page exists beyond what metadata accounts for
-        const nextPage = backend.readPage(storagePath, pagesFromMeta);
-        if (nextPage) {
-          // Exponential probe + binary search to find the true extent.
-          // This is O(log n) reads instead of O(n) linear scanning.
-          let lo = pagesFromMeta;
-          let hi = pagesFromMeta + 1;
-          // Exponential probe: double the step until we find a missing page
-          while (backend.readPage(storagePath, hi)) {
-            lo = hi;
-            hi = Math.min(hi * 2, MAX_PROBE_PAGE);
-            if (hi === lo) break; // hit cap — lo is the last known page
-          }
-          // Binary search between lo (exists) and hi (missing)
-          while (hi - lo > 1) {
-            const mid = (lo + hi) >>> 1;
-            if (backend.readPage(storagePath, mid)) {
-              lo = mid;
-            } else {
-              hi = mid;
-            }
-          }
-          fileSize = (lo + 1) * PAGE_SIZE;
+        let fileSize: number;
+        if (actualPageCount === 0) {
+          fileSize = 0;
+        } else if (actualPageCount === pagesFromMeta) {
+          // Page count matches metadata — trust meta.size for sub-page precision
+          fileSize = meta.size;
+        } else {
+          // Mismatch: crash occurred between page writes and metadata sync.
+          // Use page count as ground truth — we lose sub-page precision
+          // but preserve all data that made it to the backend.
+          fileSize = actualPageCount * PAGE_SIZE;
         }
         node.usedBytes = fileSize;
         node.atime = meta.atime ?? meta.mtime;

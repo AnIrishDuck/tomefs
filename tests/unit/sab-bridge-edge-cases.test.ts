@@ -157,6 +157,11 @@ class FailingBackend implements StorageBackend {
     return this.inner.deleteMetas(paths);
   }
 
+  async countPages(path: string): Promise<number> {
+    this.maybeThrow("countPages");
+    return this.inner.countPages(path);
+  }
+
   async listFiles(): Promise<string[]> {
     this.maybeThrow("listFiles");
     return this.inner.listFiles();
@@ -223,6 +228,10 @@ class SlowBackend implements StorageBackend {
 
   async deleteMetas(paths: string[]): Promise<void> {
     return this.inner.deleteMetas(paths);
+  }
+
+  async countPages(path: string): Promise<number> {
+    return this.inner.countPages(path);
   }
 
   async listFiles(): Promise<string[]> {

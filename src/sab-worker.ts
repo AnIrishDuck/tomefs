@@ -281,6 +281,15 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.COUNT_PAGES: {
+        const count = await this.backend.countPages(params.path as string);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          count,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       case OpCode.WRITE_METAS: {
         const entries = params.entries as Array<{
           path: string;

@@ -211,6 +211,19 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async countPages(path: string): Promise<number> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGES_STORE, "readonly");
+      const store = tx.objectStore(PAGES_STORE);
+      const range = IDBKeyRange.bound([path, 0], [path, ""], false, true);
+      const request = store.count(range);
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     const db = await this.getDb();
 

@@ -56,6 +56,17 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     }
   }
 
+  countPages(path: string): number {
+    const prefix = `${path}\0`;
+    let count = 0;
+    for (const key of this.pages.keys()) {
+      if (key.startsWith(prefix)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   renameFile(oldPath: string, newPath: string): void {
     const prefix = `${oldPath}\0`;
     const toAdd: Array<[string, Uint8Array]> = [];

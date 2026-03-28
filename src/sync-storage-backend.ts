@@ -52,6 +52,9 @@ export interface SyncStorageBackend {
   /** Rename all pages from one path to another. */
   renameFile(oldPath: string, newPath: string): void;
 
+  /** Count the number of pages stored for a file. Returns 0 if no pages exist. */
+  countPages(path: string): number;
+
   /** List all paths that have metadata stored. */
   listFiles(): string[];
 }
