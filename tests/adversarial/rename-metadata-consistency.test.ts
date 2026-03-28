@@ -383,7 +383,7 @@ describe("adversarial: rename metadata consistency", () => {
   // Rename file that was never synced (no metadata in backend)
   // ---------------------------------------------------------------------------
 
-  it("rename of never-synced file does not crash (no metadata to move)", async () => {
+  it("rename of never-synced file writes metadata from node state (crash safety)", async () => {
     const { FS, tomefs } = await mountTome(backend);
 
     // Create file but don't sync — no metadata in backend
@@ -393,12 +393,16 @@ describe("adversarial: rename metadata consistency", () => {
 
     expect(backend.readMeta("/unsynced")).toBeNull();
 
-    // Rename should work without crashing
+    // Rename constructs metadata from node state for crash safety —
+    // even for never-synced files, the new path gets metadata so a
+    // crash after rename doesn't orphan the file's pages.
     FS.rename(`${MOUNT}/unsynced`, `${MOUNT}/moved`);
 
-    // No metadata at either path (never synced)
     expect(backend.readMeta("/unsynced")).toBeNull();
-    expect(backend.readMeta("/moved")).toBeNull();
+    // Metadata now exists at new path (constructed from node state)
+    const meta = backend.readMeta("/moved");
+    expect(meta).not.toBeNull();
+    expect(meta!.size).toBe(3);
 
     // Data should still be accessible
     const buf = new Uint8Array(10);
