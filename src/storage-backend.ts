@@ -28,6 +28,9 @@ export interface StorageBackend {
   /** Delete all pages for a file. */
   deleteFile(path: string): Promise<void>;
 
+  /** Delete all pages for multiple files in a single batch. */
+  deleteFiles(paths: string[]): Promise<void>;
+
   /** Delete pages beyond a given index (for truncation). */
   deletePagesFrom(path: string, fromPageIndex: number): Promise<void>;
 

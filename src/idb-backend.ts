@@ -186,6 +186,28 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async deleteFiles(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+    if (paths.length === 1) {
+      await this.deleteFile(paths[0]);
+      return;
+    }
+
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const store = tx.objectStore(PAGES_STORE);
+
+      for (const path of paths) {
+        const range = IDBKeyRange.bound([path, 0], [path, ""], false, true);
+        store.delete(range);
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async deletePagesFrom(
     path: string,
     fromPageIndex: number,

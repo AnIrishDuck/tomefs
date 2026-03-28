@@ -208,6 +208,15 @@ export class OpfsBackend implements StorageBackend {
     }
   }
 
+  async deleteFiles(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+    if (paths.length === 1) {
+      await this.deleteFile(paths[0]);
+      return;
+    }
+    await Promise.all(paths.map((path) => this.deleteFile(path)));
+  }
+
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     await this.init();
     const oldEncoded = encodePath(oldPath);

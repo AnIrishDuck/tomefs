@@ -994,9 +994,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               }
             }
             if (orphanPaths.length > 0) {
-              for (const path of orphanPaths) {
-                backend.deleteFile(path);
-              }
+              backend.deleteFiles(orphanPaths);
               backend.deleteMetas(orphanPaths);
             }
             needsOrphanCleanup = false;

@@ -53,6 +53,10 @@ class CountingBackend implements StorageBackend {
     this.count("deleteFile");
     return this.inner.deleteFile(path);
   }
+  async deleteFiles(paths: string[]) {
+    this.count("deleteFiles");
+    return this.inner.deleteFiles(paths);
+  }
   async deletePagesFrom(path: string, fromPageIndex: number) {
     this.count("deletePagesFrom");
     return this.inner.deletePagesFrom(path, fromPageIndex);
@@ -879,7 +883,7 @@ describe("PreloadBackend", () => {
       expect(counting.calls["deleteMeta"] ?? 0).toBe(0);
     });
 
-    it("parallelizes multiple file deletions", async () => {
+    it("batches multiple file deletions into a single deleteFiles call", async () => {
       const inner = new MemoryBackend();
       const counting = new CountingBackend(inner);
       const backend = new PreloadBackend(counting);
@@ -904,8 +908,9 @@ describe("PreloadBackend", () => {
       counting.resetCounts();
       await backend.flush();
 
-      // All 3 deleteFile calls should happen (in parallel)
-      expect(counting.calls["deleteFile"]).toBe(3);
+      // Should use 1 deleteFiles call, not 3 individual deleteFile calls
+      expect(counting.calls["deleteFiles"]).toBe(1);
+      expect(counting.calls["deleteFile"] ?? 0).toBe(0);
     });
 
     it("parallelizes multiple truncations", async () => {

@@ -225,6 +225,13 @@ export class PreloadBackend implements SyncStorageBackend {
     return keys ? keys.size : 0;
   }
 
+  deleteFiles(paths: string[]): void {
+    this.assertInitialized();
+    for (const path of paths) {
+      this.deleteFile(path);
+    }
+  }
+
   renameFile(oldPath: string, newPath: string): void {
     this.assertInitialized();
     const oldKeys = this.filePageKeys.get(oldPath);
@@ -462,11 +469,9 @@ export class PreloadBackend implements SyncStorageBackend {
       await this.remote.writeMetas(earlyMeta);
     }
 
-    // 4. Delete files from remote (parallel — independent operations)
+    // 4. Batch-delete files from remote (single call instead of O(n))
     if (this.deletedFiles.size > 0) {
-      await Promise.all(
-        [...this.deletedFiles].map((path) => this.remote.deleteFile(path)),
-      );
+      await this.remote.deleteFiles([...this.deletedFiles]);
     }
     this.deletedFiles.clear();
 

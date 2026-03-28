@@ -177,6 +177,11 @@ export class SabClient implements SyncStorageBackend {
     this.call(OpCode.DELETE_FILE, { path });
   }
 
+  deleteFiles(paths: string[]): void {
+    if (paths.length === 0) return;
+    this.call(OpCode.DELETE_FILES, { paths });
+  }
+
   deletePagesFrom(path: string, fromPageIndex: number): void {
     this.call(OpCode.DELETE_PAGES_FROM, { path, fromPageIndex });
   }

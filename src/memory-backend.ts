@@ -72,6 +72,12 @@ export class MemoryBackend implements StorageBackend {
     }
   }
 
+  async deleteFiles(paths: string[]): Promise<void> {
+    for (const path of paths) {
+      await this.deleteFile(path);
+    }
+  }
+
   async deletePagesFrom(path: string, fromPageIndex: number): Promise<void> {
     const keys = this.filePageKeys.get(path);
     if (!keys) return;
