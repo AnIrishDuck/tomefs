@@ -92,6 +92,11 @@ export interface EmscriptenFS {
   cwd(): string;
   chdir(path: string): void;
 
+  // Filesystem management
+  mount(type: any, opts: any, mountpoint: string): any;
+  syncfs(populate: boolean, callback: (err: Error | null) => void): void;
+  lookupPath(path: string, opts?: any): { node: any };
+
   // ErrnoError constructor (for instanceof checks)
   ErrnoError: new (errno: number) => Error & { errno: number };
 }
