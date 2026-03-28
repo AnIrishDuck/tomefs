@@ -787,10 +787,28 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         } else if (actualPageCount === pagesFromMeta) {
           // Page count matches metadata — trust meta.size for sub-page precision
           fileSize = meta.size;
+        } else if (actualPageCount < pagesFromMeta) {
+          // Fewer pages than expected. Two possible causes:
+          // (a) Sparse file with zero-filled gaps — the last page exists but
+          //     intermediate pages were never written. Trust meta.size.
+          // (b) Crash after truncation deleted tail pages but before metadata
+          //     was updated. The last expected page is missing. Fall back to
+          //     page-count sizing to avoid reading beyond stored data.
+          // Distinguish by probing the last page implied by meta.size.
+          const lastPageIndex = pagesFromMeta - 1;
+          const lastPage = backend.readPage(storagePath, lastPageIndex);
+          if (lastPage !== null) {
+            // Last page exists — sparse file with gaps, trust metadata
+            fileSize = meta.size;
+          } else {
+            // Last page missing — crash recovery, use page count
+            fileSize = actualPageCount * PAGE_SIZE;
+          }
         } else {
-          // Mismatch: crash occurred between page writes and metadata sync.
-          // Use page count as ground truth — we lose sub-page precision
-          // but preserve all data that made it to the backend.
+          // More pages than metadata expects: crash occurred between page
+          // writes and metadata sync. Use page count as ground truth — we
+          // lose sub-page precision but preserve all data that made it to
+          // the backend.
           fileSize = actualPageCount * PAGE_SIZE;
         }
         node.usedBytes = fileSize;
