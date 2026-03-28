@@ -1018,4 +1018,136 @@ describe("PreloadBackend", () => {
       expect(storedB![0]).toBe(0x22);
     });
   });
+
+  describe("file page index correctness", () => {
+    it("@fast deleteFile only removes target file pages, not others", async () => {
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      // Write pages for two files
+      for (let i = 0; i < 10; i++) {
+        const page = new Uint8Array(PAGE_SIZE);
+        page[0] = i;
+        backend.writePage("/fileA", i, page);
+        backend.writePage("/fileB", i, page);
+      }
+
+      // Delete fileA
+      backend.deleteFile("/fileA");
+
+      // fileA pages gone
+      for (let i = 0; i < 10; i++) {
+        expect(backend.readPage("/fileA", i)).toBeNull();
+      }
+      // fileB pages intact
+      for (let i = 0; i < 10; i++) {
+        const page = backend.readPage("/fileB", i);
+        expect(page).not.toBeNull();
+        expect(page![0]).toBe(i);
+      }
+    });
+
+    it("@fast renameFile moves pages without affecting other files", async () => {
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      for (let i = 0; i < 5; i++) {
+        const page = new Uint8Array(PAGE_SIZE);
+        page[0] = i + 1;
+        backend.writePage("/src", i, page);
+        backend.writePage("/other", i, new Uint8Array(PAGE_SIZE));
+      }
+
+      backend.renameFile("/src", "/dst");
+
+      // src pages gone
+      for (let i = 0; i < 5; i++) {
+        expect(backend.readPage("/src", i)).toBeNull();
+      }
+      // dst pages have correct data
+      for (let i = 0; i < 5; i++) {
+        const page = backend.readPage("/dst", i);
+        expect(page).not.toBeNull();
+        expect(page![0]).toBe(i + 1);
+      }
+      // other file untouched
+      for (let i = 0; i < 5; i++) {
+        expect(backend.readPage("/other", i)).not.toBeNull();
+      }
+    });
+
+    it("@fast deletePagesFrom only removes pages at or beyond index", async () => {
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      for (let i = 0; i < 8; i++) {
+        const page = new Uint8Array(PAGE_SIZE);
+        page[0] = i;
+        backend.writePage("/file", i, page);
+      }
+
+      backend.deletePagesFrom("/file", 4);
+
+      // Pages 0-3 intact
+      for (let i = 0; i < 4; i++) {
+        const page = backend.readPage("/file", i);
+        expect(page).not.toBeNull();
+        expect(page![0]).toBe(i);
+      }
+      // Pages 4-7 gone
+      for (let i = 4; i < 8; i++) {
+        expect(backend.readPage("/file", i)).toBeNull();
+      }
+    });
+
+    it("@fast interleaved operations maintain index consistency", async () => {
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      // Create 5 files with 3 pages each
+      for (let f = 0; f < 5; f++) {
+        for (let p = 0; p < 3; p++) {
+          const page = new Uint8Array(PAGE_SIZE);
+          page[0] = f * 10 + p;
+          backend.writePage(`/f${f}`, p, page);
+        }
+      }
+
+      // Delete f1, rename f2→f1, truncate f3 from page 1
+      backend.deleteFile("/f1");
+      backend.renameFile("/f2", "/f1");
+      backend.deletePagesFrom("/f3", 1);
+
+      // f0 untouched
+      for (let p = 0; p < 3; p++) {
+        expect(backend.readPage("/f0", p)![0]).toBe(p);
+      }
+      // f1 now has f2's data
+      for (let p = 0; p < 3; p++) {
+        expect(backend.readPage("/f1", p)![0]).toBe(20 + p);
+      }
+      // f2 gone
+      for (let p = 0; p < 3; p++) {
+        expect(backend.readPage("/f2", p)).toBeNull();
+      }
+      // f3 only has page 0
+      expect(backend.readPage("/f3", 0)![0]).toBe(30);
+      expect(backend.readPage("/f3", 1)).toBeNull();
+      // f4 untouched
+      for (let p = 0; p < 3; p++) {
+        expect(backend.readPage("/f4", p)![0]).toBe(40 + p);
+      }
+
+      // Flush and verify remote state matches
+      backend.writeMeta("/f0", { size: PAGE_SIZE * 3, mode: 0o100644, ctime: 1, mtime: 1 });
+      backend.writeMeta("/f1", { size: PAGE_SIZE * 3, mode: 0o100644, ctime: 1, mtime: 1 });
+      backend.writeMeta("/f3", { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 });
+      backend.writeMeta("/f4", { size: PAGE_SIZE * 3, mode: 0o100644, ctime: 1, mtime: 1 });
+      await backend.flush();
+
+      // Verify remote has correct data
+      const remoteF1P0 = await remote.readPage("/f1", 0);
+      expect(remoteF1P0![0]).toBe(20);
+    });
+  });
 });
