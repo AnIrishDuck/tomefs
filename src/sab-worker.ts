@@ -187,6 +187,11 @@ export class SabWorker {
 
       case OpCode.WRITE_PAGE: {
         const dataLen = params.dataLen as number;
+        if (dataLen < 0 || dataLen > binary.length) {
+          throw new Error(
+            `WRITE_PAGE: dataLen ${dataLen} out of bounds [0, ${binary.length}]`,
+          );
+        }
         const pageData = new Uint8Array(binary.buffer, binary.byteOffset, dataLen);
         await this.backend.writePage(
           params.path as string,
@@ -208,6 +213,11 @@ export class SabWorker {
         }>;
         let offset = 0;
         const pages = pageMeta.map((pm) => {
+          if (pm.dataLen < 0 || offset + pm.dataLen > binary.length) {
+            throw new Error(
+              `WRITE_PAGES: dataLen ${pm.dataLen} at offset ${offset} exceeds binary length ${binary.length}`,
+            );
+          }
           const data = binary.slice(offset, offset + pm.dataLen);
           offset += pm.dataLen;
           return { path: pm.path, pageIndex: pm.pageIndex, data };

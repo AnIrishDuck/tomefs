@@ -875,3 +875,138 @@ describe("SAB bridge: decodeMessage validation", () => {
     );
   });
 });
+
+describe("SAB bridge: worker-side dataLen validation", () => {
+  // These tests verify that the SabWorker rejects malformed WRITE_PAGE and
+  // WRITE_PAGES requests where the declared dataLen exceeds the actual binary
+  // data in the SAB. This is defense-in-depth against corrupt SAB messages.
+
+  let backend: MemoryBackend;
+  let sabWorker: SabWorker;
+  let sab: SharedArrayBuffer;
+
+  // Import protocol constants for manual request crafting
+  const STATUS_IDLE = 0;
+  const STATUS_REQUEST = 1;
+  const STATUS_RESPONSE = 2;
+  const STATUS_ERROR = -1;
+  const SLOT_STATUS = 0;
+  const SLOT_OPCODE = 1;
+  const SLOT_DATA_LEN = 2;
+  const OPCODE_WRITE_PAGE = 2;
+  const OPCODE_WRITE_PAGES = 3;
+
+  beforeEach(() => {
+    backend = new MemoryBackend();
+    sab = new SharedArrayBuffer(DEFAULT_BUFFER_SIZE);
+    sabWorker = new SabWorker(sab, backend);
+  });
+
+  afterEach(() => {
+    sabWorker.stop();
+  });
+
+  /**
+   * Send a manually crafted request to the SabWorker and wait for a response.
+   * Returns the status and decoded response.
+   */
+  async function sendRawRequest(
+    opcode: number,
+    json: unknown,
+    binaryChunks?: Uint8Array[],
+  ): Promise<{ status: number; json: unknown }> {
+    const controlView = new Int32Array(sab, 0, 3);
+    const dataView = new DataView(sab);
+    const uint8View = new Uint8Array(sab);
+
+    // Encode the request
+    const dataLen = encodeMessage(dataView, uint8View, json, binaryChunks);
+    Atomics.store(controlView, SLOT_OPCODE, opcode);
+    Atomics.store(controlView, SLOT_DATA_LEN, dataLen);
+
+    // Start worker, signal request, and wait for response
+    const workerPromise = sabWorker.start();
+    Atomics.store(controlView, SLOT_STATUS, STATUS_REQUEST);
+    Atomics.notify(controlView, SLOT_STATUS);
+
+    // Poll for response (worker runs on same event loop via waitAsync)
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      const status = Atomics.load(controlView, SLOT_STATUS);
+      if (status === STATUS_RESPONSE || status === STATUS_ERROR) {
+        sabWorker.stop();
+        const responseLen = Atomics.load(controlView, SLOT_DATA_LEN);
+        const decoded = decodeMessage(dataView, uint8View, responseLen);
+        return { status, json: decoded.json };
+      }
+    }
+    sabWorker.stop();
+    throw new Error("Worker did not respond within timeout");
+  }
+
+  it("@fast WRITE_PAGE rejects dataLen exceeding binary length", async () => {
+    // Send a WRITE_PAGE where dataLen claims 99999 bytes but binary is only 8 bytes
+    const tinyBinary = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const result = await sendRawRequest(
+      OPCODE_WRITE_PAGE,
+      { path: "/test", pageIndex: 0, dataLen: 99999 },
+      [tinyBinary],
+    );
+
+    expect(result.status).toBe(STATUS_ERROR);
+    expect((result.json as { error: string }).error).toMatch(
+      /WRITE_PAGE.*dataLen 99999.*out of bounds/,
+    );
+  });
+
+  it("WRITE_PAGE rejects negative dataLen", async () => {
+    const data = new Uint8Array(PAGE_SIZE);
+    const result = await sendRawRequest(
+      OPCODE_WRITE_PAGE,
+      { path: "/test", pageIndex: 0, dataLen: -1 },
+      [data],
+    );
+
+    expect(result.status).toBe(STATUS_ERROR);
+    expect((result.json as { error: string }).error).toMatch(
+      /WRITE_PAGE.*dataLen -1.*out of bounds/,
+    );
+  });
+
+  it("WRITE_PAGES rejects entry with dataLen exceeding remaining binary", async () => {
+    // Two entries: first is valid (8 bytes), second claims 50000 but binary is exhausted
+    const chunk = new Uint8Array(8);
+    const result = await sendRawRequest(
+      OPCODE_WRITE_PAGES,
+      {
+        pages: [
+          { path: "/test", pageIndex: 0, dataLen: 8 },
+          { path: "/test", pageIndex: 1, dataLen: 50000 },
+        ],
+      },
+      [chunk],
+    );
+
+    expect(result.status).toBe(STATUS_ERROR);
+    expect((result.json as { error: string }).error).toMatch(
+      /WRITE_PAGES.*dataLen 50000.*exceeds binary length/,
+    );
+  });
+
+  it("WRITE_PAGE accepts valid dataLen within bounds", async () => {
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0x42;
+    const result = await sendRawRequest(
+      OPCODE_WRITE_PAGE,
+      { path: "/valid", pageIndex: 0, dataLen: PAGE_SIZE },
+      [data],
+    );
+
+    expect(result.status).toBe(STATUS_RESPONSE);
+
+    // Verify the write actually succeeded
+    const page = await backend.readPage("/valid", 0);
+    expect(page).not.toBeNull();
+    expect(page![0]).toBe(0x42);
+  });
+});
