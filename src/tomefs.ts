@@ -157,8 +157,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       pageCache.zeroTailAfterTruncate(path, newSize);
       pageCache.invalidatePagesFrom(path, neededPages);
       backend.deletePagesFrom(path, neededPages);
+    } else {
+      // Growing: materialize ALL new pages so they're flushed during syncfs.
+      // Without this, allocate → syncfs → remount loses the extended size
+      // because restoreTree uses countPages to verify metadata, and sparse
+      // files (where intermediate pages don't exist in the backend) cause a
+      // mismatch between countPages and the metadata page count.
+      const firstNewPage = node.usedBytes > 0 ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
+      const lastPageIdx = Math.ceil(newSize / PAGE_SIZE) - 1;
+      for (let pi = firstNewPage; pi <= lastPageIdx; pi++) {
+        pageCache.markPageDirty(path, pi);
+      }
     }
-    // Growing: pages are allocated on demand when written/read via getPage
 
     node.usedBytes = newSize;
   }

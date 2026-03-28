@@ -162,6 +162,7 @@ type Op =
   | { type: "seekFd"; fdId: number; offset: number; whence: number }
   | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "appendWrite"; path: string; data: Uint8Array }
+  | { type: "allocate"; path: string; offset: number; length: number }
   | { type: "checkpoint" };
 
 const DIR_NAMES = ["aa", "bb", "cc"];
@@ -203,6 +204,7 @@ function generateOp(rng: Rng, model: Model): Op {
     ["seekFd", activeFdIds.length > 0 ? 6 : 0],
     ["ftruncateFd", activeFdIds.length > 0 ? 5 : 0],
     ["appendWrite", allFiles.length > 0 ? 8 : 0],
+    ["allocate", allFiles.length > 0 ? 8 : 0],
     ["checkpoint", 8],
   ];
 
@@ -363,6 +365,20 @@ function generateOp(rng: Rng, model: Model): Op {
       return { type: "appendWrite", path, data: rng.bytes(rng.pick(sizeChoices)) };
     }
 
+    case "allocate": {
+      const path = rng.pick(allFiles);
+      const currentSize = model.files.get(path)!.content.length;
+      // Allocate beyond current size (may be page-aligned or not)
+      const sizeChoices = [
+        currentSize + PAGE_SIZE,
+        currentSize + 3 * PAGE_SIZE,
+        currentSize + PAGE_SIZE + 500,
+        Math.max(PAGE_SIZE, currentSize),
+      ];
+      const totalSize = rng.pick(sizeChoices);
+      return { type: "allocate", path, offset: 0, length: totalSize };
+    }
+
     case "checkpoint":
     default:
       return { type: "checkpoint" };
@@ -391,6 +407,8 @@ function formatOp(op: Op, index: number): string {
     case "seekFd": return `[${index}] seekFd(fd#${op.fdId}, ${op.offset}, whence=${op.whence})`;
     case "ftruncateFd": return `[${index}] ftruncateFd(fd#${op.fdId}, ${op.size})`;
     case "appendWrite": return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
+    case "allocate": return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
+
     case "checkpoint": return `[${index}] CHECKPOINT`;
   }
 }
@@ -584,6 +602,16 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       }
       break;
     }
+    case "allocate": {
+      const state = model.files.get(op.path)!;
+      const newSize = Math.max(state.content.length, op.offset + op.length);
+      if (newSize > state.content.length) {
+        const newContent = new Uint8Array(newSize);
+        newContent.set(state.content);
+        state.content = newContent;
+      }
+      break;
+    }
   }
 }
 
@@ -761,6 +789,12 @@ function execOp(harness: PersistenceHarness, op: Op): boolean {
       case "ftruncateFd": {
         const s = harness.liveStreams.get(op.fdId)!;
         FS.ftruncate(s.fd, op.size);
+        return true;
+      }
+      case "allocate": {
+        const s = FS.open(op.path, O.RDWR);
+        s.stream_ops.allocate(s, op.offset, op.length);
+        FS.close(s);
         return true;
       }
       default:

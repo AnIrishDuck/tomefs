@@ -564,6 +564,22 @@ export class PageCache {
     }
   }
 
+  /**
+   * Ensure a page exists in the cache and is marked dirty.
+   *
+   * Used when growing a file via allocate(). The extended region is
+   * zero-filled but pages aren't materialized — they're created on demand.
+   * Without marking the last page dirty, flushAll() won't write it to the
+   * backend, and restoreTree will conclude the metadata is stale.
+   */
+  async markPageDirty(path: string, pageIndex: number): Promise<void> {
+    const page = await this.getPage(path, pageIndex);
+    if (!page.dirty) {
+      page.dirty = true;
+      this.dirtyKeys.add(pageKeyStr(path, pageIndex));
+    }
+  }
+
   /** Check if a specific page is in the cache. */
   has(path: string, pageIndex: number): boolean {
     return this.cache.has(pageKeyStr(path, pageIndex));
