@@ -166,6 +166,8 @@ type Op =
   | { type: "seekFd"; fdId: number; offset: number; whence: number }
   | { type: "appendWrite"; path: string; data: Uint8Array }
   | { type: "ftruncateFd"; fdId: number; size: number }
+  | { type: "readdirOp"; path: string }
+  | { type: "statOp"; path: string }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -209,6 +211,8 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["seekFd", model.openFds.size > 0 ? 6 : 0],
     ["appendWrite", allFiles.length > 0 ? 8 : 0],
     ["ftruncateFd", model.openFds.size > 0 ? 5 : 0],
+    ["readdirOp", 8],
+    ["statOp", allFiles.length > 0 ? 6 : 0],
     ["syncfs", 3],
   ];
 
@@ -430,6 +434,19 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "ftruncateFd", fdId, size: rng.pick(sizeChoices) };
     }
 
+    case "readdirOp": {
+      // Exclude root — MEMFS root has system dirs (dev, home, proc, tmp)
+      // that don't exist in the tomefs mount.
+      const nonRootDirs = allContainerDirs.filter((d) => d !== "/");
+      if (nonRootDirs.length === 0) return { type: "mkdir", path: `/${rng.pick(DIR_NAMES)}` };
+      const dir = rng.pick(nonRootDirs);
+      return { type: "readdirOp", path: dir };
+    }
+
+    case "statOp": {
+      return { type: "statOp", path: rng.pick(allFiles) };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -615,6 +632,20 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         FS.ftruncate(stream.fd ?? stream, op.size);
         const fstatResult = FS.fstat(stream.fd ?? stream);
         return { error: null, size: fstatResult.size };
+      }
+
+      case "readdirOp": {
+        const entries = FS.readdir(op.path);
+        // Sort for deterministic comparison (Emscripten readdir order isn't guaranteed)
+        const sorted = [...entries].sort();
+        return { error: null, data: new TextEncoder().encode(sorted.join("\0")) };
+      }
+
+      case "statOp": {
+        const st = FS.stat(op.path);
+        return { error: null, size: st.size, data: new TextEncoder().encode(
+          `${st.size}:${st.mode}`,
+        )};
       }
 
       case "syncfs": {
@@ -805,6 +836,10 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
     case "ftruncateFd":
       return `[${index}] ftruncateFd(fdId=${op.fdId}, size=${op.size})`;
+    case "readdirOp":
+      return `[${index}] readdir(${op.path})`;
+    case "statOp":
+      return `[${index}] stat(${op.path})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -981,7 +1016,32 @@ function compareSymlinks(
   }
 }
 
-/** Compare all files and symlinks tracked by the model between two FSes. */
+/** Compare directory listings between two FSes. */
+function compareDirListings(
+  memFS: EmscriptenFS,
+  tomeFS: EmscriptenFS,
+  model: FSModel,
+  context: string,
+): void {
+  for (const dir of model.dirs) {
+    // Skip root — MEMFS root has system dirs that don't exist in tomefs mount
+    if (dir === "/") continue;
+    let memEntries: string[], tomeEntries: string[];
+    let memErr: string | null = null, tomeErr: string | null = null;
+
+    try { memEntries = [...memFS.readdir(dir)].sort(); } catch (e: any) { memErr = `errno:${e.errno}`; memEntries = []; }
+    try { tomeEntries = [...tomeFS.readdir(dir)].sort(); } catch (e: any) { tomeErr = `errno:${e.errno}`; tomeEntries = []; }
+
+    if (memErr || tomeErr) {
+      expect(tomeErr, `${context}: readdir error mismatch for ${dir}`).toBe(memErr);
+      continue;
+    }
+
+    expect(tomeEntries, `${context}: readdir mismatch for ${dir}`).toEqual(memEntries);
+  }
+}
+
+/** Compare all files, symlinks, and directory listings tracked by the model. */
 function compareAllFiles(
   memFS: EmscriptenFS,
   tomeFS: EmscriptenFS,
@@ -992,6 +1052,7 @@ function compareAllFiles(
     compareFileContents(memFS, tomeFS, path, context);
   }
   compareSymlinks(memFS, tomeFS, model, context);
+  compareDirListings(memFS, tomeFS, model, context);
 }
 
 // ---------------------------------------------------------------
@@ -1056,6 +1117,20 @@ async function runFuzzSequence(
       const memStat = memFS.stat(op.path);
       const tomeStat = tomeFS.stat(op.path);
       expect(tomeStat.mode, `${desc}: mode mismatch after chmod`).toBe(memStat.mode);
+    }
+
+    // For readdir, compare sorted directory listings
+    if (op.type === "readdirOp" && !memResult.error && memResult.data && tomeResult.data) {
+      const memStr = new TextDecoder().decode(memResult.data);
+      const tomeStr = new TextDecoder().decode(tomeResult.data);
+      expect(tomeStr, `${desc}: readdir mismatch`).toBe(memStr);
+    }
+
+    // For stat, compare size and mode
+    if (op.type === "statOp" && !memResult.error && memResult.data && tomeResult.data) {
+      const memStr = new TextDecoder().decode(memResult.data);
+      const tomeStr = new TextDecoder().decode(tomeResult.data);
+      expect(tomeStr, `${desc}: stat mismatch`).toBe(memStr);
     }
 
     // For read operations, compare returned data
