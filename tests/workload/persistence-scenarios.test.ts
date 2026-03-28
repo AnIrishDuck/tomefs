@@ -1,0 +1,685 @@
+/**
+ * Workload persistence scenario tests for tomefs.
+ *
+ * These bridge the gap between workload scenarios (realistic Postgres-like
+ * patterns, no persistence) and adversarial persistence tests (specific edge
+ * cases with syncfs→remount). Each scenario runs a holistic multi-operation
+ * workload with periodic "checkpoints" (syncfs→remount), verifying data
+ * integrity across persistence boundaries at multiple cache pressure levels.
+ *
+ * Ethos §6 (performance parity), §8 (workload scenarios), §9 (adversarial).
+ */
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+import { describe, it, expect, beforeEach } from "vitest";
+import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
+import { createTomeFS } from "../../src/tomefs.js";
+import { PAGE_SIZE } from "../../src/types.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const O = {
+  RDONLY: 0,
+  WRONLY: 1,
+  RDWR: 2,
+  CREAT: 64,
+  TRUNC: 512,
+  APPEND: 1024,
+} as const;
+
+const SEEK_SET = 0;
+const SEEK_END = 2;
+
+const MOUNT = "/tome";
+
+/** Cache sizes that force different eviction behaviors. */
+const CACHE_CONFIGS = {
+  tiny: 4,     // 32 KB — extreme eviction pressure
+  small: 16,   // 128 KB — moderate eviction
+  large: 4096, // 32 MB — working set fits
+} as const;
+
+type CacheSize = keyof typeof CACHE_CONFIGS;
+
+function encode(s: string): Uint8Array {
+  return new TextEncoder().encode(s);
+}
+
+function decode(buf: Uint8Array, length?: number): string {
+  return new TextDecoder().decode(
+    length !== undefined ? buf.subarray(0, length) : buf,
+  );
+}
+
+/** Fill a buffer with a deterministic pattern based on a seed byte. */
+function fillPattern(size: number, seed: number): Uint8Array {
+  const buf = new Uint8Array(size);
+  for (let i = 0; i < size; i++) {
+    buf[i] = (seed + i * 31) & 0xff;
+  }
+  return buf;
+}
+
+/** Verify a buffer matches the expected deterministic pattern. */
+function expectPattern(buf: Uint8Array, size: number, seed: number): void {
+  for (let i = 0; i < size; i++) {
+    if (buf[i] !== ((seed + i * 31) & 0xff)) {
+      throw new Error(
+        `Pattern mismatch at byte ${i}: expected ${(seed + i * 31) & 0xff}, got ${buf[i]} (seed=${seed})`,
+      );
+    }
+  }
+}
+
+async function mountTome(backend: SyncMemoryBackend, maxPages: number) {
+  const { default: createModule } = await import(
+    join(__dirname, "../harness/emscripten_fs.mjs")
+  );
+  const Module = await createModule();
+  const FS = Module.FS;
+  const tomefs = createTomeFS(FS, { backend, maxPages });
+  FS.mkdir(MOUNT);
+  FS.mount(tomefs, {}, MOUNT);
+  return { FS, tomefs };
+}
+
+function syncfs(FS: any, tomefs: any) {
+  tomefs.syncfs(FS.lookupPath(MOUNT).node.mount, false, (err: any) => {
+    if (err) throw err;
+  });
+}
+
+function syncAndUnmount(FS: any, tomefs: any) {
+  syncfs(FS, tomefs);
+  FS.unmount(MOUNT);
+}
+
+/** Helper: read an entire file into a buffer. */
+function readFile(FS: any, path: string, size: number): Uint8Array {
+  const buf = new Uint8Array(size);
+  const s = FS.open(path, O.RDONLY);
+  FS.read(s, buf, 0, size);
+  FS.close(s);
+  return buf;
+}
+
+/** Helper: write a buffer to a file (truncating). */
+function writeFile(FS: any, path: string, data: Uint8Array): void {
+  const s = FS.open(path, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+  FS.write(s, data, 0, data.length);
+  FS.close(s);
+}
+
+/** Helper: append data to a file. */
+function appendFile(FS: any, path: string, data: Uint8Array): void {
+  const s = FS.open(path, O.WRONLY | O.CREAT | O.APPEND, 0o666);
+  FS.write(s, data, 0, data.length);
+  FS.close(s);
+}
+
+// ---------------------------------------------------------------------------
+// Test runner: runs each scenario at multiple cache pressure levels
+// ---------------------------------------------------------------------------
+
+function describeWithPersistence(
+  name: string,
+  scenarioFn: (backend: SyncMemoryBackend, maxPages: number) => Promise<void>,
+) {
+  describe(name, () => {
+    for (const [sizeName, pages] of Object.entries(CACHE_CONFIGS)) {
+      it(`cache=${sizeName} (${pages} pages)`, async () => {
+        const backend = new SyncMemoryBackend();
+        await scenarioFn(backend, pages);
+      });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 1: WAL Rotation + Checkpoint
+//
+// Postgres writes sequentially to a WAL segment. When it fills up, the old
+// segment is renamed (archived) and a new segment is created. A checkpoint
+// (syncfs) persists state. After restart (remount), both the archived and
+// active WAL must be intact.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 1: WAL Rotation + Checkpoint @fast",
+  async (backend, maxPages) => {
+    const walDir = `${MOUNT}/pg_wal`;
+    const segmentSize = PAGE_SIZE * 3; // 24 KB per WAL segment
+
+    // --- Cycle 1: write first WAL segment, rotate, start second ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(walDir);
+
+    // Write WAL segment 000
+    const wal0Data = fillPattern(segmentSize, 0x10);
+    writeFile(FS1, `${walDir}/000000010000000000000000`, wal0Data);
+
+    // Rotate: archive the full segment, create new one
+    FS1.rename(
+      `${walDir}/000000010000000000000000`,
+      `${walDir}/000000010000000000000000.done`,
+    );
+    const wal1Partial = fillPattern(PAGE_SIZE, 0x20);
+    writeFile(FS1, `${walDir}/000000010000000000000001`, wal1Partial);
+
+    // Checkpoint
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: continue writing to active WAL, rotate again ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Verify archived WAL survived
+    const archived = readFile(
+      FS2,
+      `${walDir}/000000010000000000000000.done`,
+      segmentSize,
+    );
+    expectPattern(archived, segmentSize, 0x10);
+
+    // Verify partial active WAL survived
+    const active1 = readFile(
+      FS2,
+      `${walDir}/000000010000000000000001`,
+      PAGE_SIZE,
+    );
+    expectPattern(active1, PAGE_SIZE, 0x20);
+
+    // Extend active WAL to full size
+    const wal1Extend = fillPattern(PAGE_SIZE * 2, 0x21);
+    const s = FS2.open(`${walDir}/000000010000000000000001`, O.WRONLY);
+    FS2.llseek(s, 0, SEEK_END);
+    FS2.write(s, wal1Extend, 0, wal1Extend.length);
+    FS2.close(s);
+
+    // Rotate and start segment 002
+    FS2.rename(
+      `${walDir}/000000010000000000000001`,
+      `${walDir}/000000010000000000000001.done`,
+    );
+    const wal2Data = fillPattern(PAGE_SIZE * 2, 0x30);
+    writeFile(FS2, `${walDir}/000000010000000000000002`, wal2Data);
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify all segments survived ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+
+    // Archived segment 000
+    const seg0 = readFile(
+      FS3,
+      `${walDir}/000000010000000000000000.done`,
+      segmentSize,
+    );
+    expectPattern(seg0, segmentSize, 0x10);
+
+    // Archived segment 001: first page from cycle 1, next 2 pages from cycle 2
+    const seg1Stat = FS3.stat(`${walDir}/000000010000000000000001.done`);
+    expect(seg1Stat.size).toBe(segmentSize);
+    const seg1 = readFile(
+      FS3,
+      `${walDir}/000000010000000000000001.done`,
+      segmentSize,
+    );
+    expectPattern(seg1.subarray(0, PAGE_SIZE), PAGE_SIZE, 0x20);
+    expectPattern(seg1.subarray(PAGE_SIZE), PAGE_SIZE * 2, 0x21);
+
+    // Active segment 002
+    const seg2 = readFile(
+      FS3,
+      `${walDir}/000000010000000000000002`,
+      PAGE_SIZE * 2,
+    );
+    expectPattern(seg2, PAGE_SIZE * 2, 0x30);
+
+    // Directory listing
+    const entries = FS3.readdir(walDir).filter(
+      (e: string) => e !== "." && e !== "..",
+    );
+    expect(entries.sort()).toEqual([
+      "000000010000000000000000.done",
+      "000000010000000000000001.done",
+      "000000010000000000000002",
+    ]);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 2: Vacuum-like Rewrite
+//
+// Postgres VACUUM rewrites relation pages to reclaim dead tuple space.
+// It reads pages sequentially, rewrites a subset, then truncates the file
+// if the tail is empty. This tests the read-scan + selective-rewrite +
+// truncate pattern across persistence boundaries.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 2: Vacuum-like Rewrite",
+  async (backend, maxPages) => {
+    const tablePath = `${MOUNT}/base/16384/16385`;
+    const totalPages = 8;
+    const fileSize = totalPages * PAGE_SIZE;
+
+    // --- Cycle 1: create a table file with 8 pages ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(`${MOUNT}/base`);
+    FS1.mkdir(`${MOUNT}/base/16384`);
+
+    const s1 = FS1.open(tablePath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < totalPages; p++) {
+      const data = fillPattern(PAGE_SIZE, p);
+      FS1.write(s1, data, 0, PAGE_SIZE);
+    }
+    FS1.close(s1);
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: vacuum — scan all pages, rewrite even-numbered pages,
+    //     truncate last 2 pages (simulating dead space reclaim) ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    const s2 = FS2.open(tablePath, O.RDWR);
+    const readBuf = new Uint8Array(PAGE_SIZE);
+
+    // Sequential scan: read each page, rewrite even ones with new content
+    for (let p = 0; p < totalPages; p++) {
+      FS2.read(s2, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, p);
+
+      if (p % 2 === 0) {
+        // Rewrite this page (vacuum compaction)
+        const newData = fillPattern(PAGE_SIZE, p + 100);
+        FS2.write(s2, newData, 0, PAGE_SIZE, p * PAGE_SIZE);
+      }
+    }
+    FS2.close(s2);
+
+    // Truncate last 2 pages (dead tail reclaimed)
+    const newSize = (totalPages - 2) * PAGE_SIZE;
+    FS2.truncate(tablePath, newSize);
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify vacuum results ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+
+    const stat = FS3.stat(tablePath);
+    expect(stat.size).toBe(newSize);
+
+    const s3 = FS3.open(tablePath, O.RDONLY);
+    for (let p = 0; p < totalPages - 2; p++) {
+      FS3.read(s3, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      if (p % 2 === 0) {
+        // Rewritten pages
+        expectPattern(readBuf, PAGE_SIZE, p + 100);
+      } else {
+        // Untouched pages
+        expectPattern(readBuf, PAGE_SIZE, p);
+      }
+    }
+    FS3.close(s3);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 3: Multi-file Table Extension
+//
+// Postgres extends relation files one page at a time. With multiple tables
+// being written concurrently (e.g., INSERT into one while SELECT creates
+// temp results in another), the page cache faces interleaved extensions
+// across files. Tests that page-at-a-time growth across multiple files
+// persists correctly through checkpoints.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 3: Multi-file Table Extension @fast",
+  async (backend, maxPages) => {
+    const fileCount = 4;
+    const pagesPerFile = 5;
+    const files = Array.from(
+      { length: fileCount },
+      (_, i) => `${MOUNT}/rel_${i}`,
+    );
+
+    // --- Cycle 1: extend files one page at a time, interleaved ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+
+    // Open all files
+    const streams = files.map((f) =>
+      FS1.open(f, O.RDWR | O.CREAT, 0o666),
+    );
+
+    // Interleaved page-at-a-time extension: round-robin across files
+    for (let page = 0; page < pagesPerFile; page++) {
+      for (let f = 0; f < fileCount; f++) {
+        const seed = f * 100 + page;
+        const data = fillPattern(PAGE_SIZE, seed);
+        FS1.write(streams[f], data, 0, PAGE_SIZE);
+      }
+    }
+    for (const s of streams) FS1.close(s);
+
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: extend each file by 2 more pages, then checkpoint ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    for (let f = 0; f < fileCount; f++) {
+      const s = FS2.open(files[f], O.WRONLY | O.APPEND);
+      for (let page = pagesPerFile; page < pagesPerFile + 2; page++) {
+        const seed = f * 100 + page;
+        const data = fillPattern(PAGE_SIZE, seed);
+        FS2.write(s, data, 0, PAGE_SIZE);
+      }
+      FS2.close(s);
+    }
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify all data across all files ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+    const totalPages = pagesPerFile + 2;
+
+    for (let f = 0; f < fileCount; f++) {
+      const stat = FS3.stat(files[f]);
+      expect(stat.size).toBe(totalPages * PAGE_SIZE);
+
+      const s = FS3.open(files[f], O.RDONLY);
+      const readBuf = new Uint8Array(PAGE_SIZE);
+      for (let page = 0; page < totalPages; page++) {
+        const n = FS3.read(s, readBuf, 0, PAGE_SIZE);
+        expect(n).toBe(PAGE_SIZE);
+        const seed = f * 100 + page;
+        expectPattern(readBuf, PAGE_SIZE, seed);
+      }
+      FS3.close(s);
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 4: Mixed Checkpoint Workload (WAL + Heap + Temp)
+//
+// Realistic Postgres session: writes to a WAL file, updates heap pages
+// (random write), creates and destroys temp files, all with periodic
+// checkpoints. This is the most holistic scenario — combining sequential
+// writes, random writes, file lifecycle, and persistence into one test.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 4: Mixed Checkpoint Workload",
+  async (backend, maxPages) => {
+    const walPath = `${MOUNT}/pg_wal/wal_000`;
+    const heapPath = `${MOUNT}/base/heap_001`;
+    const heapPages = 6;
+
+    // --- Cycle 1: set up WAL + heap, first checkpoint ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(`${MOUNT}/pg_wal`);
+    FS1.mkdir(`${MOUNT}/base`);
+
+    // Create heap file with 6 pages
+    const heapS = FS1.open(heapPath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < heapPages; p++) {
+      FS1.write(heapS, fillPattern(PAGE_SIZE, p), 0, PAGE_SIZE);
+    }
+    FS1.close(heapS);
+
+    // Start WAL with 2 pages of records
+    writeFile(FS1, walPath, fillPattern(PAGE_SIZE * 2, 0xA0));
+
+    // Create a temp file (query result spool)
+    const tmpPath = `${MOUNT}/base/t_sort_001`;
+    writeFile(FS1, tmpPath, fillPattern(PAGE_SIZE, 0xF0));
+
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: random heap updates + WAL growth + temp file lifecycle ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Random heap page updates (simulate UPDATE statements)
+    const updatedPages = [1, 3, 5]; // specific pages to modify
+    const hs = FS2.open(heapPath, O.RDWR);
+    for (const p of updatedPages) {
+      const newData = fillPattern(PAGE_SIZE, p + 50);
+      FS2.write(hs, newData, 0, PAGE_SIZE, p * PAGE_SIZE);
+    }
+    FS2.close(hs);
+
+    // Extend WAL (more records)
+    appendFile(FS2, walPath, fillPattern(PAGE_SIZE, 0xA1));
+
+    // Destroy temp file from previous cycle
+    FS2.unlink(tmpPath);
+
+    // Create new temp file
+    const tmpPath2 = `${MOUNT}/base/t_hash_002`;
+    writeFile(FS2, tmpPath2, fillPattern(PAGE_SIZE * 2, 0xF1));
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: WAL rotation + more heap updates ---
+    const { FS: FS3, tomefs: t3 } = await mountTome(backend, maxPages);
+
+    // Rotate WAL
+    FS3.rename(walPath, `${walPath}.done`);
+    writeFile(FS3, walPath, fillPattern(PAGE_SIZE, 0xB0));
+
+    // Heap: extend by 1 page + update page 0
+    const hs3 = FS3.open(heapPath, O.RDWR);
+    FS3.write(hs3, fillPattern(PAGE_SIZE, 200), 0, PAGE_SIZE, 0);
+    FS3.llseek(hs3, 0, SEEK_END);
+    FS3.write(hs3, fillPattern(PAGE_SIZE, 206), 0, PAGE_SIZE);
+    FS3.close(hs3);
+
+    // Delete temp file from cycle 2
+    FS3.unlink(tmpPath2);
+
+    syncAndUnmount(FS3, t3);
+
+    // --- Cycle 4: verify all state ---
+    const { FS: FS4 } = await mountTome(backend, maxPages);
+
+    // Heap: 7 pages total (6 original + 1 extended)
+    const heapStat = FS4.stat(heapPath);
+    expect(heapStat.size).toBe((heapPages + 1) * PAGE_SIZE);
+
+    const hs4 = FS4.open(heapPath, O.RDONLY);
+    const readBuf = new Uint8Array(PAGE_SIZE);
+    for (let p = 0; p <= heapPages; p++) {
+      FS4.read(hs4, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      let expectedSeed: number;
+      if (p === 0) {
+        expectedSeed = 200; // Updated in cycle 3
+      } else if (updatedPages.includes(p)) {
+        expectedSeed = p + 50; // Updated in cycle 2
+      } else if (p === heapPages) {
+        expectedSeed = 206; // Extended in cycle 3
+      } else {
+        expectedSeed = p; // Original from cycle 1
+      }
+      expectPattern(readBuf, PAGE_SIZE, expectedSeed);
+    }
+    FS4.close(hs4);
+
+    // Archived WAL: 3 pages from cycles 1+2
+    const archivedWal = readFile(FS4, `${walPath}.done`, PAGE_SIZE * 3);
+    expectPattern(archivedWal.subarray(0, PAGE_SIZE * 2), PAGE_SIZE * 2, 0xA0);
+    expectPattern(
+      archivedWal.subarray(PAGE_SIZE * 2),
+      PAGE_SIZE,
+      0xA1,
+    );
+
+    // Active WAL: 1 page from cycle 3
+    const activeWal = readFile(FS4, walPath, PAGE_SIZE);
+    expectPattern(activeWal, PAGE_SIZE, 0xB0);
+
+    // Temp files should be gone
+    expect(() => FS4.stat(tmpPath)).toThrow();
+    expect(() => FS4.stat(tmpPath2)).toThrow();
+
+    // Only expected files remain
+    const baseEntries = FS4.readdir(`${MOUNT}/base`).filter(
+      (e: string) => e !== "." && e !== "..",
+    );
+    expect(baseEntries.sort()).toEqual(["heap_001"]);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 5: Index Rebuild with Persistence
+//
+// Postgres REINDEX reads all heap pages to extract index keys, builds the
+// new index in bulk (sequential writes), then drops the old index file.
+// This tests the full-scan-read + bulk-write + delete-old pattern.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 5: Index Rebuild",
+  async (backend, maxPages) => {
+    const heapPath = `${MOUNT}/heap`;
+    const oldIdxPath = `${MOUNT}/idx_old`;
+    const newIdxPath = `${MOUNT}/idx_new`;
+    const heapPages = 6;
+
+    // --- Cycle 1: create heap + old index ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+
+    const hs = FS1.open(heapPath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < heapPages; p++) {
+      FS1.write(hs, fillPattern(PAGE_SIZE, p), 0, PAGE_SIZE);
+    }
+    FS1.close(hs);
+
+    // Old index: 3 pages
+    writeFile(FS1, oldIdxPath, fillPattern(PAGE_SIZE * 3, 0x80));
+
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: REINDEX — scan heap, build new index, drop old ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Full heap scan (read all pages sequentially)
+    const scanStream = FS2.open(heapPath, O.RDONLY);
+    const scanBuf = new Uint8Array(PAGE_SIZE);
+    for (let p = 0; p < heapPages; p++) {
+      const n = FS2.read(scanStream, scanBuf, 0, PAGE_SIZE);
+      expect(n).toBe(PAGE_SIZE);
+      expectPattern(scanBuf, PAGE_SIZE, p);
+    }
+    FS2.close(scanStream);
+
+    // Build new index from scan results (4 pages — different from old)
+    const newIdxStream = FS2.open(newIdxPath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < 4; p++) {
+      FS2.write(newIdxStream, fillPattern(PAGE_SIZE, 0x90 + p), 0, PAGE_SIZE);
+    }
+    FS2.close(newIdxStream);
+
+    // Drop old index
+    FS2.unlink(oldIdxPath);
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+
+    // Heap unchanged
+    const verifyStream = FS3.open(heapPath, O.RDONLY);
+    for (let p = 0; p < heapPages; p++) {
+      FS3.read(verifyStream, scanBuf, 0, PAGE_SIZE);
+      expectPattern(scanBuf, PAGE_SIZE, p);
+    }
+    FS3.close(verifyStream);
+
+    // New index present with correct data
+    const idxStat = FS3.stat(newIdxPath);
+    expect(idxStat.size).toBe(PAGE_SIZE * 4);
+    const idxStream = FS3.open(newIdxPath, O.RDONLY);
+    for (let p = 0; p < 4; p++) {
+      FS3.read(idxStream, scanBuf, 0, PAGE_SIZE);
+      expectPattern(scanBuf, PAGE_SIZE, 0x90 + p);
+    }
+    FS3.close(idxStream);
+
+    // Old index gone
+    expect(() => FS3.stat(oldIdxPath)).toThrow();
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 6: Multi-cycle Incremental Updates
+//
+// Simulates a long-running application that accumulates state across many
+// checkpoint cycles. Each cycle modifies a subset of pages and adds new
+// files. Tests that incremental changes compose correctly across 5+ cycles.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 6: Multi-cycle Incremental Updates @fast",
+  async (backend, maxPages) => {
+    const cycles = 5;
+    const basePath = `${MOUNT}/data`;
+    // Track expected state: file -> { size, seeds: pageIndex -> seed }
+    const expectedState = new Map<
+      string,
+      { size: number; seeds: Map<number, number> }
+    >();
+
+    for (let cycle = 0; cycle < cycles; cycle++) {
+      const { FS, tomefs } = await mountTome(backend, maxPages);
+
+      if (cycle === 0) {
+        FS.mkdir(basePath);
+      }
+
+      // Each cycle: create one new file and modify one page in each existing file
+      const newFile = `${basePath}/file_${cycle}`;
+      const newFilePages = 3;
+      const ns = FS.open(newFile, O.RDWR | O.CREAT, 0o666);
+      const seeds = new Map<number, number>();
+      for (let p = 0; p < newFilePages; p++) {
+        const seed = cycle * 1000 + p;
+        FS.write(ns, fillPattern(PAGE_SIZE, seed), 0, PAGE_SIZE);
+        seeds.set(p, seed);
+      }
+      FS.close(ns);
+      expectedState.set(newFile, {
+        size: newFilePages * PAGE_SIZE,
+        seeds,
+      });
+
+      // Modify page 1 of each existing file (except the one just created)
+      for (const [path, state] of expectedState) {
+        if (path === newFile) continue;
+        const modSeed = cycle * 1000 + 900 + expectedState.size;
+        const ms = FS.open(path, O.RDWR);
+        FS.write(ms, fillPattern(PAGE_SIZE, modSeed), 0, PAGE_SIZE, PAGE_SIZE);
+        FS.close(ms);
+        state.seeds.set(1, modSeed);
+      }
+
+      syncAndUnmount(FS, tomefs);
+    }
+
+    // Final verification cycle
+    const { FS } = await mountTome(backend, maxPages);
+    const readBuf = new Uint8Array(PAGE_SIZE);
+
+    for (const [path, state] of expectedState) {
+      const stat = FS.stat(path);
+      expect(stat.size).toBe(state.size);
+
+      const s = FS.open(path, O.RDONLY);
+      const pageCount = state.size / PAGE_SIZE;
+      for (let p = 0; p < pageCount; p++) {
+        FS.read(s, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+        expectPattern(readBuf, PAGE_SIZE, state.seeds.get(p)!);
+      }
+      FS.close(s);
+    }
+  },
+);
