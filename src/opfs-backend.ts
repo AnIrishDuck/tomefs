@@ -190,6 +190,24 @@ export class OpfsBackend implements StorageBackend {
     }
   }
 
+  async countPages(path: string): Promise<number> {
+    await this.init();
+    const encoded = encodePath(path);
+    try {
+      const fileDir = (await this.pagesDir!.getDirectoryHandle(
+        encoded,
+      )) as IterableDirectoryHandle;
+      let count = 0;
+      for await (const _ of fileDir.keys()) {
+        count++;
+      }
+      return count;
+    } catch (err) {
+      if (isNotFoundError(err)) return 0;
+      throw err;
+    }
+  }
+
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     await this.init();
     const oldEncoded = encodePath(oldPath);

@@ -34,6 +34,9 @@ export interface StorageBackend {
   /** Rename all pages from one path to another. */
   renameFile(oldPath: string, newPath: string): Promise<void>;
 
+  /** Count the number of pages stored for a file. Returns 0 if no pages exist. */
+  countPages(path: string): Promise<number>;
+
   /** Read file metadata. Returns null if the file doesn't exist. */
   readMeta(path: string): Promise<FileMeta | null>;
 

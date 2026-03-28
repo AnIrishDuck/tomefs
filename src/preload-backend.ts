@@ -219,6 +219,12 @@ export class PreloadBackend implements SyncStorageBackend {
     this.truncations.delete(path);
   }
 
+  countPages(path: string): number {
+    this.assertInitialized();
+    const keys = this.filePageKeys.get(path);
+    return keys ? keys.size : 0;
+  }
+
   renameFile(oldPath: string, newPath: string): void {
     this.assertInitialized();
     const oldKeys = this.filePageKeys.get(oldPath);
