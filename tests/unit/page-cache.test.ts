@@ -395,6 +395,231 @@ describe("PageCache", () => {
     });
   });
 
+  describe("deleteFile", () => {
+    it("removes pages from cache and backend", async () => {
+      await cache.write("/file", new Uint8Array([1, 2, 3]), 0, 3, 0, 0);
+      await cache.flushFile("/file");
+
+      await cache.deleteFile("/file");
+      expect(cache.has("/file", 0)).toBe(false);
+      expect(await backend.readPage("/file", 0)).toBeNull();
+    });
+
+    it("removes dirty pages without flushing", async () => {
+      await cache.write("/file", new Uint8Array([1, 2, 3]), 0, 3, 0, 0);
+      expect(cache.isDirty("/file", 0)).toBe(true);
+
+      await cache.deleteFile("/file");
+      expect(cache.has("/file", 0)).toBe(false);
+      expect(cache.dirtyCount).toBe(0);
+      // Should NOT have flushed dirty data to backend
+      expect(await backend.readPage("/file", 0)).toBeNull();
+    });
+
+    it("does not affect other files", async () => {
+      await cache.write("/a", new Uint8Array([1]), 0, 1, 0, 0);
+      await cache.write("/b", new Uint8Array([2]), 0, 1, 0, 0);
+
+      await cache.deleteFile("/a");
+      expect(cache.has("/a", 0)).toBe(false);
+      expect(cache.has("/b", 0)).toBe(true);
+      expect(cache.isDirty("/b", 0)).toBe(true);
+    });
+  });
+
+  describe("renameFile", () => {
+    it("@fast moves pages from old path to new path", async () => {
+      const data = new Uint8Array([10, 20, 30]);
+      await cache.write("/old", data, 0, 3, 0, 0);
+
+      await cache.renameFile("/old", "/new");
+
+      // Old path should be gone
+      expect(cache.has("/old", 0)).toBe(false);
+      expect(await backend.readPage("/old", 0)).toBeNull();
+
+      // New path should have the data
+      const buf = new Uint8Array(3);
+      await cache.read("/new", buf, 0, 3, 0, 3);
+      expect(buf).toEqual(data);
+    });
+
+    it("rename preserves data that was evicted to backend", async () => {
+      const small = new PageCache(backend, 1);
+      // Write page 0, then evict it
+      const data = new Uint8Array([42]);
+      await small.write("/old", data, 0, 1, 0, 0);
+      await small.getPage("/other", 0); // evict /old page 0
+
+      await small.renameFile("/old", "/new");
+
+      const buf = new Uint8Array(1);
+      await small.read("/new", buf, 0, 1, 0, 1);
+      expect(buf[0]).toBe(42);
+    });
+
+    it("flushes dirty pages before renaming", async () => {
+      const data = fillBuf(5, 0xab);
+      await cache.write("/old", data, 0, 5, 0, 0);
+      expect(cache.isDirty("/old", 0)).toBe(true);
+
+      await cache.renameFile("/old", "/new");
+
+      // After rename, pages under new path should not be dirty
+      // (they were flushed before the backend rename)
+      expect(cache.isDirty("/new", 0)).toBe(false);
+
+      // Backend should have data under new path
+      const stored = await backend.readPage("/new", 0);
+      expect(stored).not.toBeNull();
+      expect(stored![0]).toBe(0xab);
+    });
+  });
+
+  describe("batch readPages optimization", () => {
+    it("uses readPages for multi-page reads with multiple cache misses", async () => {
+      // Write 4 pages to backend directly
+      for (let i = 0; i < 4; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data[0] = i + 1;
+        await backend.writePage("/file", i, data);
+      }
+
+      // Track readPages calls
+      let readPagesCallCount = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, pageIndices: number[]) => {
+        readPagesCallCount++;
+        return origReadPages(path, pageIndices);
+      };
+
+      const c = new PageCache(backend, 16);
+      const buf = new Uint8Array(PAGE_SIZE * 4);
+      await c.read("/file", buf, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+
+      // Should have used readPages (1 batch call instead of 4 individual reads)
+      expect(readPagesCallCount).toBe(1);
+      // Verify data integrity
+      expect(buf[0]).toBe(1);
+      expect(buf[PAGE_SIZE]).toBe(2);
+      expect(buf[PAGE_SIZE * 2]).toBe(3);
+      expect(buf[PAGE_SIZE * 3]).toBe(4);
+    });
+
+    it("skips batch for single-page reads", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 42;
+      await backend.writePage("/file", 0, data);
+
+      let readPagesCallCount = 0;
+      const origReadPages = backend.readPages.bind(backend);
+      backend.readPages = async (path: string, pageIndices: number[]) => {
+        readPagesCallCount++;
+        return origReadPages(path, pageIndices);
+      };
+
+      const c = new PageCache(backend, 16);
+      const buf = new Uint8Array(100);
+      await c.read("/file", buf, 0, 100, 0, PAGE_SIZE);
+
+      // Single-page read should NOT use readPages
+      expect(readPagesCallCount).toBe(0);
+      expect(buf[0]).toBe(42);
+    });
+
+    it("handles mix of existing and non-existing pages in batch", async () => {
+      // Only write pages 0 and 2; page 1 doesn't exist in backend
+      const d0 = new Uint8Array(PAGE_SIZE);
+      d0[0] = 0xaa;
+      await backend.writePage("/file", 0, d0);
+      const d2 = new Uint8Array(PAGE_SIZE);
+      d2[0] = 0xcc;
+      await backend.writePage("/file", 2, d2);
+
+      const c = new PageCache(backend, 16);
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      await c.read("/file", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
+
+      expect(buf[0]).toBe(0xaa);
+      expect(buf[PAGE_SIZE]).toBe(0); // non-existent page → zeros
+      expect(buf[PAGE_SIZE * 2]).toBe(0xcc);
+    });
+  });
+
+  describe("batch eviction optimization", () => {
+    it("batches dirty eviction flushes during multi-page read", async () => {
+      const small = new PageCache(backend, 4);
+
+      // Fill cache with 4 dirty pages
+      const fillData = new Uint8Array(PAGE_SIZE * 4);
+      fillData.fill(0xab);
+      await small.write("/a", fillData, 0, PAGE_SIZE * 4, 0, 0);
+
+      // Write 4 pages of file B directly to backend (bypass cache)
+      for (let i = 0; i < 4; i++) {
+        const d = new Uint8Array(PAGE_SIZE);
+        d[0] = i + 1;
+        await backend.writePage("/b", i, d);
+      }
+
+      // Track backend calls — capture originals before patching to avoid
+      // double-counting (MemoryBackend.writePages delegates to this.writePage)
+      let writePagesCount = 0;
+      let writePageCount = 0;
+      const origWritePage = backend.writePage.bind(backend);
+      backend.writePage = async (path: string, pageIndex: number, data: Uint8Array) => {
+        writePageCount++;
+        return origWritePage(path, pageIndex, data);
+      };
+      // Capture writePages AFTER patching writePage so the bound version
+      // uses our counting writePage internally (giving us total page count).
+      // We track direct writePages calls separately.
+      const origWritePages = backend.writePages.bind(backend);
+      backend.writePages = async (pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) => {
+        writePagesCount++;
+        return origWritePages(pages);
+      };
+
+      // Read all 4 pages of file B — evicts all of A's dirty pages
+      const buf = new Uint8Array(PAGE_SIZE * 4);
+      await small.read("/b", buf, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+
+      // Eviction should be batched: writePages called once (not 4 individual writePage calls)
+      expect(writePagesCount).toBe(1);
+      // writePage count includes calls from within writePages — the point is
+      // that batchEvict used writePages (1 call) rather than evictOne (4 calls)
+      // Total pages flushed should be 4 either way
+      expect(writePageCount).toBe(4);
+
+      // Verify read data
+      expect(buf[0]).toBe(1);
+      expect(buf[PAGE_SIZE]).toBe(2);
+    });
+
+    it("data survives batch eviction and re-read from backend", async () => {
+      const small = new PageCache(backend, 4);
+
+      // Write distinctive data to 8 pages across 2 files
+      const dataA = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < dataA.length; i++) dataA[i] = (i * 11) & 0xff;
+      await small.write("/a", dataA, 0, PAGE_SIZE * 4, 0, 0);
+
+      const dataB = new Uint8Array(PAGE_SIZE * 4);
+      for (let i = 0; i < dataB.length; i++) dataB[i] = (i * 13) & 0xff;
+      await small.write("/b", dataB, 0, PAGE_SIZE * 4, 0, 0);
+
+      // File A was evicted when B was written. Read it back from backend.
+      const bufA = new Uint8Array(PAGE_SIZE * 4);
+      await small.read("/a", bufA, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+      expect(bufA).toEqual(dataA);
+
+      // File B was evicted when A was re-read. Read it back too.
+      const bufB = new Uint8Array(PAGE_SIZE * 4);
+      await small.read("/b", bufB, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+      expect(bufB).toEqual(dataB);
+    });
+  });
+
   describe("read-write round-trip", () => {
     it("@fast writes then reads same data", async () => {
       const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
