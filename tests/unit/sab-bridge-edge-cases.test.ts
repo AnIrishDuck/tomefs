@@ -578,6 +578,138 @@ describe("SAB bridge: backend error propagation", () => {
   });
 });
 
+describe("SAB bridge: automatic batch chunking", () => {
+  let backend: MemoryBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    backend = new MemoryBackend();
+    // Use the default 1MB buffer — chunking is needed for batches >~124 pages
+    sab = SabClient.createBuffer();
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 0 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("@fast writePages with 150 pages succeeds via auto-chunking on default buffer", async () => {
+    // 150 pages × 8KB = 1.2MB — exceeds the 1MB default buffer.
+    // Without chunking, this would throw "SAB buffer overflow".
+    const pages = Array.from({ length: 150 }, (_, i) => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = i & 0xff;
+      data[PAGE_SIZE - 1] = ((i * 37) + 1) & 0xff;
+      return { path: "/chunked", pageIndex: i, data };
+    });
+
+    await callClient(clientWorker, "writePages", [pages]);
+
+    // Verify all pages were written correctly
+    for (const idx of [0, 49, 99, 123, 124, 125, 149]) {
+      const result = await callClient(clientWorker, "readPage", ["/chunked", idx]);
+      const buf = toUint8Array(result);
+      expect(buf[0]).toBe(idx & 0xff);
+      expect(buf[PAGE_SIZE - 1]).toBe(((idx * 37) + 1) & 0xff);
+    }
+  });
+
+  it("@fast readPages with 150 pages succeeds via auto-chunking on default buffer", async () => {
+    // First write 150 pages individually (each fits in the buffer)
+    for (let i = 0; i < 150; i++) {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = i & 0xff;
+      data[1] = ((i * 13) + 5) & 0xff;
+      await callClient(clientWorker, "writePage", [`/readchunk`, i, data]);
+    }
+
+    // Now read all 150 at once — response would be 1.2MB, exceeding 1MB buffer.
+    // Without chunking, this would throw "SAB buffer overflow".
+    const indices = Array.from({ length: 150 }, (_, i) => i);
+    const result = (await callClient(clientWorker, "readPages", [
+      "/readchunk",
+      indices,
+    ])) as Array<unknown>;
+
+    expect(result.length).toBe(150);
+    for (const idx of [0, 49, 99, 123, 124, 125, 149]) {
+      const buf = toUint8Array(result[idx]);
+      expect(buf[0]).toBe(idx & 0xff);
+      expect(buf[1]).toBe(((idx * 13) + 5) & 0xff);
+    }
+  });
+
+  it("writePages with 300 pages across multiple files succeeds", async () => {
+    // 300 pages × 8KB = 2.4MB — requires at least 3 chunks on 1MB buffer.
+    const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
+    for (let i = 0; i < 300; i++) {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = i & 0xff;
+      data[1] = (i >> 8) & 0xff;
+      const file = `/multi${Math.floor(i / 100)}`;
+      pages.push({ path: file, pageIndex: i % 100, data });
+    }
+
+    await callClient(clientWorker, "writePages", [pages]);
+
+    // Spot-check pages across different files and chunk boundaries
+    for (const [file, pi, expectedByte0, expectedByte1] of [
+      ["/multi0", 0, 0, 0],
+      ["/multi0", 99, 99, 0],
+      ["/multi1", 0, 100, 0],
+      ["/multi1", 50, 150, 0],
+      ["/multi2", 0, 200, 0],
+      ["/multi2", 99, 299 & 0xff, (299 >> 8) & 0xff],
+    ] as Array<[string, number, number, number]>) {
+      const result = await callClient(clientWorker, "readPage", [file, pi]);
+      const buf = toUint8Array(result);
+      expect(buf[0]).toBe(expectedByte0);
+      expect(buf[1]).toBe(expectedByte1);
+    }
+  });
+
+  it("writePages and readPages below chunk threshold use single call", async () => {
+    // 10 pages — well within buffer, should NOT be chunked
+    const pages = Array.from({ length: 10 }, (_, i) => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = (i + 42) & 0xff;
+      return { path: "/small", pageIndex: i, data };
+    });
+
+    await callClient(clientWorker, "writePages", [pages]);
+
+    const indices = Array.from({ length: 10 }, (_, i) => i);
+    const result = (await callClient(clientWorker, "readPages", [
+      "/small",
+      indices,
+    ])) as Array<unknown>;
+
+    expect(result.length).toBe(10);
+    for (let i = 0; i < 10; i++) {
+      expect(toUint8Array(result[i])[0]).toBe((i + 42) & 0xff);
+    }
+  });
+
+  it("empty writePages and readPages are no-ops", async () => {
+    await callClient(clientWorker, "writePages", [[]]);
+    const result = await callClient(clientWorker, "readPages", ["/empty", []]);
+    expect(result).toEqual([]);
+  });
+});
+
 describe("SAB bridge: large batch operations", () => {
   let backend: MemoryBackend;
   let sabWorker: SabWorker;

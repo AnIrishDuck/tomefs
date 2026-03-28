@@ -9,6 +9,7 @@
  * Emscripten FS layer can call from its synchronous C-style callbacks.
  */
 
+import { PAGE_SIZE } from "./types.js";
 import type { FileMeta } from "./types.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
 import {
@@ -20,6 +21,7 @@ import {
   SLOT_STATUS,
   SLOT_OPCODE,
   SLOT_DATA_LEN,
+  CONTROL_BYTES,
   DEFAULT_BUFFER_SIZE,
   encodeMessage,
   decodeMessage,
@@ -46,12 +48,30 @@ export class SabClient implements SyncStorageBackend {
   private readonly uint8View: Uint8Array;
   private readonly timeout: number;
 
+  /**
+   * Maximum pages per batch call. Computed from buffer size to prevent
+   * overflow when flushAll/flushFile sends large dirty page batches.
+   *
+   * Each page in a writePages request needs PAGE_SIZE bytes of binary data
+   * plus ~256 bytes of JSON metadata. Each page in a readPages response
+   * needs PAGE_SIZE bytes plus JSON overhead for the sizes array.
+   * We use a conservative estimate and leave 4 KB headroom for the
+   * enclosing JSON wrapper.
+   */
+  private readonly maxBatchPages: number;
+
   constructor(sab: SharedArrayBuffer, options?: SabClientOptions) {
     this.sab = sab;
     this.controlView = new Int32Array(sab, 0, 3);
     this.dataView = new DataView(sab);
     this.uint8View = new Uint8Array(sab);
     this.timeout = options?.timeout ?? 0;
+
+    const dataRegionSize = sab.byteLength - CONTROL_BYTES;
+    this.maxBatchPages = Math.max(
+      1,
+      Math.floor((dataRegionSize - 4096) / (PAGE_SIZE + 256)),
+    );
   }
 
   /** Create a SharedArrayBuffer for use with this client and a SabWorker. */
@@ -68,6 +88,26 @@ export class SabClient implements SyncStorageBackend {
 
   readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
     if (pageIndices.length === 0) return [];
+
+    // If the batch fits in a single call, use the fast path.
+    // Otherwise chunk to avoid overflowing the SAB response buffer
+    // (the worker encodes all page data into the shared buffer).
+    if (pageIndices.length <= this.maxBatchPages) {
+      return this.readPagesChunk(path, pageIndices);
+    }
+
+    const results: Array<Uint8Array | null> = [];
+    for (let i = 0; i < pageIndices.length; i += this.maxBatchPages) {
+      const chunk = pageIndices.slice(i, i + this.maxBatchPages);
+      results.push(...this.readPagesChunk(path, chunk));
+    }
+    return results;
+  }
+
+  private readPagesChunk(
+    path: string,
+    pageIndices: number[],
+  ): Array<Uint8Array | null> {
     const { json, binary } = this.call(OpCode.READ_PAGES, {
       path,
       pageIndices,
@@ -105,6 +145,23 @@ export class SabClient implements SyncStorageBackend {
   }
 
   writePages(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+  ): void {
+    if (pages.length === 0) return;
+
+    // If the batch fits in a single call, use the fast path.
+    // Otherwise chunk to avoid overflowing the SAB request buffer.
+    if (pages.length <= this.maxBatchPages) {
+      this.writePagesChunk(pages);
+      return;
+    }
+
+    for (let i = 0; i < pages.length; i += this.maxBatchPages) {
+      this.writePagesChunk(pages.slice(i, i + this.maxBatchPages));
+    }
+  }
+
+  private writePagesChunk(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
   ): void {
     const meta = pages.map((p) => ({
