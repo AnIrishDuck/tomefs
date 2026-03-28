@@ -294,6 +294,26 @@ describe("IdbBackend", () => {
       expect((await backend.readPage("/new", 0))![0]).toBe(0x22);
       expect(await backend.readPage("/old", 0)).toBeNull();
     });
+
+    it("cleans up extra destination pages when source has fewer pages", async () => {
+      // Destination has 4 pages, source has 2 — extra pages must not survive.
+      for (let i = 0; i < 4; i++) {
+        await backend.writePage("/dest", i, filledPage(0xdd));
+      }
+      await backend.writePage("/src", 0, filledPage(0xaa));
+      await backend.writePage("/src", 1, filledPage(0xbb));
+
+      await backend.renameFile("/src", "/dest");
+
+      expect(await backend.readPage("/dest", 0)).toEqual(filledPage(0xaa));
+      expect(await backend.readPage("/dest", 1)).toEqual(filledPage(0xbb));
+      // Orphan pages from old destination must be gone
+      expect(await backend.readPage("/dest", 2)).toBeNull();
+      expect(await backend.readPage("/dest", 3)).toBeNull();
+      // Source is gone
+      expect(await backend.readPage("/src", 0)).toBeNull();
+      expect(await backend.readPage("/src", 1)).toBeNull();
+    });
   });
 
   // -------------------------------------------------------------------
@@ -341,6 +361,51 @@ describe("IdbBackend", () => {
 
     it("deleteMeta on non-existent file is a no-op", async () => {
       await backend.deleteMeta("/nonexistent");
+    });
+
+    it("writeMetas batch writes multiple metadata entries", async () => {
+      const meta1 = { size: 100, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      const meta2 = { size: 200, mode: 0o100755, ctime: 3000, mtime: 4000 };
+
+      await backend.writeMetas([
+        { path: "/a", meta: meta1 },
+        { path: "/b", meta: meta2 },
+      ]);
+
+      expect(await backend.readMeta("/a")).toEqual(meta1);
+      expect(await backend.readMeta("/b")).toEqual(meta2);
+    });
+
+    it("writeMetas with empty array is a no-op", async () => {
+      await backend.writeMetas([]);
+    });
+
+    it("writeMetas overwrites existing metadata", async () => {
+      await backend.writeMeta("/a", meta);
+      const updated = { ...meta, size: 99999, mtime: 5000 };
+      await backend.writeMetas([{ path: "/a", meta: updated }]);
+
+      expect(await backend.readMeta("/a")).toEqual(updated);
+    });
+
+    it("deleteMetas removes multiple metadata entries", async () => {
+      await backend.writeMeta("/a", meta);
+      await backend.writeMeta("/b", meta);
+      await backend.writeMeta("/c", meta);
+
+      await backend.deleteMetas(["/a", "/b"]);
+
+      expect(await backend.readMeta("/a")).toBeNull();
+      expect(await backend.readMeta("/b")).toBeNull();
+      expect(await backend.readMeta("/c")).toEqual(meta);
+    });
+
+    it("deleteMetas with empty array is a no-op", async () => {
+      await backend.deleteMetas([]);
+    });
+
+    it("deleteMetas on non-existent paths is a no-op", async () => {
+      await backend.deleteMetas(["/nonexistent1", "/nonexistent2"]);
     });
 
     it("metadata and pages are independent", async () => {

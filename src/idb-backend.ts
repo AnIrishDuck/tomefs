@@ -214,10 +214,23 @@ export class IdbBackend implements StorageBackend {
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     const db = await this.getDb();
 
-    // Single transaction: cursor over old pages, write under new key, delete old.
+    // Single transaction: delete destination pages, then cursor-copy old → new.
+    // Clearing the destination first prevents orphan pages when the destination
+    // has more pages than the source (mirrors OpfsBackend behavior).
     return new Promise((resolve, reject) => {
       const tx = db.transaction(PAGES_STORE, "readwrite");
       const store = tx.objectStore(PAGES_STORE);
+
+      // Delete any pre-existing pages at the destination path.
+      const destRange = IDBKeyRange.bound(
+        [newPath, 0],
+        [newPath, ""],
+        false,
+        true,
+      );
+      store.delete(destRange);
+
+      // Cursor over old pages: copy to new key, delete old.
       const range = IDBKeyRange.bound([oldPath, 0], [oldPath, ""], false, true);
       const request = store.openCursor(range);
 
