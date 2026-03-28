@@ -74,6 +74,17 @@ interface FileState {
   mode: number;
 }
 
+interface OpenFdState {
+  /** Unique slot id for this fd. */
+  id: number;
+  /** Current file path (updated on rename). */
+  path: string;
+  /** Current write position in the file. */
+  position: number;
+  /** True if the file was unlinked while fd was open. */
+  orphaned: boolean;
+}
+
 interface Model {
   files: Map<string, FileState>;
   dirs: Set<string>;
@@ -81,6 +92,10 @@ interface Model {
   dirModes: Map<string, number>;
   /** Symlinks: path → target string. */
   symlinks: Map<string, string>;
+  /** Open file descriptors: slot id → fd state. */
+  openFds: Map<number, OpenFdState>;
+  /** Counter for unique fd slot ids. */
+  nextFdId: number;
 }
 
 /** Default file mode after creation (Emscripten default umask = 0). */
@@ -89,7 +104,7 @@ const DEFAULT_FILE_MODE = 0o666;
 const DEFAULT_DIR_MODE = 0o777;
 
 function newModel(): Model {
-  return { files: new Map(), dirs: new Set(["/"]), dirModes: new Map(), symlinks: new Map() };
+  return { files: new Map(), dirs: new Set(["/"]), dirModes: new Map(), symlinks: new Map(), openFds: new Map(), nextFdId: 0 };
 }
 
 function filesInDir(model: Model, dir: string): string[] {
@@ -139,6 +154,10 @@ type Op =
   | { type: "unlinkSymlink"; path: string }
   | { type: "chmodFile"; path: string; mode: number }
   | { type: "chmodDir"; path: string; mode: number }
+  | { type: "openFd"; path: string; fdId: number }
+  | { type: "writeFd"; fdId: number; data: Uint8Array }
+  | { type: "closeFd"; fdId: number }
+  | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "checkpoint" };
 
 const DIR_NAMES = ["aa", "bb", "cc"];
@@ -150,6 +169,14 @@ function generateOp(rng: Rng, model: Model): Op {
   const allDirs = [...model.dirs].filter((d) => d !== "/");
   const allContainerDirs = [...model.dirs];
   const allSymlinks = [...model.symlinks.keys()];
+  // Files without an open fd (safe to open a new fd on)
+  const unopenedFiles = allFiles.filter(
+    (p) => ![...model.openFds.values()].some((fd) => fd.path === p && !fd.orphaned),
+  );
+  const openFdIds = [...model.openFds.keys()];
+  // Non-orphaned fds (for write/ftruncate — orphaned fds can't be safely written through
+  // because the model tracks content by path, and orphaned paths are gone from model.files)
+  const activeFdIds = openFdIds.filter((id) => !model.openFds.get(id)!.orphaned);
 
   const weights: Array<[string, number]> = [
     ["createFile", 20],
@@ -164,7 +191,11 @@ function generateOp(rng: Rng, model: Model): Op {
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
     ["chmodFile", allFiles.length > 0 ? 6 : 0],
     ["chmodDir", allDirs.length > 0 ? 4 : 0],
-    ["checkpoint", 8], // ~8% chance of checkpoint
+    ["openFd", unopenedFiles.length > 0 && model.openFds.size < 4 ? 10 : 0],
+    ["writeFd", activeFdIds.length > 0 ? 12 : 0],
+    ["closeFd", openFdIds.length > 0 ? 6 : 0],
+    ["ftruncateFd", activeFdIds.length > 0 ? 5 : 0],
+    ["checkpoint", 8],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -259,6 +290,30 @@ function generateOp(rng: Rng, model: Model): Op {
       return { type: "chmodDir", path, mode: rng.pick(modeChoices) };
     }
 
+    case "openFd": {
+      const path = rng.pick(unopenedFiles);
+      const fdId = model.nextFdId;
+      return { type: "openFd", path, fdId };
+    }
+
+    case "writeFd": {
+      const fdId = rng.pick(activeFdIds);
+      const sizeChoices = [1, 50, PAGE_SIZE, PAGE_SIZE + 1];
+      return { type: "writeFd", fdId, data: rng.bytes(rng.pick(sizeChoices)) };
+    }
+
+    case "closeFd":
+      return { type: "closeFd", fdId: rng.pick(openFdIds) };
+
+    case "ftruncateFd": {
+      const fdId = rng.pick(activeFdIds);
+      const fd = model.openFds.get(fdId)!;
+      const fileState = model.files.get(fd.path);
+      const currentSize = fileState ? fileState.content.length : 0;
+      const sizeChoices = [0, Math.max(0, currentSize - PAGE_SIZE), currentSize, currentSize + PAGE_SIZE];
+      return { type: "ftruncateFd", fdId, size: rng.pick(sizeChoices) };
+    }
+
     case "checkpoint":
     default:
       return { type: "checkpoint" };
@@ -279,6 +334,10 @@ function formatOp(op: Op, index: number): string {
     case "unlinkSymlink": return `[${index}] unlinkSymlink(${op.path})`;
     case "chmodFile": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
     case "chmodDir": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
+    case "openFd": return `[${index}] openFd(${op.path}, fd#${op.fdId})`;
+    case "writeFd": return `[${index}] writeFd(fd#${op.fdId}, ${op.data.length}B)`;
+    case "closeFd": return `[${index}] closeFd(fd#${op.fdId})`;
+    case "ftruncateFd": return `[${index}] ftruncateFd(fd#${op.fdId}, ${op.size})`;
     case "checkpoint": return `[${index}] CHECKPOINT`;
   }
 }
@@ -318,12 +377,25 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
     case "renameFile": {
       const state = model.files.get(op.oldPath)!;
       model.files.delete(op.oldPath);
+      // If destination had an open fd, mark it orphaned (overwritten file)
+      for (const fd of model.openFds.values()) {
+        if (fd.path === op.newPath && !fd.orphaned) fd.orphaned = true;
+      }
       model.files.set(op.newPath, state);
+      // Update any open fds that referenced the old path
+      for (const fd of model.openFds.values()) {
+        if (fd.path === op.oldPath) fd.path = op.newPath;
+      }
       break;
     }
-    case "unlink":
+    case "unlink": {
+      // Mark any open fds on this file as orphaned
+      for (const fd of model.openFds.values()) {
+        if (fd.path === op.path && !fd.orphaned) fd.orphaned = true;
+      }
       model.files.delete(op.path);
       break;
+    }
     case "mkdir":
       model.dirs.add(op.path);
       model.dirModes.set(op.path, DEFAULT_DIR_MODE);
@@ -336,8 +408,13 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       const oldPrefix = op.oldPath + "/";
       for (const [path, state] of [...model.files]) {
         if (path.startsWith(oldPrefix)) {
+          const newPath = op.newPath + path.slice(op.oldPath.length);
           model.files.delete(path);
-          model.files.set(op.newPath + path.slice(op.oldPath.length), state);
+          model.files.set(newPath, state);
+          // Update open fds that referenced files under the old directory
+          for (const fd of model.openFds.values()) {
+            if (fd.path === path) fd.path = newPath;
+          }
         }
       }
       for (const dir of [...model.dirs]) {
@@ -376,6 +453,43 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
     case "chmodDir":
       model.dirModes.set(op.path, op.mode);
       break;
+    case "openFd": {
+      const fileState = model.files.get(op.path);
+      model.openFds.set(op.fdId, {
+        id: op.fdId,
+        path: op.path,
+        position: fileState ? fileState.content.length : 0,
+        orphaned: false,
+      });
+      model.nextFdId = op.fdId + 1;
+      break;
+    }
+    case "writeFd": {
+      const fd = model.openFds.get(op.fdId)!;
+      const fileState = model.files.get(fd.path)!;
+      const newSize = Math.max(fileState.content.length, fd.position + op.data.length);
+      const newContent = new Uint8Array(newSize);
+      newContent.set(fileState.content);
+      newContent.set(op.data, fd.position);
+      fileState.content = newContent;
+      fd.position += op.data.length;
+      break;
+    }
+    case "closeFd":
+      model.openFds.delete(op.fdId);
+      break;
+    case "ftruncateFd": {
+      const fd = model.openFds.get(op.fdId)!;
+      const fileState = model.files.get(fd.path)!;
+      if (op.size < fileState.content.length) {
+        fileState.content = fileState.content.slice(0, op.size);
+      } else if (op.size > fileState.content.length) {
+        const newContent = new Uint8Array(op.size);
+        newContent.set(fileState.content);
+        fileState.content = newContent;
+      }
+      break;
+    }
   }
 }
 
@@ -391,6 +505,8 @@ interface PersistenceHarness {
   backend: SyncMemoryBackend;
   tomefs: any;
   maxPages: number;
+  /** Maps model fd slot id → live Emscripten stream object. */
+  liveStreams: Map<number, EmscriptenStream>;
 }
 
 async function createPersistenceHarness(maxPages: number): Promise<PersistenceHarness> {
@@ -405,7 +521,7 @@ async function createPersistenceHarness(maxPages: number): Promise<PersistenceHa
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
   const FS = createRewriter(rawFS);
-  return { FS, rawFS, backend, tomefs, maxPages };
+  return { FS, rawFS, backend, tomefs, maxPages, liveStreams: new Map() };
 }
 
 /** Remount: unmount tomefs, create new Emscripten module, mount from same backend. */
@@ -420,7 +536,7 @@ async function remount(h: PersistenceHarness): Promise<PersistenceHarness> {
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
   const FS = createRewriter(rawFS);
-  return { FS, rawFS, backend: h.backend, tomefs, maxPages: h.maxPages };
+  return { FS, rawFS, backend: h.backend, tomefs, maxPages: h.maxPages, liveStreams: new Map() };
 }
 
 function createRewriter(realFS: any): EmscriptenFS {
@@ -469,7 +585,8 @@ function createRewriter(realFS: any): EmscriptenFS {
 // Execute op on FS
 // ---------------------------------------------------------------
 
-function execOp(FS: EmscriptenFS, op: Op): boolean {
+function execOp(harness: PersistenceHarness, op: Op): boolean {
+  const FS = harness.FS;
   try {
     switch (op.type) {
       case "createFile": {
@@ -508,6 +625,30 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
       case "chmodDir":
         FS.chmod(op.path, op.mode);
         return true;
+      case "openFd": {
+        // Open with RDWR | APPEND so writes go to end (matching model behavior)
+        const s = FS.open(op.path, O.RDWR);
+        // Seek to end to match model's initial position = file size
+        FS.llseek(s, 0, 2 /* SEEK_END */);
+        harness.liveStreams.set(op.fdId, s);
+        return true;
+      }
+      case "writeFd": {
+        const s = harness.liveStreams.get(op.fdId)!;
+        FS.write(s, op.data, 0, op.data.length);
+        return true;
+      }
+      case "closeFd": {
+        const s = harness.liveStreams.get(op.fdId)!;
+        FS.close(s);
+        harness.liveStreams.delete(op.fdId);
+        return true;
+      }
+      case "ftruncateFd": {
+        const s = harness.liveStreams.get(op.fdId)!;
+        FS.ftruncate(s.fd, op.size);
+        return true;
+      }
       default:
         return true;
     }
@@ -598,6 +739,15 @@ function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
 // Fuzz runner with persistence checkpoints
 // ---------------------------------------------------------------
 
+/** Close all open fds on a harness and clear them from the model. */
+function closeAllFds(harness: PersistenceHarness, model: Model): void {
+  for (const [fdId, stream] of harness.liveStreams) {
+    try { harness.FS.close(stream); } catch { /* already closed or invalid */ }
+  }
+  harness.liveStreams.clear();
+  model.openFds.clear();
+}
+
 async function runPersistenceFuzz(
   seed: number,
   numOps: number,
@@ -618,10 +768,12 @@ async function runPersistenceFuzz(
     const op = ops[i];
 
     if (op.type === "checkpoint") {
-      // Persist and remount
+      // Persist with fds still open (like Postgres during fsync/checkpoint)
       harness.rawFS.syncfs(false, (err: Error | null) => {
         if (err) throw err;
       });
+      // Close all fds before remount — fds don't survive module teardown
+      closeAllFds(harness, model);
       harness = await remount(harness);
       checkpoints++;
 
@@ -630,11 +782,12 @@ async function runPersistenceFuzz(
       continue;
     }
 
-    const success = execOp(harness.FS, op);
+    const success = execOp(harness, op);
     applyToModel(model, op, success);
   }
 
-  // Final checkpoint: persist + remount + verify
+  // Close open fds, persist, remount, verify
+  closeAllFds(harness, model);
   harness.rawFS.syncfs(false, (err: Error | null) => {
     if (err) throw err;
   });
@@ -688,6 +841,32 @@ describe("fuzz: persistence through syncfs + remount cycles", () => {
 
     it("150 ops, small cache, seed 256", async () => {
       await runPersistenceFuzz(256, 150, 16);
+    }, 60_000);
+  });
+
+  describe("fd operations across syncfs + remount (ethos §9)", () => {
+    it("seed 60001 — tiny cache, fds open during syncfs @fast", async () => {
+      await runPersistenceFuzz(60001, 80, 4);
+    }, 30_000);
+
+    it("seed 60002 — tiny cache, fd writes interleaved with renames", async () => {
+      await runPersistenceFuzz(60002, 80, 4);
+    }, 30_000);
+
+    it("seed 60003 — small cache, fds + unlink + persist", async () => {
+      await runPersistenceFuzz(60003, 80, 16);
+    }, 30_000);
+
+    it("seed 60004 — large cache, fds + truncate + persist", async () => {
+      await runPersistenceFuzz(60004, 100, 4096);
+    }, 30_000);
+
+    it("150 ops, tiny cache, seed 60099 — extended fd+persist sequence", async () => {
+      await runPersistenceFuzz(60099, 150, 4);
+    }, 60_000);
+
+    it("150 ops, small cache, seed 60100 — extended fd+persist sequence", async () => {
+      await runPersistenceFuzz(60100, 150, 16);
     }, 60_000);
   });
 
