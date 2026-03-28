@@ -54,6 +54,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     deleteMeta: async (p) => sync.deleteMeta(p),
     deleteMetas: async (ps) => sync.deleteMetas(ps),
     listFiles: async () => sync.listFiles(),
+    countPages: async (p) => sync.countPages(p),
   };
 }
 
