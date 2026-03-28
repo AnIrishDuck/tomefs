@@ -221,21 +221,38 @@ export class OpfsBackend implements StorageBackend {
       names.push(name);
     }
 
-    await Promise.all(
-      names.map(async (name) => {
-        const srcHandle = await oldDir.getFileHandle(name);
-        const file = await srcHandle.getFile();
-        const data = await file.arrayBuffer();
+    try {
+      await Promise.all(
+        names.map(async (name) => {
+          const srcHandle = await oldDir.getFileHandle(name);
+          const file = await srcHandle.getFile();
+          const data = await file.arrayBuffer();
 
-        const dstHandle = await newDir.getFileHandle(name, { create: true });
-        const writable = await dstHandle.createWritable();
-        try {
-          await writable.write(new Uint8Array(data));
-        } finally {
-          await writable.close();
+          const dstHandle = await newDir.getFileHandle(name, { create: true });
+          const writable = await dstHandle.createWritable();
+          try {
+            await writable.write(new Uint8Array(data));
+          } finally {
+            await writable.close();
+          }
+        }),
+      );
+    } catch (err) {
+      // Copy failed — clean up the partial new directory so we don't
+      // leave orphaned pages. The old directory is still intact.
+      try {
+        await this.pagesDir!.removeEntry(newEncoded, { recursive: true });
+      } catch (cleanupErr) {
+        if (!isNotFoundError(cleanupErr)) {
+          // Surface both the original error and the cleanup failure
+          throw new Error(
+            `OPFS renameFile: copy failed (${err instanceof Error ? err.message : String(err)}) ` +
+              `and cleanup also failed (${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)})`,
+          );
         }
-      }),
-    );
+      }
+      throw err;
+    }
 
     // Verify all pages were copied before deleting the source.
     // Without this check, a partial copy failure would cause data loss
@@ -245,6 +262,17 @@ export class OpfsBackend implements StorageBackend {
       copiedNames.push(name);
     }
     if (copiedNames.length < names.length) {
+      // Verification failed — clean up the partial new directory.
+      try {
+        await this.pagesDir!.removeEntry(newEncoded, { recursive: true });
+      } catch (cleanupErr) {
+        if (!isNotFoundError(cleanupErr)) {
+          throw new Error(
+            `OPFS renameFile: copy verification failed (expected ${names.length} pages but found ${copiedNames.length}) ` +
+              `and cleanup also failed (${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)})`,
+          );
+        }
+      }
       throw new Error(
         `OPFS renameFile: copy verification failed — expected ${names.length} pages but found ${copiedNames.length}`,
       );
@@ -269,7 +297,17 @@ export class OpfsBackend implements StorageBackend {
       }
     }
 
-    await Promise.all(toRemove.map((name) => fileDir.removeEntry(name)));
+    const results = await Promise.allSettled(
+      toRemove.map((name) => fileDir.removeEntry(name)),
+    );
+    const failures = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected",
+    );
+    if (failures.length > 0) {
+      throw new Error(
+        `OPFS deletePagesFrom: ${failures.length}/${toRemove.length} page removals failed: ${failures[0].reason}`,
+      );
+    }
   }
 
   async readMeta(path: string): Promise<FileMeta | null> {
