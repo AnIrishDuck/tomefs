@@ -264,25 +264,30 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const newStoragePath = computeStoragePath(new_dir, new_name);
       pageCache.renameFile(oldStoragePath, newStoragePath);
       old_node.storagePath = newStoragePath;
-      // Move metadata to new path (matching how renameDescendantPaths
-      // handles symlinks and directories). Without this, a crash between
-      // rename and syncfs would lose the file's metadata — pages exist
-      // under the new path but metadata is gone from both old and new.
-      const oldMeta = backend.readMeta(oldStoragePath);
-      if (oldMeta) {
-        backend.writeMeta(newStoragePath, oldMeta);
-      }
+      // Move metadata to new path. Construct from node state (no backend
+      // read needed) — the node tree is the source of truth. This also
+      // provides crash safety for files not yet synced (metadata gets
+      // written at the new path immediately).
+      backend.writeMeta(newStoragePath, {
+        size: old_node.usedBytes,
+        mode: old_node.mode,
+        ctime: old_node.ctime,
+        mtime: old_node.mtime,
+        atime: old_node.atime,
+      });
       backend.deleteMeta(oldStoragePath);
     } else if (FS.isDir(old_node.mode)) {
       // Move directory metadata to the new path before recursing into
-      // children. This mirrors the pattern used inside renameDescendantPaths
-      // for subdirectories and ensures a crash between rename and syncfs
-      // doesn't orphan the directory.
-      const oldDirMeta = backend.readMeta(oldStoragePath);
+      // children. Construct from node state (no backend read needed) —
+      // the node tree is the source of truth for current metadata.
       const newDirPath = computeStoragePath(new_dir, new_name);
-      if (oldDirMeta) {
-        backend.writeMeta(newDirPath, oldDirMeta);
-      }
+      backend.writeMeta(newDirPath, {
+        size: 0,
+        mode: old_node.mode,
+        ctime: old_node.ctime,
+        mtime: old_node.mtime,
+        atime: old_node.atime,
+      });
       backend.deleteMeta(oldStoragePath);
       // Recursively update storagePaths for all file descendants.
       // Without this, pages remain keyed by old paths in the cache/backend,
@@ -353,52 +358,87 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    * Recursively rename storage paths for all file descendants of a directory.
    * Called during directory rename to keep storagePaths consistent with the
    * new tree structure, preventing data loss on persist → restore cycles.
+   *
+   * Collects all metadata operations during the tree walk, then executes
+   * them in two batched backend calls (writeMetas + deleteMetas) instead
+   * of O(3n) individual calls. Through the SAB bridge, this reduces
+   * directory rename metadata round-trips from O(3n) to O(2).
+   *
+   * Metadata is constructed from in-memory node state rather than read
+   * from the backend. The node tree is the source of truth for current
+   * state; this also provides crash safety for files that haven't been
+   * synced yet (their metadata gets written at the new path immediately).
    */
   function renameDescendantPaths(
     dirNode: any,
     oldDirPath: string,
     newDirPath: string,
   ): void {
-    for (const childName of Object.keys(dirNode.contents)) {
-      const child = dirNode.contents[childName];
-      if (FS.isFile(child.mode)) {
-        const oldPath = child.storagePath;
-        const newPath = newDirPath + oldPath.substring(oldDirPath.length);
-        pageCache.renameFile(oldPath, newPath);
-        child.storagePath = newPath;
-        // Move file metadata to the new path, matching how symlinks and
-        // directories below are handled. Without this, a crash between
-        // directory rename and syncfs leaves file metadata at the old path
-        // while pages are at the new path — restoreTree would recreate the
-        // file at the old path with no pages, losing data.
-        const fileMeta = backend.readMeta(oldPath);
-        if (fileMeta) {
-          backend.writeMeta(newPath, fileMeta);
-          backend.deleteMeta(oldPath);
+    const metaWrites: Array<{ path: string; meta: FileMeta }> = [];
+    const metaDeletes: string[] = [];
+
+    function collect(node: any, oldBase: string, newBase: string): void {
+      for (const childName of Object.keys(node.contents)) {
+        const child = node.contents[childName];
+        if (FS.isFile(child.mode)) {
+          const oldPath = child.storagePath;
+          const newPath = newBase + oldPath.substring(oldBase.length);
+          pageCache.renameFile(oldPath, newPath);
+          child.storagePath = newPath;
+          metaWrites.push({
+            path: newPath,
+            meta: {
+              size: child.usedBytes,
+              mode: child.mode,
+              ctime: child.ctime,
+              mtime: child.mtime,
+              atime: child.atime,
+            },
+          });
+          metaDeletes.push(oldPath);
+        } else if (FS.isLink(child.mode)) {
+          const oldPath = oldBase + "/" + childName;
+          const newPath = newBase + "/" + childName;
+          metaWrites.push({
+            path: newPath,
+            meta: {
+              size: 0,
+              mode: child.mode,
+              ctime: child.ctime,
+              mtime: child.mtime,
+              atime: child.atime,
+              link: child.link,
+            },
+          });
+          metaDeletes.push(oldPath);
+        } else if (FS.isDir(child.mode)) {
+          const oldChildPath = oldBase + "/" + childName;
+          const newChildPath = newBase + "/" + childName;
+          metaWrites.push({
+            path: newChildPath,
+            meta: {
+              size: 0,
+              mode: child.mode,
+              ctime: child.ctime,
+              mtime: child.mtime,
+              atime: child.atime,
+            },
+          });
+          metaDeletes.push(oldChildPath);
+          collect(child, oldChildPath, newChildPath);
         }
-      } else if (FS.isLink(child.mode)) {
-        // Symlinks have no page data, but their metadata is keyed by path.
-        // Move metadata to the new path so a crash before syncfs doesn't
-        // orphan the symlink (old parent metadata is already deleted).
-        const oldPath = oldDirPath + "/" + childName;
-        const newPath = newDirPath + "/" + childName;
-        const meta = backend.readMeta(oldPath);
-        if (meta) {
-          backend.writeMeta(newPath, meta);
-          backend.deleteMeta(oldPath);
-        }
-      } else if (FS.isDir(child.mode)) {
-        const oldChildPath = oldDirPath + "/" + childName;
-        const newChildPath = newDirPath + "/" + childName;
-        // Move directory metadata before recursing into children,
-        // so a crash mid-rename doesn't orphan the subtree.
-        const meta = backend.readMeta(oldChildPath);
-        if (meta) {
-          backend.writeMeta(newChildPath, meta);
-          backend.deleteMeta(oldChildPath);
-        }
-        renameDescendantPaths(child, oldChildPath, newChildPath);
       }
+    }
+
+    collect(dirNode, oldDirPath, newDirPath);
+
+    // Batch-write all metadata at new paths, then batch-delete old paths.
+    // Two backend calls instead of O(3n) individual calls.
+    if (metaWrites.length > 0) {
+      backend.writeMetas(metaWrites);
+    }
+    if (metaDeletes.length > 0) {
+      backend.deleteMetas(metaDeletes);
     }
   }
 
