@@ -19,7 +19,7 @@ import { createTomeFS } from "../../src/tomefs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import type { EmscriptenFS, EmscriptenStream } from "../harness/emscripten-fs.js";
-import { O } from "../harness/emscripten-fs.js";
+import { O, SEEK_SET, SEEK_CUR, SEEK_END } from "../harness/emscripten-fs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -157,7 +157,10 @@ type Op =
   | { type: "openFd"; path: string; fdId: number }
   | { type: "writeFd"; fdId: number; data: Uint8Array }
   | { type: "closeFd"; fdId: number }
+  | { type: "dupFd"; srcFdId: number; newFdId: number }
+  | { type: "seekFd"; fdId: number; offset: number; whence: number }
   | { type: "ftruncateFd"; fdId: number; size: number }
+  | { type: "appendWrite"; path: string; data: Uint8Array }
   | { type: "checkpoint" };
 
 const DIR_NAMES = ["aa", "bb", "cc"];
@@ -194,7 +197,10 @@ function generateOp(rng: Rng, model: Model): Op {
     ["openFd", unopenedFiles.length > 0 && model.openFds.size < 4 ? 10 : 0],
     ["writeFd", activeFdIds.length > 0 ? 12 : 0],
     ["closeFd", openFdIds.length > 0 ? 6 : 0],
+    ["dupFd", openFdIds.length > 0 && model.openFds.size < 8 ? 6 : 0],
+    ["seekFd", activeFdIds.length > 0 ? 6 : 0],
     ["ftruncateFd", activeFdIds.length > 0 ? 5 : 0],
+    ["appendWrite", allFiles.length > 0 ? 8 : 0],
     ["checkpoint", 8],
   ];
 
@@ -305,6 +311,33 @@ function generateOp(rng: Rng, model: Model): Op {
     case "closeFd":
       return { type: "closeFd", fdId: rng.pick(openFdIds) };
 
+    case "dupFd": {
+      const srcFdId = rng.pick(openFdIds);
+      const newFdId = model.nextFdId;
+      return { type: "dupFd", srcFdId, newFdId };
+    }
+
+    case "seekFd": {
+      const fdId = rng.pick(activeFdIds);
+      const fd = model.openFds.get(fdId)!;
+      const fileState = model.files.get(fd.path);
+      const fileSize = fileState ? fileState.content.length : 0;
+      // Choose a whence and offset that produce a valid position
+      const whence = rng.pick([SEEK_SET, SEEK_CUR, SEEK_END]);
+      let offset: number;
+      if (whence === SEEK_SET) {
+        offset = rng.int(Math.max(1, fileSize + PAGE_SIZE));
+      } else if (whence === SEEK_CUR) {
+        // Seek relative to current position — keep result non-negative
+        const maxForward = fileSize + PAGE_SIZE - fd.position;
+        offset = rng.int(Math.max(1, fd.position + maxForward + 1)) - fd.position;
+      } else {
+        // SEEK_END: offset relative to end of file
+        offset = -rng.int(Math.max(1, fileSize + 1));
+      }
+      return { type: "seekFd", fdId, offset, whence };
+    }
+
     case "ftruncateFd": {
       const fdId = rng.pick(activeFdIds);
       const fd = model.openFds.get(fdId)!;
@@ -312,6 +345,12 @@ function generateOp(rng: Rng, model: Model): Op {
       const currentSize = fileState ? fileState.content.length : 0;
       const sizeChoices = [0, Math.max(0, currentSize - PAGE_SIZE), currentSize, currentSize + PAGE_SIZE];
       return { type: "ftruncateFd", fdId, size: rng.pick(sizeChoices) };
+    }
+
+    case "appendWrite": {
+      const path = rng.pick(allFiles);
+      const sizeChoices = [1, 50, PAGE_SIZE, PAGE_SIZE + 1];
+      return { type: "appendWrite", path, data: rng.bytes(rng.pick(sizeChoices)) };
     }
 
     case "checkpoint":
@@ -337,7 +376,10 @@ function formatOp(op: Op, index: number): string {
     case "openFd": return `[${index}] openFd(${op.path}, fd#${op.fdId})`;
     case "writeFd": return `[${index}] writeFd(fd#${op.fdId}, ${op.data.length}B)`;
     case "closeFd": return `[${index}] closeFd(fd#${op.fdId})`;
+    case "dupFd": return `[${index}] dupFd(fd#${op.srcFdId} -> fd#${op.newFdId})`;
+    case "seekFd": return `[${index}] seekFd(fd#${op.fdId}, ${op.offset}, whence=${op.whence})`;
     case "ftruncateFd": return `[${index}] ftruncateFd(fd#${op.fdId}, ${op.size})`;
+    case "appendWrite": return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
     case "checkpoint": return `[${index}] CHECKPOINT`;
   }
 }
@@ -478,6 +520,40 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
     case "closeFd":
       model.openFds.delete(op.fdId);
       break;
+    case "dupFd": {
+      const srcFd = model.openFds.get(op.srcFdId)!;
+      model.openFds.set(op.newFdId, {
+        id: op.newFdId,
+        path: srcFd.path,
+        position: srcFd.position,
+        orphaned: srcFd.orphaned,
+      });
+      model.nextFdId = op.newFdId + 1;
+      break;
+    }
+    case "seekFd": {
+      const fd = model.openFds.get(op.fdId)!;
+      const fileState = model.files.get(fd.path);
+      const fileSize = fileState ? fileState.content.length : 0;
+      let newPos: number;
+      if (op.whence === SEEK_SET) {
+        newPos = op.offset;
+      } else if (op.whence === SEEK_CUR) {
+        newPos = fd.position + op.offset;
+      } else {
+        newPos = fileSize + op.offset;
+      }
+      if (newPos >= 0) fd.position = newPos;
+      break;
+    }
+    case "appendWrite": {
+      const state = model.files.get(op.path)!;
+      const newContent = new Uint8Array(state.content.length + op.data.length);
+      newContent.set(state.content);
+      newContent.set(op.data, state.content.length);
+      state.content = newContent;
+      break;
+    }
     case "ftruncateFd": {
       const fd = model.openFds.get(op.fdId)!;
       const fileState = model.files.get(fd.path)!;
@@ -642,6 +718,23 @@ function execOp(harness: PersistenceHarness, op: Op): boolean {
         const s = harness.liveStreams.get(op.fdId)!;
         FS.close(s);
         harness.liveStreams.delete(op.fdId);
+        return true;
+      }
+      case "dupFd": {
+        const srcStream = harness.liveStreams.get(op.srcFdId)!;
+        const dupStream = FS.dupStream(srcStream);
+        harness.liveStreams.set(op.newFdId, dupStream);
+        return true;
+      }
+      case "seekFd": {
+        const s = harness.liveStreams.get(op.fdId)!;
+        FS.llseek(s, op.offset, op.whence);
+        return true;
+      }
+      case "appendWrite": {
+        const s = FS.open(op.path, O.WRONLY | O.APPEND);
+        FS.write(s, op.data, 0, op.data.length);
+        FS.close(s);
         return true;
       }
       case "ftruncateFd": {
@@ -867,6 +960,32 @@ describe("fuzz: persistence through syncfs + remount cycles", () => {
 
     it("150 ops, small cache, seed 60100 — extended fd+persist sequence", async () => {
       await runPersistenceFuzz(60100, 150, 16);
+    }, 60_000);
+  });
+
+  describe("dupFd + seekFd + appendWrite across remount cycles", () => {
+    it("seed 70001 — tiny cache, dup fds open during syncfs @fast", async () => {
+      await runPersistenceFuzz(70001, 80, 4);
+    }, 30_000);
+
+    it("seed 70002 — tiny cache, seek + write interleaved with renames", async () => {
+      await runPersistenceFuzz(70002, 80, 4);
+    }, 30_000);
+
+    it("seed 70003 — small cache, dup + unlink + persist", async () => {
+      await runPersistenceFuzz(70003, 80, 16);
+    }, 30_000);
+
+    it("seed 70004 — large cache, append + seek + persist", async () => {
+      await runPersistenceFuzz(70004, 100, 4096);
+    }, 30_000);
+
+    it("150 ops, tiny cache, seed 70099 — extended dup+seek+append sequence", async () => {
+      await runPersistenceFuzz(70099, 150, 4);
+    }, 60_000);
+
+    it("150 ops, small cache, seed 70100 — extended dup+seek+append sequence", async () => {
+      await runPersistenceFuzz(70100, 150, 16);
     }, 60_000);
   });
 
