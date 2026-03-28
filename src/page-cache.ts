@@ -91,9 +91,13 @@ export class PageCache {
     const existing = this.cache.get(key);
     if (existing) {
       this._hits++;
-      // Move to end (most recently used)
-      this.cache.delete(key);
-      this.cache.set(key, existing);
+      // Only reorder for LRU when cache is at capacity (eviction could happen).
+      // Below capacity, nothing will be evicted, so strict LRU order is unnecessary.
+      // This eliminates the expensive Map delete+set on every cache hit.
+      if (this.cache.size >= this.maxPages) {
+        this.cache.delete(key);
+        this.cache.set(key, existing);
+      }
       this.mruKey = key;
       return existing;
     }
@@ -139,8 +143,22 @@ export class PageCache {
     const toRead = Math.min(length, available);
     if (toRead === 0) return 0;
 
-    // Determine which pages this read spans
     const firstPage = Math.floor(position / PAGE_SIZE);
+    const pageOffset = position - firstPage * PAGE_SIZE;
+
+    // Fast path: entire read fits within a single page (common case for
+    // page-aligned I/O). Skips multi-page setup, loop, and per-iteration
+    // index computation.
+    if (pageOffset + toRead <= PAGE_SIZE) {
+      const page = await this.getPage(path, firstPage);
+      buffer.set(
+        page.data.subarray(pageOffset, pageOffset + toRead),
+        offset,
+      );
+      return toRead;
+    }
+
+    // Multi-page path
     const lastPage = Math.floor((position + toRead - 1) / PAGE_SIZE);
 
     // Find cache misses — only batch when there are multiple misses
@@ -229,15 +247,36 @@ export class PageCache {
   ): Promise<{ bytesWritten: number; newFileSize: number }> {
     if (length === 0) return { bytesWritten: 0, newFileSize: currentFileSize };
 
-    // Determine which pages this write spans
     const firstPage = Math.floor(position / PAGE_SIZE);
-    const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
+    const pageOffset = position - firstPage * PAGE_SIZE;
 
     // Pages at or beyond this index don't exist in the backend, so we can
     // skip the readPage call and create zero-filled pages directly. This
     // avoids wasted round-trips when extending files.
     const firstNewPage =
       currentFileSize > 0 ? Math.ceil(currentFileSize / PAGE_SIZE) : 0;
+
+    // Fast path: entire write fits within a single page
+    if (pageOffset + length <= PAGE_SIZE) {
+      const page = await this.getPageInternal(
+        path,
+        firstPage,
+        firstPage < firstNewPage,
+      );
+      page.data.set(
+        buffer.subarray(offset, offset + length),
+        pageOffset,
+      );
+      if (!page.dirty) {
+        page.dirty = true;
+        this.dirtyKeys.add(pageKeyStr(path, firstPage));
+      }
+      const newFileSize = Math.max(currentFileSize, position + length);
+      return { bytesWritten: length, newFileSize };
+    }
+
+    // Multi-page path
+    const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
 
     // For multi-page writes, batch eviction and pre-loading of cache misses
     // Separate cache misses into pages that might exist in the backend
