@@ -60,6 +60,19 @@ export class SabClient implements SyncStorageBackend {
    */
   private readonly maxBatchPages: number;
 
+  /**
+   * Maximum metadata entries per batch call. Computed from buffer size to
+   * prevent overflow when syncfs persists metadata for many files.
+   *
+   * Each entry in a writeMetas request is pure JSON: path string (~100 bytes
+   * typical) + FileMeta object (~100 bytes) + JSON overhead (~50 bytes).
+   * We conservatively estimate 512 bytes per entry.
+   *
+   * Each path in a deleteMetas request is shorter (~128 bytes with overhead),
+   * so this limit is conservative for deletes too.
+   */
+  private readonly maxBatchMetas: number;
+
   constructor(sab: SharedArrayBuffer, options?: SabClientOptions) {
     this.sab = sab;
     this.controlView = new Int32Array(sab, 0, 3);
@@ -71,6 +84,10 @@ export class SabClient implements SyncStorageBackend {
     this.maxBatchPages = Math.max(
       1,
       Math.floor((dataRegionSize - 4096) / (PAGE_SIZE + 256)),
+    );
+    this.maxBatchMetas = Math.max(
+      1,
+      Math.floor((dataRegionSize - 4096) / 512),
     );
   }
 
@@ -202,7 +219,19 @@ export class SabClient implements SyncStorageBackend {
 
   writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
     if (entries.length === 0) return;
-    this.call(OpCode.WRITE_METAS, { entries });
+
+    // If the batch fits in a single call, use the fast path.
+    // Otherwise chunk to avoid overflowing the SAB request buffer.
+    if (entries.length <= this.maxBatchMetas) {
+      this.call(OpCode.WRITE_METAS, { entries });
+      return;
+    }
+
+    for (let i = 0; i < entries.length; i += this.maxBatchMetas) {
+      this.call(OpCode.WRITE_METAS, {
+        entries: entries.slice(i, i + this.maxBatchMetas),
+      });
+    }
   }
 
   deleteMeta(path: string): void {
@@ -217,7 +246,19 @@ export class SabClient implements SyncStorageBackend {
 
   deleteMetas(paths: string[]): void {
     if (paths.length === 0) return;
-    this.call(OpCode.DELETE_METAS, { paths });
+
+    // If the batch fits in a single call, use the fast path.
+    // Otherwise chunk to avoid overflowing the SAB request buffer.
+    if (paths.length <= this.maxBatchMetas) {
+      this.call(OpCode.DELETE_METAS, { paths });
+      return;
+    }
+
+    for (let i = 0; i < paths.length; i += this.maxBatchMetas) {
+      this.call(OpCode.DELETE_METAS, {
+        paths: paths.slice(i, i + this.maxBatchMetas),
+      });
+    }
   }
 
   listFiles(): string[] {
