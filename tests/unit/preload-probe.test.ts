@@ -90,6 +90,9 @@ class ReadCountingBackend implements StorageBackend {
   async deleteFile(path: string) {
     return this.inner.deleteFile(path);
   }
+  async deleteFiles(paths: string[]) {
+    return this.inner.deleteFiles(paths);
+  }
   async deletePagesFrom(path: string, fromPageIndex: number) {
     return this.inner.deletePagesFrom(path, fromPageIndex);
   }

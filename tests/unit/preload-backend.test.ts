@@ -1016,6 +1016,7 @@ describe("PreloadBackend", () => {
         return this.inner.writePages(pages);
       }
       async deleteFile(path: string) { return this.inner.deleteFile(path); }
+      async deleteFiles(paths: string[]) { return this.inner.deleteFiles(paths); }
       async deletePagesFrom(path: string, fromPageIndex: number) { return this.inner.deletePagesFrom(path, fromPageIndex); }
       async renameFile(oldPath: string, newPath: string) { return this.inner.renameFile(oldPath, newPath); }
       async readMeta(path: string) { return this.inner.readMeta(path); }

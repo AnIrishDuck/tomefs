@@ -122,6 +122,11 @@ class FailingBackend implements StorageBackend {
     return this.inner.deleteFile(path);
   }
 
+  async deleteFiles(paths: string[]): Promise<void> {
+    this.maybeThrow("deleteFiles");
+    return this.inner.deleteFiles(paths);
+  }
+
   async deletePagesFrom(path: string, fromPageIndex: number): Promise<void> {
     this.maybeThrow("deletePagesFrom");
     return this.inner.deletePagesFrom(path, fromPageIndex);
@@ -205,6 +210,10 @@ class SlowBackend implements StorageBackend {
 
   async deleteFile(path: string): Promise<void> {
     return this.inner.deleteFile(path);
+  }
+
+  async deleteFiles(paths: string[]): Promise<void> {
+    return this.inner.deleteFiles(paths);
   }
 
   async deletePagesFrom(path: string, fromPageIndex: number): Promise<void> {
