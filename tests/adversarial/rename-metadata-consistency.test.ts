@@ -418,6 +418,108 @@ describe("adversarial: rename metadata consistency", () => {
   // Mid-level directory rename with mixed node types
   // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
+  // Symlink rename: metadata should be moved eagerly for crash safety
+  // ---------------------------------------------------------------------------
+
+  it("symlink rename moves metadata to new path in backend @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create a file and a symlink pointing to it
+    const s = FS.open(`${MOUNT}/target`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("data"), 0, 4);
+    FS.close(s);
+    FS.symlink("target", `${MOUNT}/oldlink`);
+    syncfs(FS, tomefs);
+
+    // Verify symlink metadata exists
+    const oldMeta = backend.readMeta("/oldlink");
+    expect(oldMeta).not.toBeNull();
+    expect(oldMeta!.link).toBe("target");
+
+    // Rename the symlink without syncfs
+    FS.rename(`${MOUNT}/oldlink`, `${MOUNT}/newlink`);
+
+    // Metadata should be at new path, not old
+    expect(backend.readMeta("/oldlink")).toBeNull();
+    const newMeta = backend.readMeta("/newlink");
+    expect(newMeta).not.toBeNull();
+    expect(newMeta!.link).toBe("target");
+
+    FS.unmount(MOUNT);
+  });
+
+  it("symlink survives crash after rename (no syncfs)", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    const s = FS.open(`${MOUNT}/real`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("real-data"), 0, 9);
+    FS.close(s);
+    FS.symlink("real", `${MOUNT}/before`);
+    syncfs(FS, tomefs);
+
+    // Rename symlink without syncfs — simulates crash before next sync
+    FS.rename(`${MOUNT}/before`, `${MOUNT}/after`);
+
+    // "Crash" — remount from backend without syncfs
+    const { FS: FS2 } = await mountTome(backend);
+
+    // Symlink should be at new path and resolve to the target
+    expect(FS2.readlink(`${MOUNT}/after`)).toBe("real");
+    expect(() => FS2.readlink(`${MOUNT}/before`)).toThrow();
+
+    // Data should be accessible through the renamed symlink
+    const buf = new Uint8Array(20);
+    const s2 = FS2.open(`${MOUNT}/after`, O.RDONLY);
+    const n = FS2.read(s2, buf, 0, 20);
+    FS2.close(s2);
+    expect(decode(buf, n)).toBe("real-data");
+  });
+
+  it("symlink rename of never-synced symlink writes metadata for crash safety", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create file and symlink but don't sync
+    const s = FS.open(`${MOUNT}/file`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("hello"), 0, 5);
+    FS.close(s);
+    FS.symlink("file", `${MOUNT}/lnk`);
+
+    expect(backend.readMeta("/lnk")).toBeNull();
+
+    // Rename — should write metadata at new path from node state
+    FS.rename(`${MOUNT}/lnk`, `${MOUNT}/moved`);
+
+    expect(backend.readMeta("/lnk")).toBeNull();
+    const meta = backend.readMeta("/moved");
+    expect(meta).not.toBeNull();
+    expect(meta!.link).toBe("file");
+
+    FS.unmount(MOUNT);
+  });
+
+  it("chain rename of symlink A→B→C moves metadata at each step", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    FS.symlink("/some/target", `${MOUNT}/a`);
+    syncfs(FS, tomefs);
+
+    // A → B
+    FS.rename(`${MOUNT}/a`, `${MOUNT}/b`);
+    expect(backend.readMeta("/a")).toBeNull();
+    expect(backend.readMeta("/b")!.link).toBe("/some/target");
+
+    // B → C
+    FS.rename(`${MOUNT}/b`, `${MOUNT}/c`);
+    expect(backend.readMeta("/b")).toBeNull();
+    expect(backend.readMeta("/c")!.link).toBe("/some/target");
+
+    // Verify after remount
+    syncAndUnmount(FS, tomefs);
+    const { FS: FS2 } = await mountTome(backend);
+    expect(FS2.readlink(`${MOUNT}/c`)).toBe("/some/target");
+  });
+
   it("mid-level directory rename moves file + symlink + subdir metadata", async () => {
     const { FS, tomefs } = await mountTome(backend);
 

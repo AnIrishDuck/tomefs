@@ -152,6 +152,7 @@ type Op =
   | { type: "renameDir"; oldPath: string; newPath: string }
   | { type: "symlink"; target: string; path: string }
   | { type: "unlinkSymlink"; path: string }
+  | { type: "renameSymlink"; oldPath: string; newPath: string }
   | { type: "chmodFile"; path: string; mode: number }
   | { type: "chmodDir"; path: string; mode: number }
   | { type: "openFd"; path: string; fdId: number }
@@ -189,6 +190,7 @@ function generateOp(rng: Rng, model: Model): Op {
     ["renameDir", allDirs.length > 0 ? 6 : 0],
     ["symlink", allFiles.length > 0 ? 8 : 0],
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
+    ["renameSymlink", allSymlinks.length > 0 ? 6 : 0],
     ["chmodFile", allFiles.length > 0 ? 6 : 0],
     ["chmodDir", allDirs.length > 0 ? 4 : 0],
     ["openFd", unopenedFiles.length > 0 && model.openFds.size < 4 ? 10 : 0],
@@ -278,6 +280,14 @@ function generateOp(rng: Rng, model: Model): Op {
     case "unlinkSymlink":
       return { type: "unlinkSymlink", path: rng.pick(allSymlinks) };
 
+    case "renameSymlink": {
+      const oldPath = rng.pick(allSymlinks);
+      const dir = rng.pick(allContainerDirs);
+      const name = rng.pick(LINK_NAMES);
+      const newPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+      return { type: "renameSymlink", oldPath, newPath };
+    }
+
     case "chmodFile": {
       const path = rng.pick(allFiles);
       const modeChoices = [0o444, 0o644, 0o666, 0o755, 0o700, 0o600, 0o400];
@@ -332,6 +342,7 @@ function formatOp(op: Op, index: number): string {
     case "rmdir": return `[${index}] rmdir(${op.path})`;
     case "symlink": return `[${index}] symlink(${op.target} -> ${op.path})`;
     case "unlinkSymlink": return `[${index}] unlinkSymlink(${op.path})`;
+    case "renameSymlink": return `[${index}] renameSymlink(${op.oldPath} -> ${op.newPath})`;
     case "chmodFile": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
     case "chmodDir": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
     case "openFd": return `[${index}] openFd(${op.path}, fd#${op.fdId})`;
@@ -445,6 +456,13 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
     case "unlinkSymlink":
       model.symlinks.delete(op.path);
       break;
+    case "renameSymlink": {
+      const target = model.symlinks.get(op.oldPath)!;
+      model.symlinks.delete(op.oldPath);
+      // Overwrite destination symlink if it exists
+      model.symlinks.set(op.newPath, target);
+      break;
+    }
     case "chmodFile": {
       const state = model.files.get(op.path);
       if (state) state.mode = op.mode;
@@ -610,6 +628,9 @@ function execOp(harness: PersistenceHarness, op: Op): boolean {
         return true;
       case "symlink":
         FS.symlink(op.target, op.path);
+        return true;
+      case "renameSymlink":
+        FS.rename(op.oldPath, op.newPath);
         return true;
       case "unlinkSymlink":
       case "unlink":
