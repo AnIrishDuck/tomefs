@@ -41,7 +41,7 @@ function decode(buf: Uint8Array, length?: number): string {
  */
 class RecordingBackend extends SyncMemoryBackend {
   operations: Array<{
-    op: "writeMeta" | "deleteMeta" | "deleteFile" | "readMeta";
+    op: "writeMeta" | "deleteMeta" | "deleteFile" | "readMeta" | "listFiles";
     path: string;
   }> = [];
   recording = false;
@@ -99,6 +99,13 @@ class RecordingBackend extends SyncMemoryBackend {
       this.operations.push({ op: "readMeta", path });
     }
     return super.readMeta(path);
+  }
+
+  listFiles(): string[] {
+    if (this.recording) {
+      this.operations.push({ op: "listFiles", path: "*" });
+    }
+    return super.listFiles();
   }
 }
 
@@ -607,6 +614,97 @@ describe("syncfs detached node handling", () => {
       (o) => o.op === "readMeta",
     );
     expect(readMetaCalls.length).toBe(0);
+
+    FS.unmount(MOUNT);
+  });
+
+  // ------------------------------------------------------------------
+  // Orphan cleanup skip optimization
+  // ------------------------------------------------------------------
+
+  it("skips backend.listFiles() on second syncfs when no tree mutations occurred @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    const s = FS.open(`${MOUNT}/data`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("hello"), 0, 5);
+    FS.close(s);
+
+    // First syncfs — must call listFiles for orphan cleanup
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
+
+    // Modify the file (but no unlink/rename/rmdir)
+    const s2 = FS.open(`${MOUNT}/data`, O.RDWR, 0o666);
+    FS.write(s2, encode("world"), 0, 5);
+    FS.close(s2);
+
+    // Second syncfs — should skip listFiles since no tree-mutating ops
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(false);
+
+    FS.unmount(MOUNT);
+  });
+
+  it("re-enables orphan cleanup after unlink @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create and sync
+    const s = FS.open(`${MOUNT}/a`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("a"), 0, 1);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    // Unlink triggers needsOrphanCleanup
+    FS.unlink(`${MOUNT}/a`);
+
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
+
+    // After cleanup, subsequent sync without mutations skips listFiles
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(false);
+
+    FS.unmount(MOUNT);
+  });
+
+  it("re-enables orphan cleanup after rename", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    const s = FS.open(`${MOUNT}/old`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("data"), 0, 4);
+    FS.close(s);
+    syncfs(FS, tomefs);
+
+    // Rename triggers needsOrphanCleanup
+    FS.rename(`${MOUNT}/old`, `${MOUNT}/new`);
+
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
+
+    FS.unmount(MOUNT);
+  });
+
+  it("re-enables orphan cleanup after rmdir", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    FS.mkdir(`${MOUNT}/dir`);
+    syncfs(FS, tomefs);
+
+    FS.rmdir(`${MOUNT}/dir`);
+
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
 
     FS.unmount(MOUNT);
   });

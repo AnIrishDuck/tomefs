@@ -493,22 +493,16 @@ export class PageCache {
     const tailOffset = newSize % PAGE_SIZE;
     if (tailOffset === 0) return;
 
-    const key = pageKeyStr(path, lastPageIndex);
-    const page = this.cache.get(key);
-    if (page) {
-      page.data.fill(0, tailOffset);
-      if (!page.dirty) {
-        page.dirty = true;
-        this.dirtyKeys.add(key);
-      }
-    } else {
-      // Page is not cached — check if it exists in the backend
-      const data = await this.backend.readPage(path, lastPageIndex);
-      if (data) {
-        const updated = new Uint8Array(data);
-        updated.fill(0, tailOffset);
-        await this.backend.writePage(path, lastPageIndex, updated);
-      }
+    // Load the page through the cache (from backend if not cached).
+    // This avoids bypassing the cache with direct backend read+write,
+    // which would cause an unnecessary write round-trip and a guaranteed
+    // cache miss on the next access to this page.
+    const page = await this.getPageInternal(path, lastPageIndex, true);
+    page.data.fill(0, tailOffset);
+    if (!page.dirty) {
+      const key = pageKeyStr(path, lastPageIndex);
+      page.dirty = true;
+      this.dirtyKeys.add(key);
     }
   }
 
