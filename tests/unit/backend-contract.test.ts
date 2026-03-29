@@ -49,6 +49,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     deletePagesFrom: async (p, i) => sync.deletePagesFrom(p, i),
     renameFile: async (o, n) => sync.renameFile(o, n),
     readMeta: async (p) => sync.readMeta(p),
+    readMetas: async (ps) => sync.readMetas(ps),
     writeMeta: async (p, m) => sync.writeMeta(p, m),
     writeMetas: async (e) => sync.writeMetas(e),
     deleteMeta: async (p) => sync.deleteMeta(p),
@@ -526,6 +527,142 @@ for (const factory of factories) {
 
         expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
         expect(await backend.readPage("/f", 1)).toEqual(filledPage(0x03));
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // countPages
+    // ---------------------------------------------------------------
+
+    describe("countPages", () => {
+      it("returns 0 for non-existent file @fast", async () => {
+        expect(await backend.countPages("/missing")).toBe(0);
+      });
+
+      it("returns correct count after writes @fast", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 1, filledPage(0x02));
+        await backend.writePage("/f", 2, filledPage(0x03));
+
+        expect(await backend.countPages("/f")).toBe(3);
+      });
+
+      it("returns correct count for sparse pages", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 5, filledPage(0x05));
+
+        expect(await backend.countPages("/f")).toBe(2);
+      });
+
+      it("reflects deletePagesFrom", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 1, filledPage(0x02));
+        await backend.writePage("/f", 2, filledPage(0x03));
+
+        await backend.deletePagesFrom("/f", 1);
+
+        expect(await backend.countPages("/f")).toBe(1);
+      });
+
+      it("returns 0 after deleteFile", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 1, filledPage(0x02));
+
+        await backend.deleteFile("/f");
+
+        expect(await backend.countPages("/f")).toBe(0);
+      });
+
+      it("counts pages independently per file", async () => {
+        await backend.writePage("/a", 0, filledPage(0x01));
+        await backend.writePage("/b", 0, filledPage(0x02));
+        await backend.writePage("/b", 1, filledPage(0x03));
+
+        expect(await backend.countPages("/a")).toBe(1);
+        expect(await backend.countPages("/b")).toBe(2);
+      });
+
+      it("reflects renameFile (source becomes 0, dest gets count)", async () => {
+        await backend.writePage("/src", 0, filledPage(0x01));
+        await backend.writePage("/src", 1, filledPage(0x02));
+
+        await backend.renameFile("/src", "/dest");
+
+        expect(await backend.countPages("/src")).toBe(0);
+        expect(await backend.countPages("/dest")).toBe(2);
+      });
+
+      it("does not count pages from prefix-matching files", async () => {
+        await backend.writePage("/file1", 0, filledPage(0x01));
+        await backend.writePage("/file10", 0, filledPage(0x02));
+        await backend.writePage("/file10", 1, filledPage(0x03));
+
+        expect(await backend.countPages("/file1")).toBe(1);
+        expect(await backend.countPages("/file10")).toBe(2);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // readMetas batch
+    // ---------------------------------------------------------------
+
+    describe("readMetas batch", () => {
+      it("returns empty array for empty input @fast", async () => {
+        expect(await backend.readMetas([])).toEqual([]);
+      });
+
+      it("reads multiple entries in parallel order @fast", async () => {
+        const m1 = { ...meta, size: 100 };
+        const m2 = { ...meta, size: 200 };
+        await backend.writeMeta("/a", m1);
+        await backend.writeMeta("/b", m2);
+
+        const results = await backend.readMetas(["/a", "/b"]);
+        expect(results).toEqual([m1, m2]);
+      });
+
+      it("returns null for non-existent paths", async () => {
+        await backend.writeMeta("/exists", meta);
+
+        const results = await backend.readMetas(["/exists", "/missing", "/also-missing"]);
+        expect(results[0]).toEqual(meta);
+        expect(results[1]).toBeNull();
+        expect(results[2]).toBeNull();
+      });
+
+      it("returns all nulls when no files exist", async () => {
+        const results = await backend.readMetas(["/a", "/b"]);
+        expect(results).toEqual([null, null]);
+      });
+
+      it("returns results in same order as input paths", async () => {
+        const m1 = { ...meta, size: 111 };
+        const m2 = { ...meta, size: 222 };
+        const m3 = { ...meta, size: 333 };
+        await backend.writeMeta("/x", m1);
+        await backend.writeMeta("/y", m2);
+        await backend.writeMeta("/z", m3);
+
+        // Read in reverse order
+        const results = await backend.readMetas(["/z", "/x", "/y"]);
+        expect(results).toEqual([m3, m1, m2]);
+      });
+
+      it("reflects deleteMeta changes", async () => {
+        await backend.writeMeta("/a", meta);
+        await backend.writeMeta("/b", meta);
+        await backend.deleteMeta("/a");
+
+        const results = await backend.readMetas(["/a", "/b"]);
+        expect(results[0]).toBeNull();
+        expect(results[1]).toEqual(meta);
+      });
+
+      it("handles duplicate paths in input", async () => {
+        await backend.writeMeta("/f", meta);
+
+        const results = await backend.readMetas(["/f", "/f"]);
+        expect(results).toEqual([meta, meta]);
       });
     });
   });
