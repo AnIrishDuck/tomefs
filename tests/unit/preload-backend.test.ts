@@ -199,6 +199,137 @@ describe("PreloadBackend", () => {
       // Second init should not call listFiles again
       expect(counting.calls["listFiles"] ?? 0).toBe(0);
     });
+
+    it("@fast init() retries after transient failure", async () => {
+      let listFilesCallCount = 0;
+      const failOnce: StorageBackend = {
+        async listFiles() {
+          listFilesCallCount++;
+          if (listFilesCallCount === 1) {
+            throw new Error("transient IDB failure");
+          }
+          return [];
+        },
+        async readPage() { return null; },
+        async readPages(_, indices: number[]) { return indices.map(() => null); },
+        async writePage() {},
+        async writePages() {},
+        async deleteFile() {},
+        async deletePagesFrom() {},
+        async renameFile() {},
+        async readMeta() { return null; },
+        async readMetas(paths: string[]) { return paths.map(() => null); },
+        async writeMeta() {},
+        async writeMetas() {},
+        async deleteMeta() {},
+        async deleteMetas() {},
+        async countPages() { return 0; },
+      };
+
+      const backend = new PreloadBackend(failOnce);
+
+      // First init fails
+      await expect(backend.init()).rejects.toThrow("transient IDB failure");
+
+      // Backend is not usable
+      expect(() => backend.readPage("/x", 0)).toThrow("init()");
+
+      // Retry succeeds (listFiles no longer throws)
+      await backend.init();
+      expect(backend.listFiles()).toEqual([]);
+    });
+
+    it("init() retry loads data after previous failure", async () => {
+      const inner = new MemoryBackend();
+
+      // Seed data
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0xdd;
+      await inner.writePage("/f", 0, data);
+      await inner.writeMeta("/f", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 1000,
+      });
+
+      let readMetasCallCount = 0;
+      const failFirstReadMetas: StorageBackend = {
+        async listFiles() { return inner.listFiles(); },
+        async readPage(p: string, i: number) { return inner.readPage(p, i); },
+        async readPages(p: string, indices: number[]) { return inner.readPages(p, indices); },
+        async writePage(p: string, i: number, d: Uint8Array) { return inner.writePage(p, i, d); },
+        async writePages(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) { return inner.writePages(pages); },
+        async deleteFile(p: string) { return inner.deleteFile(p); },
+        async deletePagesFrom(p: string, i: number) { return inner.deletePagesFrom(p, i); },
+        async renameFile(o: string, n: string) { return inner.renameFile(o, n); },
+        async readMeta(p: string) { return inner.readMeta(p); },
+        async readMetas(paths: string[]) {
+          readMetasCallCount++;
+          if (readMetasCallCount === 1) {
+            throw new Error("transient readMetas failure");
+          }
+          return inner.readMetas(paths);
+        },
+        async writeMeta(p: string, m: FileMeta) { return inner.writeMeta(p, m); },
+        async writeMetas(entries: Array<{ path: string; meta: FileMeta }>) { return inner.writeMetas(entries); },
+        async deleteMeta(p: string) { return inner.deleteMeta(p); },
+        async deleteMetas(paths: string[]) { return inner.deleteMetas(paths); },
+        async countPages(p: string) { return inner.countPages(p); },
+      };
+
+      const backend = new PreloadBackend(failFirstReadMetas);
+
+      // First init fails during readMetas
+      await expect(backend.init()).rejects.toThrow("transient readMetas failure");
+
+      // Retry succeeds and loads data
+      await backend.init();
+      const read = backend.readPage("/f", 0);
+      expect(read).not.toBeNull();
+      expect(read![0]).toBe(0xdd);
+      expect(backend.readMeta("/f")?.size).toBe(PAGE_SIZE);
+    });
+
+    it("concurrent init() calls share the same rejection on failure", async () => {
+      let callCount = 0;
+      const alwaysFails: StorageBackend = {
+        async listFiles() {
+          callCount++;
+          throw new Error("always fails");
+        },
+        async readPage() { return null; },
+        async readPages(_, indices: number[]) { return indices.map(() => null); },
+        async writePage() {},
+        async writePages() {},
+        async deleteFile() {},
+        async deletePagesFrom() {},
+        async renameFile() {},
+        async readMeta() { return null; },
+        async readMetas(paths: string[]) { return paths.map(() => null); },
+        async writeMeta() {},
+        async writeMetas() {},
+        async deleteMeta() {},
+        async deleteMetas() {},
+        async countPages() { return 0; },
+      };
+
+      const backend = new PreloadBackend(alwaysFails);
+
+      // Multiple concurrent calls should all reject but only trigger one listFiles
+      const results = await Promise.allSettled([
+        backend.init(),
+        backend.init(),
+        backend.init(),
+      ]);
+
+      expect(results.every((r) => r.status === "rejected")).toBe(true);
+      expect(callCount).toBe(1);
+
+      // After failure, a new call retries (calls listFiles again)
+      await expect(backend.init()).rejects.toThrow("always fails");
+      expect(callCount).toBe(2);
+    });
   });
 
   describe("sync operations after init", () => {

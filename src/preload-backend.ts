@@ -69,7 +69,12 @@ export class PreloadBackend implements SyncStorageBackend {
     if (this.initialized) return;
     if (this.initPromise) return this.initPromise;
 
-    this.initPromise = this.doInit();
+    this.initPromise = this.doInit().catch((err) => {
+      // Clear the cached promise so a subsequent init() call can retry
+      // instead of returning the same rejected promise forever.
+      this.initPromise = null;
+      throw err;
+    });
     return this.initPromise;
   }
 
