@@ -185,6 +185,32 @@ describe("SAB+Atomics Bridge", () => {
       expect(await callClient(clientWorker, "readPage", ["/test", 1])).toBeNull();
     });
 
+    it("@fast deleteFiles removes pages for multiple files in one call", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0x42;
+      await callClient(clientWorker, "writePage", ["/a", 0, data]);
+      await callClient(clientWorker, "writePage", ["/a", 1, data]);
+      await callClient(clientWorker, "writePage", ["/b", 0, data]);
+      await callClient(clientWorker, "writePage", ["/c", 0, data]);
+
+      await callClient(clientWorker, "deleteFiles", [["/a", "/b"]]);
+
+      expect(await callClient(clientWorker, "readPage", ["/a", 0])).toBeNull();
+      expect(await callClient(clientWorker, "readPage", ["/a", 1])).toBeNull();
+      expect(await callClient(clientWorker, "readPage", ["/b", 0])).toBeNull();
+      expect(await callClient(clientWorker, "readPage", ["/c", 0])).not.toBeNull();
+    });
+
+    it("deleteFiles with empty array is a no-op", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0x42;
+      await callClient(clientWorker, "writePage", ["/test", 0, data]);
+
+      await callClient(clientWorker, "deleteFiles", [[]]);
+
+      expect(await callClient(clientWorker, "readPage", ["/test", 0])).not.toBeNull();
+    });
+
     it("deletePagesFrom removes pages at and beyond index", async () => {
       const data = new Uint8Array(PAGE_SIZE);
       data[0] = 0x42;

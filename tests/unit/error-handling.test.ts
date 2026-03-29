@@ -55,6 +55,12 @@ class FailingSyncBackend implements SyncStorageBackend {
     this.inner.deleteFile(path);
   }
 
+  deleteFiles(paths: string[]): void {
+    for (const path of paths) {
+      this.deleteFile(path);
+    }
+  }
+
   deletePagesFrom(path: string, fromPageIndex: number): void {
     this.inner.deletePagesFrom(path, fromPageIndex);
   }
@@ -139,6 +145,12 @@ class FailingAsyncBackend implements StorageBackend {
 
   async deleteFile(path: string): Promise<void> {
     return this.inner.deleteFile(path);
+  }
+
+  async deleteFiles(paths: string[]): Promise<void> {
+    for (const path of paths) {
+      await this.deleteFile(path);
+    }
   }
 
   async renameFile(oldPath: string, newPath: string): Promise<void> {

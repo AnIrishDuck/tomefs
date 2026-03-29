@@ -60,6 +60,12 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     }
   }
 
+  deleteFiles(paths: string[]): void {
+    for (const path of paths) {
+      this.deleteFile(path);
+    }
+  }
+
   deletePagesFrom(path: string, fromPageIndex: number): void {
     const keys = this.filePageKeys.get(path);
     if (!keys) return;

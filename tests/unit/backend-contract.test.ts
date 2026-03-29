@@ -46,6 +46,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     writePage: async (p, i, d) => sync.writePage(p, i, d),
     writePages: async (ps) => sync.writePages(ps),
     deleteFile: async (p) => sync.deleteFile(p),
+    deleteFiles: async (ps) => sync.deleteFiles(ps),
     deletePagesFrom: async (p, i) => sync.deletePagesFrom(p, i),
     renameFile: async (o, n) => sync.renameFile(o, n),
     readMeta: async (p) => sync.readMeta(p),

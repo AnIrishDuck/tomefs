@@ -134,6 +134,44 @@ describe("MemoryBackend", () => {
     });
   });
 
+  describe("deleteFiles", () => {
+    it("@fast removes all pages for multiple files in one call", async () => {
+      await backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/a", 1, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/b", 0, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/c", 0, new Uint8Array(PAGE_SIZE));
+
+      await backend.deleteFiles(["/a", "/b"]);
+
+      expect(await backend.readPage("/a", 0)).toBeNull();
+      expect(await backend.readPage("/a", 1)).toBeNull();
+      expect(await backend.readPage("/b", 0)).toBeNull();
+      expect(await backend.readPage("/c", 0)).not.toBeNull();
+    });
+
+    it("is a no-op for empty array", async () => {
+      await backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      await backend.deleteFiles([]);
+      expect(await backend.readPage("/a", 0)).not.toBeNull();
+    });
+
+    it("handles non-existent paths gracefully", async () => {
+      await backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      await backend.deleteFiles(["/nonexistent", "/also-missing"]);
+      expect(await backend.readPage("/a", 0)).not.toBeNull();
+    });
+
+    it("does not delete pages from prefix-matching paths", async () => {
+      await backend.writePage("/abc", 0, new Uint8Array(PAGE_SIZE));
+      await backend.writePage("/abcdef", 0, new Uint8Array(PAGE_SIZE));
+
+      await backend.deleteFiles(["/abc"]);
+
+      expect(await backend.readPage("/abc", 0)).toBeNull();
+      expect(await backend.readPage("/abcdef", 0)).not.toBeNull();
+    });
+  });
+
   describe("deletePagesFrom", () => {
     it("removes pages at and beyond the given index", async () => {
       await backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
