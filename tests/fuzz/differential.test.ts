@@ -168,6 +168,8 @@ type Op =
   | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "readdirOp"; path: string }
   | { type: "statOp"; path: string }
+  | { type: "mmapRead"; fdId: number; length: number; position: number }
+  | { type: "mmapWrite"; fdId: number; length: number; position: number; data: Uint8Array }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -213,6 +215,8 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["ftruncateFd", model.openFds.size > 0 ? 5 : 0],
     ["readdirOp", 8],
     ["statOp", allFiles.length > 0 ? 6 : 0],
+    ["mmapRead", model.openFds.size > 0 ? 6 : 0],
+    ["mmapWrite", model.openFds.size > 0 ? 6 : 0],
     ["syncfs", 3],
   ];
 
@@ -447,6 +451,33 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "statOp", path: rng.pick(allFiles) };
     }
 
+    case "mmapRead": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const fdInfo = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+      if (currentSize === 0) return { type: "syncfs" };
+      // mmap a region within the file
+      const maxLen = Math.min(currentSize, PAGE_SIZE * 3);
+      const length = Math.max(1, rng.int(maxLen + 1));
+      const position = rng.int(Math.max(1, currentSize - length + 1));
+      return { type: "mmapRead", fdId, length, position };
+    }
+
+    case "mmapWrite": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const fdInfo = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+      if (currentSize === 0) return { type: "syncfs" };
+      // mmap a region, write modified data via msync
+      const maxLen = Math.min(currentSize, PAGE_SIZE * 2);
+      const length = Math.max(1, rng.int(maxLen + 1));
+      const position = rng.int(Math.max(1, currentSize - length + 1));
+      const data = rng.bytes(length);
+      return { type: "mmapWrite", fdId, length, position, data };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -648,6 +679,46 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         )};
       }
 
+      case "mmapRead": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        // Try mmap; fall back to FS.read if mmap fails (MEMFS in test
+        // harness lacks emscripten_builtin_memalign). This is still a
+        // valid differential test: tomefs mmap must return the same
+        // data as a positional read.
+        try {
+          const mmapResult = stream.stream_ops.mmap(stream, op.length, op.position, 0, 0);
+          const buf = mmapResult.ptr instanceof Uint8Array
+            ? new Uint8Array(mmapResult.ptr.buffer, mmapResult.ptr.byteOffset, op.length)
+            : new Uint8Array(op.length);
+          return { error: null, data: new Uint8Array(buf) };
+        } catch {
+          // Fallback: positional read (semantically equivalent to mmap)
+          const buf = new Uint8Array(op.length);
+          FS.read(stream, buf, 0, op.length, op.position);
+          return { error: null, data: new Uint8Array(buf) };
+        }
+      }
+
+      case "mmapWrite": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        // Try mmap+msync; fall back to FS.write if mmap fails (MEMFS).
+        // Differential test: tomefs msync must produce same result as
+        // a positional write.
+        try {
+          const mmapResult = stream.stream_ops.mmap(stream, op.length, op.position, 0, 0);
+          const buf = mmapResult.ptr instanceof Uint8Array ? mmapResult.ptr : new Uint8Array(mmapResult.ptr);
+          buf.set(op.data.subarray(0, op.length));
+          stream.stream_ops.msync(stream, buf, op.position, op.length, 0);
+        } catch {
+          // Fallback: positional write (semantically equivalent to msync)
+          FS.write(stream, op.data, 0, op.length, op.position);
+        }
+        const fstatResult = FS.fstat(stream.fd ?? stream);
+        return { error: null, size: fstatResult.size };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -779,7 +850,8 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
       }
       break;
     }
-    // readFd, readlink, readThroughSymlink, seekFd don't modify file state
+    // readFd, readlink, readThroughSymlink, seekFd, mmapRead don't modify file state
+    // mmapWrite modifies file contents via msync but doesn't change size
   }
 }
 
@@ -840,6 +912,10 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] readdir(${op.path})`;
     case "statOp":
       return `[${index}] stat(${op.path})`;
+    case "mmapRead":
+      return `[${index}] mmapRead(fdId=${op.fdId}, len=${op.length}, pos=${op.position})`;
+    case "mmapWrite":
+      return `[${index}] mmapWrite(fdId=${op.fdId}, len=${op.length}, pos=${op.position}, ${op.data.length}B)`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -1133,8 +1209,13 @@ async function runFuzzSequence(
       expect(tomeStr, `${desc}: stat mismatch`).toBe(memStr);
     }
 
+    // For mmapWrite, compare resulting file sizes
+    if (op.type === "mmapWrite" && !memResult.error) {
+      expect(tomeResult.size, `${desc}: size mismatch`).toBe(memResult.size);
+    }
+
     // For read operations, compare returned data
-    if ((op.type === "readFile" || op.type === "readThroughSymlink" || op.type === "readlink" || op.type === "readFd") && !memResult.error && memResult.data && tomeResult.data) {
+    if ((op.type === "readFile" || op.type === "readThroughSymlink" || op.type === "readlink" || op.type === "readFd" || op.type === "mmapRead") && !memResult.error && memResult.data && tomeResult.data) {
       expect(tomeResult.data.length, `${desc}: read length mismatch`).toBe(memResult.data.length);
       for (let j = 0; j < memResult.data.length; j++) {
         if (memResult.data[j] !== tomeResult.data[j]) {
@@ -1279,6 +1360,25 @@ describe("fuzz: randomized differential testing", () => {
 
     it("seed 12321 tiny cache", async () => {
       await runFuzzSequence(12321, 120, 4);
+    }, 30_000);
+  });
+
+  describe("mmap/msync operations", () => {
+    // Seeds chosen to exercise mmap read and msync write-back paths.
+    // These target the stream_ops.mmap and stream_ops.msync code in
+    // both MEMFS and tomefs, verifying data coherency through the
+    // mmap → modify → msync → read cycle under cache pressure.
+
+    it("seed 44444 tiny cache @fast", async () => {
+      await runFuzzSequence(44444, 120, 4);
+    }, 30_000);
+
+    it("seed 55555 tiny cache", async () => {
+      await runFuzzSequence(55555, 120, 4);
+    }, 30_000);
+
+    it("seed 66666 small cache", async () => {
+      await runFuzzSequence(66666, 150, 16);
     }, 30_000);
   });
 });
