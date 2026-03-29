@@ -118,6 +118,7 @@ export class SyncPageCache {
       pageIndex,
       data: data ? new Uint8Array(data) : new Uint8Array(PAGE_SIZE),
       dirty: false,
+      evicted: false,
     };
 
     this.ensureCapacity();
@@ -191,6 +192,7 @@ export class SyncPageCache {
             ? new Uint8Array(results[i]!)
             : new Uint8Array(PAGE_SIZE),
           dirty: false,
+          evicted: false,
         };
         this.ensureCapacity();
         this.cache.set(key, page);
@@ -313,6 +315,7 @@ export class SyncPageCache {
               ? new Uint8Array(results[i]!)
               : new Uint8Array(PAGE_SIZE),
             dirty: false,
+            evicted: false,
           };
           this.ensureCapacity();
           this.cache.set(key, page);
@@ -443,6 +446,7 @@ export class SyncPageCache {
     if (!keys) return;
     for (const key of keys) {
       const page = this.cache.get(key)!;
+      page.evicted = true;
       this.cache.delete(key);
       if (page === this.mruPage) this.mruPage = null;
     }
@@ -461,6 +465,7 @@ export class SyncPageCache {
     for (const key of keys) {
       const page = this.cache.get(key)!;
       if (page.pageIndex >= fromPageIndex) {
+        page.evicted = true;
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
@@ -507,6 +512,7 @@ export class SyncPageCache {
     if (keys) {
       for (const key of keys) {
         const page = this.cache.get(key)!;
+        page.evicted = true;
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
@@ -536,6 +542,7 @@ export class SyncPageCache {
     if (destKeys) {
       for (const key of destKeys) {
         const page = this.cache.get(key)!;
+        page.evicted = true;
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
@@ -583,6 +590,17 @@ export class SyncPageCache {
       page.dirty = true;
       this.dirtyKeys.add(pageKeyStr(path, pageIndex));
     }
+  }
+
+  /**
+   * Register a page as dirty by key alone (no page lookup).
+   *
+   * Used by tomefs's node-level MRU optimization: when the caller already
+   * holds a valid CachedPage reference and has set page.dirty = true, this
+   * adds the key to the dirtyKeys index without the overhead of getPage().
+   */
+  addDirtyKey(path: string, pageIndex: number): void {
+    this.dirtyKeys.add(pageKeyStr(path, pageIndex));
   }
 
   /** Check if a specific page is in the cache. */
@@ -655,6 +673,7 @@ export class SyncPageCache {
       this._flushes++;
     }
 
+    victim.evicted = true;
     this._evictions++;
     this.cache.delete(firstKey);
     if (victim === this.mruPage) this.mruPage = null;
@@ -723,6 +742,7 @@ export class SyncPageCache {
       const key = victimKeys[i];
       const victim = victims[i];
 
+      victim.evicted = true;
       this.cache.delete(key);
       if (victim === this.mruPage) this.mruPage = null;
 
