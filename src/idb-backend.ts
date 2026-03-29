@@ -270,6 +270,7 @@ export class IdbBackend implements StorageBackend {
   }
 
   async renameFile(oldPath: string, newPath: string): Promise<void> {
+    if (oldPath === newPath) return;
     const db = await this.getDb();
 
     // Single transaction: delete destination pages, then cursor-copy old → new.

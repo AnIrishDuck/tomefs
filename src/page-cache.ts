@@ -531,6 +531,7 @@ export class PageCache {
    * then delegates to the backend's renameFile for an atomic re-key.
    */
   async renameFile(oldPath: string, newPath: string): Promise<void> {
+    if (oldPath === newPath) return;
     // Flush dirty pages so backend has the latest data before re-keying
     await this.flushFile(oldPath);
 

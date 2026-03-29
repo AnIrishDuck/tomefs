@@ -242,6 +242,7 @@ export class OpfsBackend implements StorageBackend {
   }
 
   async renameFile(oldPath: string, newPath: string): Promise<void> {
+    if (oldPath === newPath) return;
     await this.init();
     const oldEncoded = encodePath(oldPath);
     const newEncoded = encodePath(newPath);
