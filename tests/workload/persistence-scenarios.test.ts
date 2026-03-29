@@ -683,3 +683,230 @@ describeWithPersistence(
     }
   },
 );
+
+// ---------------------------------------------------------------------------
+// Scenario 7: B-tree Index Random Updates with Persistence
+//
+// Simulates a Postgres B-tree index across multiple checkpoint cycles.
+// Each cycle performs random read-modify-write operations on index pages
+// (simulating INSERT/UPDATE/DELETE modifying leaf pages), then checkpoints.
+// The random scattered dirty pages stress the cache eviction and flush
+// path differently from sequential patterns — dirty pages are spread
+// across the LRU chain rather than clustered at the tail.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 7: B-tree Index Random Updates",
+  async (backend, maxPages) => {
+    const indexPages = 20;
+    const indexSize = indexPages * PAGE_SIZE;
+    const indexPath = `${MOUNT}/idx_btree`;
+    const cycles = 4;
+    const updatesPerCycle = 15;
+
+    // Track expected page headers (first 64 bytes of each page)
+    // null = unmodified (original pattern), number = modification seed
+    const expectedHeaders: (number | null)[] = new Array(indexPages).fill(null);
+
+    // --- Cycle 0: create the index file ---
+    {
+      const { FS, tomefs } = await mountTome(backend, maxPages);
+      const s = FS.open(indexPath, O.RDWR | O.CREAT, 0o666);
+      for (let p = 0; p < indexPages; p++) {
+        FS.write(s, fillPattern(PAGE_SIZE, p), 0, PAGE_SIZE);
+      }
+      FS.close(s);
+      syncAndUnmount(FS, tomefs);
+    }
+
+    // --- Cycles 1-N: random read-modify-write + checkpoint ---
+    for (let cycle = 1; cycle <= cycles; cycle++) {
+      const { FS, tomefs } = await mountTome(backend, maxPages);
+
+      const s = FS.open(indexPath, O.RDWR);
+      const buf = new Uint8Array(PAGE_SIZE);
+
+      for (let u = 0; u < updatesPerCycle; u++) {
+        // Deterministic random page selection (root→internal→leaf traversal)
+        const root = 0;
+        const leaf = 1 + ((cycle * 37 + u * 13 + 7) % (indexPages - 1));
+
+        // Read root (access pattern, no modify)
+        FS.read(s, buf, 0, PAGE_SIZE, root * PAGE_SIZE);
+
+        // Read leaf page
+        FS.read(s, buf, 0, PAGE_SIZE, leaf * PAGE_SIZE);
+
+        // Verify leaf has expected content
+        const prevHeader = expectedHeaders[leaf];
+        if (prevHeader !== null) {
+          for (let i = 0; i < 64; i++) {
+            if (buf[i] !== ((prevHeader + i * 37) & 0xff)) {
+              throw new Error(
+                `Cycle ${cycle} update ${u}: leaf ${leaf} header mismatch at byte ${i}`,
+              );
+            }
+          }
+        } else {
+          const orig = fillPattern(PAGE_SIZE, leaf);
+          for (let i = 0; i < 64; i++) {
+            if (buf[i] !== orig[i]) {
+              throw new Error(
+                `Cycle ${cycle} update ${u}: leaf ${leaf} original data mismatch at byte ${i}`,
+              );
+            }
+          }
+        }
+
+        // Modify leaf header (simulating index tuple insert)
+        const modSeed = cycle * 10000 + u * 100 + leaf;
+        for (let i = 0; i < 64; i++) {
+          buf[i] = (modSeed + i * 37) & 0xff;
+        }
+        FS.write(s, buf, 0, PAGE_SIZE, leaf * PAGE_SIZE);
+        expectedHeaders[leaf] = modSeed;
+      }
+
+      FS.close(s);
+      syncAndUnmount(FS, tomefs);
+    }
+
+    // --- Final verification: all pages must match expected state ---
+    const { FS: FSv } = await mountTome(backend, maxPages);
+    const stat = FSv.stat(indexPath);
+    expect(stat.size).toBe(indexSize);
+
+    const vs = FSv.open(indexPath, O.RDONLY);
+    const vbuf = new Uint8Array(PAGE_SIZE);
+
+    for (let p = 0; p < indexPages; p++) {
+      FSv.read(vs, vbuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      const orig = fillPattern(PAGE_SIZE, p);
+
+      const modSeed = expectedHeaders[p];
+      if (modSeed !== null) {
+        // Header was modified — check modification
+        for (let i = 0; i < 64; i++) {
+          if (vbuf[i] !== ((modSeed + i * 37) & 0xff)) {
+            throw new Error(
+              `Final verify page ${p} header byte ${i}: ` +
+              `expected ${(modSeed + i * 37) & 0xff}, got ${vbuf[i]}`,
+            );
+          }
+        }
+        // Rest of page should be original
+        for (let i = 64; i < PAGE_SIZE; i++) {
+          if (vbuf[i] !== orig[i]) {
+            throw new Error(
+              `Final verify page ${p} body byte ${i}: ` +
+              `expected ${orig[i]}, got ${vbuf[i]}`,
+            );
+          }
+        }
+      } else {
+        // Unmodified page — check full original
+        for (let i = 0; i < PAGE_SIZE; i++) {
+          if (vbuf[i] !== orig[i]) {
+            throw new Error(
+              `Final verify page ${p} byte ${i}: expected ${orig[i]}, got ${vbuf[i]}`,
+            );
+          }
+        }
+      }
+    }
+    FSv.close(vs);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 8: Heap + Index Concurrent Modification with Persistence
+//
+// Postgres UPDATEs modify both heap pages (tuple data) and index pages
+// (index entries) in the same transaction. When both files compete for
+// cache slots under pressure, dirty pages from one file may be evicted
+// to make room for the other. This tests that interleaved modifications
+// to two files persist correctly through checkpoint cycles.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 8: Heap + Index Concurrent Modification @fast",
+  async (backend, maxPages) => {
+    const heapPath = `${MOUNT}/heap`;
+    const idxPath = `${MOUNT}/idx`;
+    const heapPages = 8;
+    const idxPages = 6;
+
+    // Track expected state per page per file
+    const heapSeeds = new Map<number, number>();
+    const idxSeeds = new Map<number, number>();
+
+    // --- Cycle 0: create both files ---
+    {
+      const { FS, tomefs } = await mountTome(backend, maxPages);
+
+      const hs = FS.open(heapPath, O.RDWR | O.CREAT, 0o666);
+      for (let p = 0; p < heapPages; p++) {
+        FS.write(hs, fillPattern(PAGE_SIZE, p), 0, PAGE_SIZE);
+        heapSeeds.set(p, p);
+      }
+      FS.close(hs);
+
+      const is = FS.open(idxPath, O.RDWR | O.CREAT, 0o666);
+      for (let p = 0; p < idxPages; p++) {
+        const seed = p + 100;
+        FS.write(is, fillPattern(PAGE_SIZE, seed), 0, PAGE_SIZE);
+        idxSeeds.set(p, seed);
+      }
+      FS.close(is);
+
+      syncAndUnmount(FS, tomefs);
+    }
+
+    // --- Cycles 1-3: interleaved heap + index modifications ---
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      const { FS, tomefs } = await mountTome(backend, maxPages);
+
+      const hs = FS.open(heapPath, O.RDWR);
+      const is = FS.open(idxPath, O.RDWR);
+
+      // Simulate 5 UPDATE operations per cycle
+      for (let op = 0; op < 5; op++) {
+        // Modify a heap page
+        const hp = (cycle * 3 + op * 2) % heapPages;
+        const hSeed = cycle * 1000 + op * 10;
+        FS.write(hs, fillPattern(PAGE_SIZE, hSeed), 0, PAGE_SIZE, hp * PAGE_SIZE);
+        heapSeeds.set(hp, hSeed);
+
+        // Modify corresponding index page
+        const ip = (cycle * 2 + op) % idxPages;
+        const iSeed = cycle * 1000 + op * 10 + 500;
+        FS.write(is, fillPattern(PAGE_SIZE, iSeed), 0, PAGE_SIZE, ip * PAGE_SIZE);
+        idxSeeds.set(ip, iSeed);
+      }
+
+      FS.close(hs);
+      FS.close(is);
+      syncAndUnmount(FS, tomefs);
+    }
+
+    // --- Final verification ---
+    const { FS: FSv } = await mountTome(backend, maxPages);
+    const readBuf = new Uint8Array(PAGE_SIZE);
+
+    // Verify heap
+    const hvs = FSv.open(heapPath, O.RDONLY);
+    for (let p = 0; p < heapPages; p++) {
+      FSv.read(hvs, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, heapSeeds.get(p)!);
+    }
+    FSv.close(hvs);
+
+    // Verify index
+    const ivs = FSv.open(idxPath, O.RDONLY);
+    for (let p = 0; p < idxPages; p++) {
+      FSv.read(ivs, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, idxSeeds.get(p)!);
+    }
+    FSv.close(ivs);
+  },
+);
