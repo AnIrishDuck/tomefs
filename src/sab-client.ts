@@ -245,8 +245,22 @@ export class SabClient implements SyncStorageBackend {
 
   readMetas(paths: string[]): Array<FileMeta | null> {
     if (paths.length === 0) return [];
-    const { json } = this.call(OpCode.READ_METAS, { paths });
-    return (json as { metas: Array<FileMeta | null> }).metas;
+
+    // If the batch fits in a single call, use the fast path.
+    // Otherwise chunk to avoid overflowing the SAB response buffer
+    // (the worker encodes all FileMeta objects into the shared buffer).
+    if (paths.length <= this.maxBatchMetas) {
+      const { json } = this.call(OpCode.READ_METAS, { paths });
+      return (json as { metas: Array<FileMeta | null> }).metas;
+    }
+
+    const results: Array<FileMeta | null> = [];
+    for (let i = 0; i < paths.length; i += this.maxBatchMetas) {
+      const chunk = paths.slice(i, i + this.maxBatchMetas);
+      const { json } = this.call(OpCode.READ_METAS, { paths: chunk });
+      results.push(...(json as { metas: Array<FileMeta | null> }).metas);
+    }
+    return results;
   }
 
   deleteMetas(paths: string[]): void {
