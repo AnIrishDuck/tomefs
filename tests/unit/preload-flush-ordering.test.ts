@@ -94,6 +94,9 @@ class OrderTrackingBackend implements StorageBackend {
   async countPages(path: string) {
     return this.inner.countPages(path);
   }
+  async maxPageIndex(path: string) {
+    return this.inner.maxPageIndex(path);
+  }
   async listFiles() {
     return this.inner.listFiles();
   }
@@ -172,6 +175,9 @@ class CrashAfterNOpsBackend implements StorageBackend {
   }
   async countPages(path: string) {
     return this.inner.countPages(path);
+  }
+  async maxPageIndex(path: string) {
+    return this.inner.maxPageIndex(path);
   }
   async listFiles() {
     return this.inner.listFiles();
