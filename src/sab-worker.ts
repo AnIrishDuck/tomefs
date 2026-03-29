@@ -359,6 +359,20 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.LIST_FILES_RANGE: {
+        const offset = params.offset as number;
+        const limit = params.limit as number;
+        const allFiles = await this.backend.listFiles();
+        const total = allFiles.length;
+        const files = allFiles.slice(offset, offset + limit);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          files,
+          total,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       default:
         throw new Error(`Unknown opcode: ${opcode}`);
     }
