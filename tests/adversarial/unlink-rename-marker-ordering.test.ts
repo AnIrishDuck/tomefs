@@ -52,7 +52,7 @@ function verifyPattern(buf: Uint8Array, size: number, seed: number): boolean {
   return true;
 }
 
-async function mountTome(backend: SyncMemoryBackend, maxPages = 64) {
+async function mountTome(backend: SyncStorageBackend, maxPages = 64) {
   const { default: createModule } = await import(
     join(__dirname, "../harness/emscripten_fs.mjs")
   );
@@ -424,6 +424,9 @@ function createTrackingBackend(
     },
     countPages(path) {
       return inner.countPages(path);
+    },
+    maxPageIndex(path) {
+      return inner.maxPageIndex(path);
     },
     listFiles() {
       return inner.listFiles();
