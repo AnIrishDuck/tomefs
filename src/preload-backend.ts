@@ -230,6 +230,19 @@ export class PreloadBackend implements SyncStorageBackend {
     return keys ? keys.size : 0;
   }
 
+  maxPageIndex(path: string): number {
+    this.assertInitialized();
+    const keys = this.filePageKeys.get(path);
+    if (!keys || keys.size === 0) return -1;
+    let max = -1;
+    for (const key of keys) {
+      const nullIdx = key.indexOf("\0");
+      const idx = parseInt(key.substring(nullIdx + 1), 10);
+      if (idx > max) max = idx;
+    }
+    return max;
+  }
+
   deleteFiles(paths: string[]): void {
     this.assertInitialized();
     for (const path of paths) {

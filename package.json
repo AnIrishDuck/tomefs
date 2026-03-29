@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "description": "A bounded, page-cached filesystem layer for PGlite and Emscripten",
   "type": "module",
+  "sideEffects": false,
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {

@@ -61,6 +61,9 @@ export interface SyncStorageBackend {
   /** Count the number of pages stored for a file. Returns 0 if no pages exist. */
   countPages(path: string): number;
 
+  /** Return the highest page index stored for a file, or -1 if no pages exist. */
+  maxPageIndex(path: string): number;
+
   /** List all paths that have metadata stored. */
   listFiles(): string[];
 }

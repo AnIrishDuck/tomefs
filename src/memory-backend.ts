@@ -106,6 +106,18 @@ export class MemoryBackend implements StorageBackend {
     return count;
   }
 
+  async maxPageIndex(path: string): Promise<number> {
+    const keys = this.filePageKeys.get(path);
+    if (!keys || keys.size === 0) return -1;
+    let max = -1;
+    for (const key of keys) {
+      const nullIdx = key.indexOf("\0");
+      const idx = parseInt(key.substring(nullIdx + 1), 10);
+      if (idx > max) max = idx;
+    }
+    return max;
+  }
+
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     // Clear destination pages first to avoid orphans when source has fewer
     // pages than destination (same contract as IDB and OPFS backends).

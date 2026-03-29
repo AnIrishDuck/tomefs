@@ -348,6 +348,17 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.MAX_PAGE_INDEX: {
+        const maxIdx = await this.backend.maxPageIndex(
+          params.path as string,
+        );
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          maxIdx,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       default:
         throw new Error(`Unknown opcode: ${opcode}`);
     }
