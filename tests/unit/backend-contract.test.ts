@@ -182,6 +182,19 @@ for (const factory of factories) {
 
         expect(await backend.readPage("/b", 0)).toEqual(filledPage(0x02));
       });
+
+      it("does not affect files with a prefix match", async () => {
+        await backend.writePage("/file1", 0, filledPage(0x01));
+        await backend.writePage("/file10", 0, filledPage(0x10));
+        await backend.writePage("/file10", 1, filledPage(0x11));
+
+        await backend.renameFile("/file1", "/renamed");
+
+        expect(await backend.readPage("/renamed", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readPage("/file1", 0)).toBeNull();
+        expect(await backend.readPage("/file10", 0)).toEqual(filledPage(0x10));
+        expect(await backend.readPage("/file10", 1)).toEqual(filledPage(0x11));
+      });
     });
 
     // ---------------------------------------------------------------
@@ -344,6 +357,20 @@ for (const factory of factories) {
 
         await backend.deletePagesFrom("/a", 0);
         expect(await backend.readPage("/b", 0)).toEqual(filledPage(0xbb));
+      });
+
+      it("does not affect files with a prefix match", async () => {
+        await backend.writePage("/file1", 0, filledPage(0x01));
+        await backend.writePage("/file1", 1, filledPage(0x02));
+        await backend.writePage("/file10", 0, filledPage(0x10));
+        await backend.writePage("/file10", 1, filledPage(0x11));
+
+        await backend.deletePagesFrom("/file1", 1);
+
+        expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readPage("/file1", 1)).toBeNull();
+        expect(await backend.readPage("/file10", 0)).toEqual(filledPage(0x10));
+        expect(await backend.readPage("/file10", 1)).toEqual(filledPage(0x11));
       });
     });
 

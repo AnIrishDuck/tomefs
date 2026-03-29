@@ -498,6 +498,46 @@ describe("PageCache", () => {
       expect(n).toBe(10);
       expect(buf[0]).toBe(0xff);
     });
+
+    it("evicts cached destination pages before rename", async () => {
+      // Write 3 pages to destination
+      await cache.write("/dest", fillBuf(PAGE_SIZE * 3, 0xdd), 0, PAGE_SIZE * 3, 0, 0);
+      await cache.flushFile("/dest");
+
+      // Write 1 page to source
+      await cache.write("/src", fillBuf(PAGE_SIZE, 0xaa), 0, PAGE_SIZE, 0, 0);
+
+      await cache.renameFile("/src", "/dest");
+
+      // Destination page 0 should be source data
+      const buf0 = new Uint8Array(PAGE_SIZE);
+      await cache.read("/dest", buf0, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf0[0]).toBe(0xaa);
+
+      // Stale destination pages should not be cached
+      expect(cache.has("/dest", 1)).toBe(false);
+      expect(cache.has("/dest", 2)).toBe(false);
+
+      // Backend should have no orphan pages
+      expect(await backend.readPage("/dest", 1)).toBeNull();
+      expect(await backend.readPage("/dest", 2)).toBeNull();
+    });
+
+    it("evicts dirty destination pages without flushing them", async () => {
+      // Write dirty page to destination (not flushed)
+      await cache.write("/dest", fillBuf(PAGE_SIZE, 0xdd), 0, PAGE_SIZE, 0, 0);
+      expect(cache.isDirty("/dest", 0)).toBe(true);
+
+      // Write source page
+      await cache.write("/src", fillBuf(PAGE_SIZE, 0xaa), 0, PAGE_SIZE, 0, 0);
+
+      await cache.renameFile("/src", "/dest");
+
+      // Destination should have source data
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/dest", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xaa);
+    });
   });
 
   describe("batch read pre-loading", () => {

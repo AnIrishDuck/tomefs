@@ -534,6 +534,19 @@ export class PageCache {
     // Flush dirty pages so backend has the latest data before re-keying
     await this.flushFile(oldPath);
 
+    // Evict any cached pages for the destination path. The backend's
+    // renameFile clears destination pages before copying, so cached
+    // destination pages would be stale after the backend call.
+    const destKeys = this.filePages.get(newPath);
+    if (destKeys) {
+      for (const key of destKeys) {
+        this.cache.delete(key);
+        if (key === this.mruKey) this.mruKey = null;
+        this.dirtyKeys.delete(key);
+      }
+      this.filePages.delete(newPath);
+    }
+
     // Re-key all pages in the backend
     await this.backend.renameFile(oldPath, newPath);
 
