@@ -756,7 +756,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     return visited;
   }
 
-  /**
+/**
    * Restore the directory tree from backend metadata.
    * Creates directories, files, and symlinks from stored metadata.
    * File page data remains in the backend and is loaded on demand.
@@ -827,7 +827,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           //     intermediate pages were never written. Trust meta.size.
           // (b) Crash after truncation deleted tail pages but before metadata
           //     was updated. The last expected page is missing. Fall back to
-          //     page-count sizing to avoid reading beyond stored data.
+          //     probing for the true extent.
           // Distinguish by probing the last page implied by meta.size.
           const lastPageIndex = pagesFromMeta - 1;
           const lastPage = backend.readPage(storagePath, lastPageIndex);
@@ -835,15 +835,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             // Last page exists — sparse file with gaps, trust metadata
             fileSize = meta.size;
           } else {
-            // Last page missing — crash recovery, use page count
-            fileSize = actualPageCount * PAGE_SIZE;
+            // Last page missing — crash recovery. Use maxPageIndex to
+            // find the true highest page index rather than assuming
+            // pages are contiguous from index 0 (countPages only counts
+            // stored pages, not their maximum index — non-contiguous
+            // pages from allocate + crash would be lost otherwise).
+            const highIdx = backend.maxPageIndex(storagePath);
+            fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
           }
         } else {
           // More pages than metadata expects: crash occurred between page
-          // writes and metadata sync. Use page count as ground truth — we
-          // lose sub-page precision but preserve all data that made it to
-          // the backend.
-          fileSize = actualPageCount * PAGE_SIZE;
+          // writes and metadata sync. Use maxPageIndex to find the true
+          // highest page index — pages may be non-contiguous if
+          // allocate/seek-past-end created sparse pages that were evicted
+          // before the crash. countPages only counts stored pages, not
+          // their maximum index.
+          const highIdx = backend.maxPageIndex(storagePath);
+          fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
         }
         node.usedBytes = fileSize;
         node.atime = meta.atime ?? meta.mtime;

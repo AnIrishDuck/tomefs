@@ -246,6 +246,29 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async maxPageIndex(path: string): Promise<number> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGES_STORE, "readonly");
+      const store = tx.objectStore(PAGES_STORE);
+      // Open a reverse cursor over this file's key range to find the highest index.
+      const range = IDBKeyRange.bound([path, 0], [path, ""], false, true);
+      const request = store.openCursor(range, "prev");
+
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(-1);
+        } else {
+          const [, pageIndex] = cursor.key as [string, number];
+          resolve(pageIndex);
+        }
+      };
+
+      request.onerror = () => reject(request.error);
+    });
+  }
+
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     const db = await this.getDb();
 

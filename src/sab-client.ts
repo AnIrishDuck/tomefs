@@ -266,6 +266,11 @@ export class SabClient implements SyncStorageBackend {
     }
   }
 
+  maxPageIndex(path: string): number {
+    const { json } = this.call(OpCode.MAX_PAGE_INDEX, { path });
+    return (json as { maxIdx: number }).maxIdx;
+  }
+
   listFiles(): string[] {
     const { json } = this.call(OpCode.LIST_FILES, {});
     return (json as { files: string[] }).files;

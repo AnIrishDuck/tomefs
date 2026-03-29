@@ -40,6 +40,9 @@ export interface StorageBackend {
   /** Count the number of pages stored for a file. Returns 0 if no pages exist. */
   countPages(path: string): Promise<number>;
 
+  /** Return the highest page index stored for a file, or -1 if no pages exist. */
+  maxPageIndex(path: string): Promise<number>;
+
   /** Read file metadata. Returns null if the file doesn't exist. */
   readMeta(path: string): Promise<FileMeta | null>;
 

@@ -93,6 +93,10 @@ class CountingBackend implements StorageBackend {
     this.count("countPages");
     return this.inner.countPages(path);
   }
+  async maxPageIndex(path: string) {
+    this.count("maxPageIndex");
+    return this.inner.maxPageIndex(path);
+  }
   async listFiles() {
     this.count("listFiles");
     return this.inner.listFiles();
@@ -1026,6 +1030,7 @@ describe("PreloadBackend", () => {
       async deleteMeta(path: string) { return this.inner.deleteMeta(path); }
       async deleteMetas(paths: string[]) { return this.inner.deleteMetas(paths); }
       async countPages(path: string) { return this.inner.countPages(path); }
+      async maxPageIndex(path: string) { return this.inner.maxPageIndex(path); }
       async listFiles() { return this.inner.listFiles(); }
     }
 

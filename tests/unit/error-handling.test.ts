@@ -101,6 +101,10 @@ class FailingSyncBackend implements SyncStorageBackend {
     return this.inner.countPages(path);
   }
 
+  maxPageIndex(path: string): number {
+    return this.inner.maxPageIndex(path);
+  }
+
   listFiles(): string[] {
     return this.inner.listFiles();
   }
@@ -192,6 +196,10 @@ class FailingAsyncBackend implements StorageBackend {
 
   async countPages(path: string): Promise<number> {
     return this.inner.countPages(path);
+  }
+
+  async maxPageIndex(path: string): Promise<number> {
+    return this.inner.maxPageIndex(path);
   }
 
   async listFiles(): Promise<string[]> {

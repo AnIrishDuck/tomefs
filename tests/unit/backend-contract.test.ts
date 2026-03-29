@@ -53,11 +53,11 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     readMetas: async (ps) => sync.readMetas(ps),
     writeMeta: async (p, m) => sync.writeMeta(p, m),
     writeMetas: async (e) => sync.writeMetas(e),
-    readMetas: async (ps) => sync.readMetas(ps),
     deleteMeta: async (p) => sync.deleteMeta(p),
     deleteMetas: async (ps) => sync.deleteMetas(ps),
     listFiles: async () => sync.listFiles(),
     countPages: async (p) => sync.countPages(p),
+    maxPageIndex: async (p) => sync.maxPageIndex(p),
   };
 }
 
@@ -601,6 +601,75 @@ for (const factory of factories) {
 
         expect(await backend.countPages("/file1")).toBe(1);
         expect(await backend.countPages("/file10")).toBe(2);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // maxPageIndex
+    // ---------------------------------------------------------------
+
+    describe("maxPageIndex", () => {
+      it("returns -1 for non-existent file @fast", async () => {
+        expect(await backend.maxPageIndex("/missing")).toBe(-1);
+      });
+
+      it("returns highest index for contiguous pages @fast", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 1, filledPage(0x02));
+        await backend.writePage("/f", 2, filledPage(0x03));
+
+        expect(await backend.maxPageIndex("/f")).toBe(2);
+      });
+
+      it("returns highest index for sparse (non-contiguous) pages", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 5, filledPage(0x05));
+
+        expect(await backend.maxPageIndex("/f")).toBe(5);
+      });
+
+      it("reflects deletePagesFrom", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 3, filledPage(0x03));
+        await backend.writePage("/f", 7, filledPage(0x07));
+
+        await backend.deletePagesFrom("/f", 4);
+
+        expect(await backend.maxPageIndex("/f")).toBe(3);
+      });
+
+      it("returns -1 after deleteFile", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 5, filledPage(0x05));
+
+        await backend.deleteFile("/f");
+
+        expect(await backend.maxPageIndex("/f")).toBe(-1);
+      });
+
+      it("tracks files independently", async () => {
+        await backend.writePage("/a", 0, filledPage(0x01));
+        await backend.writePage("/a", 10, filledPage(0x0a));
+        await backend.writePage("/b", 0, filledPage(0x01));
+        await backend.writePage("/b", 3, filledPage(0x03));
+
+        expect(await backend.maxPageIndex("/a")).toBe(10);
+        expect(await backend.maxPageIndex("/b")).toBe(3);
+      });
+
+      it("reflects renameFile", async () => {
+        await backend.writePage("/src", 0, filledPage(0x01));
+        await backend.writePage("/src", 8, filledPage(0x08));
+
+        await backend.renameFile("/src", "/dest");
+
+        expect(await backend.maxPageIndex("/src")).toBe(-1);
+        expect(await backend.maxPageIndex("/dest")).toBe(8);
+      });
+
+      it("returns 0 for a single page at index 0", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        expect(await backend.maxPageIndex("/f")).toBe(0);
       });
     });
 
