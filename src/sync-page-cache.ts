@@ -527,6 +527,21 @@ export class SyncPageCache {
     // Flush dirty pages so backend has the latest data before re-keying
     this.flushFile(oldPath);
 
+    // Evict any cached pages for the destination path. The backend's
+    // renameFile clears destination pages before copying, so cached
+    // destination pages would be stale after the backend call. Evict
+    // (not flush) because they're about to be overwritten in the backend.
+    const destKeys = this.filePages.get(newPath);
+    if (destKeys) {
+      for (const key of destKeys) {
+        const page = this.cache.get(key)!;
+        this.cache.delete(key);
+        if (page === this.mruPage) this.mruPage = null;
+        this.dirtyKeys.delete(key);
+      }
+      this.filePages.delete(newPath);
+    }
+
     // Re-key all pages in the backend atomically
     this.backend.renameFile(oldPath, newPath);
 

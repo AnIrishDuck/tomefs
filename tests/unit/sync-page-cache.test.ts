@@ -285,6 +285,56 @@ describe("SyncPageCache", () => {
       cache.read("/new", buf, 0, 1, 0, 1);
       expect(buf[0]).toBe(42);
     });
+
+    it("evicts cached destination pages before rename @fast", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write 3 pages to destination
+      const destData = new Uint8Array(PAGE_SIZE * 3);
+      destData.fill(0xdd);
+      cache.write("/dest", destData, 0, PAGE_SIZE * 3, 0, 0);
+      cache.flushFile("/dest");
+
+      // Write 1 page to source
+      const srcData = new Uint8Array(PAGE_SIZE);
+      srcData.fill(0xaa);
+      cache.write("/src", srcData, 0, PAGE_SIZE, 0, 0);
+
+      cache.renameFile("/src", "/dest");
+
+      // Destination page 0 should be source data
+      const buf0 = new Uint8Array(PAGE_SIZE);
+      cache.read("/dest", buf0, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf0[0]).toBe(0xaa);
+
+      // Stale destination pages should not be cached
+      expect(cache.has("/dest", 1)).toBe(false);
+      expect(cache.has("/dest", 2)).toBe(false);
+
+      // Backend should also have no orphan pages
+      expect(backend.readPage("/dest", 1)).toBeNull();
+      expect(backend.readPage("/dest", 2)).toBeNull();
+    });
+
+    it("evicts dirty destination pages without flushing them", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write dirty page to destination (not flushed)
+      const destData = new Uint8Array(PAGE_SIZE);
+      destData.fill(0xdd);
+      cache.write("/dest", destData, 0, PAGE_SIZE, 0, 0);
+      expect(cache.isDirty("/dest", 0)).toBe(true);
+
+      // Write source page
+      const srcData = new Uint8Array(PAGE_SIZE);
+      srcData.fill(0xaa);
+      cache.write("/src", srcData, 0, PAGE_SIZE, 0, 0);
+
+      cache.renameFile("/src", "/dest");
+
+      // Destination should have source data, not the dirty dest data
+      const buf = new Uint8Array(PAGE_SIZE);
+      cache.read("/dest", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xaa);
+    });
   });
 
   describe("batch readPages optimization", () => {
