@@ -51,6 +51,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     readMeta: async (p) => sync.readMeta(p),
     writeMeta: async (p, m) => sync.writeMeta(p, m),
     writeMetas: async (e) => sync.writeMetas(e),
+    readMetas: async (ps) => sync.readMetas(ps),
     deleteMeta: async (p) => sync.deleteMeta(p),
     deleteMetas: async (ps) => sync.deleteMetas(ps),
     listFiles: async () => sync.listFiles(),
