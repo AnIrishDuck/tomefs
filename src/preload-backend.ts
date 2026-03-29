@@ -449,12 +449,19 @@ export class PreloadBackend implements SyncStorageBackend {
     }
 
     // Partition dirty metadata the same way as pages.
+    // A path needs late-writing if it appears in EITHER deletedMeta or
+    // deletedFiles. The deletedFiles check is critical: when a file is
+    // deleted and then metadata is re-written at the same path (e.g.,
+    // rename-overwrite), writeMeta() clears the path from deletedMeta.
+    // Without also checking deletedFiles, the new metadata would be
+    // written early (before the delete), creating a crash-safety window
+    // where metadata points to stale or nonexistent pages.
     const earlyMeta: Array<{ path: string; meta: FileMeta }> = [];
     const lateMeta: Array<{ path: string; meta: FileMeta }> = [];
     for (const path of flushedMetaPaths) {
       const m = this.meta.get(path);
       if (m) {
-        if (this.deletedMeta.has(path)) {
+        if (this.deletedMeta.has(path) || this.deletedFiles.has(path)) {
           lateMeta.push({ path, meta: m });
         } else {
           earlyMeta.push({ path, meta: m });
