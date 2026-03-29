@@ -82,7 +82,12 @@ export class OpfsBackend implements StorageBackend {
       this.metaDir = await this.root.getDirectoryHandle(META_DIR, {
         create: true,
       });
-    })();
+    })().catch((err) => {
+      // Clear the cached promise so a subsequent init() call can retry
+      // instead of returning the same rejected promise forever.
+      this.initPromise = null;
+      throw err;
+    });
 
     return this.initPromise;
   }

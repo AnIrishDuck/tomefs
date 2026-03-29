@@ -838,6 +838,121 @@ describe("OpfsBackend", () => {
   });
 
   // -------------------------------------------------------------------
+  // Init retry after transient failure
+  // -------------------------------------------------------------------
+
+  describe("init retry after transient failure", () => {
+    it("retries init after transient getDirectoryHandle failure @fast", async () => {
+      const root = createFakeOpfsRoot();
+      const original = root.getDirectoryHandle.bind(root);
+      let failCount = 0;
+
+      // First call to getDirectoryHandle fails (simulating transient OPFS error)
+      (root as any).getDirectoryHandle = async (
+        name: string,
+        options?: { create?: boolean },
+      ) => {
+        if (failCount < 1) {
+          failCount++;
+          throw new DOMException("Temporary I/O error", "InvalidStateError");
+        }
+        return original(name, options);
+      };
+
+      const b = new OpfsBackend({ root: root as any });
+
+      // First init should fail
+      await expect(b.readPage("/test", 0)).rejects.toThrow("Temporary I/O error");
+
+      // Second init should succeed (the transient error resolved)
+      const result = await b.readPage("/test", 0);
+      expect(result).toBeNull();
+
+      await b.destroy();
+    });
+
+    it("loads data correctly after retried init", async () => {
+      // Set up a root with pre-existing data using a working backend
+      const root = createFakeOpfsRoot();
+      const setup = new OpfsBackend({ root: root as any });
+      await setup.writePage("/file", 0, filledPage(0xab));
+      await setup.writeMeta("/file", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+
+      // Create a new backend on the same root, but make init fail once
+      const original = root.getDirectoryHandle.bind(root);
+      let failCount = 0;
+      (root as any).getDirectoryHandle = async (
+        name: string,
+        options?: { create?: boolean },
+      ) => {
+        if (failCount < 1) {
+          failCount++;
+          throw new DOMException("Quota exceeded", "QuotaExceededError");
+        }
+        return original(name, options);
+      };
+
+      const b = new OpfsBackend({ root: root as any });
+
+      // First attempt fails
+      await expect(b.readPage("/file", 0)).rejects.toThrow("Quota exceeded");
+
+      // After transient error clears, data is accessible
+      const page = await b.readPage("/file", 0);
+      expect(page).toEqual(filledPage(0xab));
+
+      const meta = await b.readMeta("/file");
+      expect(meta).toEqual({
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+
+      await b.destroy();
+    });
+
+    it("concurrent init callers share the same rejection then retry succeeds", async () => {
+      const root = createFakeOpfsRoot();
+      const original = root.getDirectoryHandle.bind(root);
+      let failCount = 0;
+
+      (root as any).getDirectoryHandle = async (
+        name: string,
+        options?: { create?: boolean },
+      ) => {
+        if (failCount < 1) {
+          failCount++;
+          throw new DOMException("Busy", "InvalidStateError");
+        }
+        return original(name, options);
+      };
+
+      const b = new OpfsBackend({ root: root as any });
+
+      // Two concurrent callers both get the same rejection
+      const [r1, r2] = await Promise.allSettled([
+        b.readPage("/a", 0),
+        b.listFiles(),
+      ]);
+
+      expect(r1.status).toBe("rejected");
+      expect(r2.status).toBe("rejected");
+
+      // After transient error resolves, new calls succeed
+      const files = await b.listFiles();
+      expect(files).toEqual([]);
+
+      await b.destroy();
+    });
+  });
+
+  // -------------------------------------------------------------------
   // Lifecycle
   // -------------------------------------------------------------------
 
