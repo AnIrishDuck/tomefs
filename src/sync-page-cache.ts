@@ -524,6 +524,7 @@ export class SyncPageCache {
    * individual readPage calls.
    */
   renameFile(oldPath: string, newPath: string): void {
+    if (oldPath === newPath) return;
     // Flush dirty pages so backend has the latest data before re-keying
     this.flushFile(oldPath);
 

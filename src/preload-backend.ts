@@ -252,6 +252,7 @@ export class PreloadBackend implements SyncStorageBackend {
 
   renameFile(oldPath: string, newPath: string): void {
     this.assertInitialized();
+    if (oldPath === newPath) return;
     const oldKeys = this.filePageKeys.get(oldPath);
     if (!oldKeys) {
       // No pages to move — still track the deletion for flush

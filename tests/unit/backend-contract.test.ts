@@ -156,6 +156,38 @@ for (const factory of factories) {
     // renameFile: basic behavior
     // ---------------------------------------------------------------
 
+    describe("renameFile self-rename @fast", () => {
+      it("self-rename preserves all pages", async () => {
+        await backend.writePage("/f", 0, filledPage(0xaa));
+        await backend.writePage("/f", 1, filledPage(0xbb));
+
+        await backend.renameFile("/f", "/f");
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0xaa));
+        expect(await backend.readPage("/f", 1)).toEqual(filledPage(0xbb));
+        expect(await backend.countPages("/f")).toBe(2);
+      });
+
+      it("self-rename preserves sparse pages", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 5, filledPage(0x05));
+        await backend.writePage("/f", 10, filledPage(0x0a));
+
+        await backend.renameFile("/f", "/f");
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readPage("/f", 5)).toEqual(filledPage(0x05));
+        expect(await backend.readPage("/f", 10)).toEqual(filledPage(0x0a));
+        expect(await backend.countPages("/f")).toBe(3);
+        expect(await backend.maxPageIndex("/f")).toBe(10);
+      });
+
+      it("self-rename of non-existent file is a no-op", async () => {
+        await backend.renameFile("/missing", "/missing");
+        expect(await backend.readPage("/missing", 0)).toBeNull();
+      });
+    });
+
     describe("renameFile basics", () => {
       it("moves all pages from old to new path", async () => {
         await backend.writePage("/old", 0, filledPage(0x01));
@@ -194,6 +226,66 @@ for (const factory of factories) {
         expect(await backend.readPage("/file1", 0)).toBeNull();
         expect(await backend.readPage("/file10", 0)).toEqual(filledPage(0x10));
         expect(await backend.readPage("/file10", 1)).toEqual(filledPage(0x11));
+      });
+
+      it("preserves non-contiguous (sparse) pages during rename", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 3, filledPage(0x03));
+        await backend.writePage("/f", 7, filledPage(0x07));
+
+        await backend.renameFile("/f", "/g");
+
+        expect(await backend.readPage("/g", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readPage("/g", 1)).toBeNull();
+        expect(await backend.readPage("/g", 2)).toBeNull();
+        expect(await backend.readPage("/g", 3)).toEqual(filledPage(0x03));
+        expect(await backend.readPage("/g", 7)).toEqual(filledPage(0x07));
+        expect(await backend.countPages("/g")).toBe(3);
+        expect(await backend.maxPageIndex("/g")).toBe(7);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // deletePagesFrom with sparse pages
+    // ---------------------------------------------------------------
+
+    describe("deletePagesFrom with sparse pages", () => {
+      it("deletes only sparse pages at or beyond the threshold", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 3, filledPage(0x03));
+        await backend.writePage("/f", 7, filledPage(0x07));
+        await backend.writePage("/f", 10, filledPage(0x0a));
+
+        await backend.deletePagesFrom("/f", 5);
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readPage("/f", 3)).toEqual(filledPage(0x03));
+        expect(await backend.readPage("/f", 7)).toBeNull();
+        expect(await backend.readPage("/f", 10)).toBeNull();
+        expect(await backend.countPages("/f")).toBe(2);
+        expect(await backend.maxPageIndex("/f")).toBe(3);
+      });
+
+      it("threshold between two sparse pages deletes only the later one", async () => {
+        await backend.writePage("/f", 2, filledPage(0x02));
+        await backend.writePage("/f", 8, filledPage(0x08));
+
+        await backend.deletePagesFrom("/f", 3);
+
+        expect(await backend.readPage("/f", 2)).toEqual(filledPage(0x02));
+        expect(await backend.readPage("/f", 8)).toBeNull();
+        expect(await backend.countPages("/f")).toBe(1);
+      });
+
+      it("threshold at exact sparse page index deletes that page", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 5, filledPage(0x05));
+
+        await backend.deletePagesFrom("/f", 5);
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readPage("/f", 5)).toBeNull();
+        expect(await backend.countPages("/f")).toBe(1);
       });
     });
 
