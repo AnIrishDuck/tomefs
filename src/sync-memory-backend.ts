@@ -111,6 +111,10 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     return m ? { ...m } : null;
   }
 
+  readMetas(paths: string[]): Array<FileMeta | null> {
+    return paths.map((path) => this.readMeta(path));
+  }
+
   writeMeta(path: string, meta: FileMeta): void {
     this.meta.set(path, { ...meta });
   }

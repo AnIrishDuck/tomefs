@@ -123,6 +123,13 @@ export class MemoryBackend implements StorageBackend {
     return meta ? { ...meta } : null;
   }
 
+  async readMetas(paths: string[]): Promise<Array<FileMeta | null>> {
+    return paths.map((path) => {
+      const meta = this.meta.get(path);
+      return meta ? { ...meta } : null;
+    });
+  }
+
   async writeMeta(path: string, meta: FileMeta): Promise<void> {
     this.meta.set(path, { ...meta });
   }

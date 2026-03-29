@@ -71,6 +71,10 @@ class FailingSyncBackend implements SyncStorageBackend {
     return this.inner.readMeta(path);
   }
 
+  readMetas(paths: string[]): Array<FileMeta | null> {
+    return this.inner.readMetas(paths);
+  }
+
   writeMeta(path: string, meta: FileMeta): void {
     this.inner.writeMeta(path, meta);
   }
@@ -150,6 +154,10 @@ class FailingAsyncBackend implements StorageBackend {
 
   async readMeta(path: string): Promise<FileMeta | null> {
     return this.inner.readMeta(path);
+  }
+
+  async readMetas(paths: string[]): Promise<Array<FileMeta | null>> {
+    return this.inner.readMetas(paths);
   }
 
   async writeMeta(path: string, meta: FileMeta): Promise<void> {

@@ -351,6 +351,14 @@ export class OpfsBackend implements StorageBackend {
     }
   }
 
+  async readMetas(paths: string[]): Promise<Array<FileMeta | null>> {
+    if (paths.length === 0) return [];
+    if (paths.length === 1) {
+      return [await this.readMeta(paths[0])];
+    }
+    return Promise.all(paths.map((path) => this.readMeta(path)));
+  }
+
   async writeMeta(path: string, meta: FileMeta): Promise<void> {
     await this.init();
     const encoded = encodePath(path);

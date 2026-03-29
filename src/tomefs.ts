@@ -738,13 +738,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       return da - db || a.localeCompare(b);
     });
 
-    for (const path of paths) {
-      // Skip /__deleted_* marker entries — these are orphaned pages from
-      // files that had open fds when the process crashed. They'll be
-      // cleaned up by the first syncfs call (orphan cleanup pass).
-      if (path.startsWith("/__deleted_")) continue;
+    // Filter out /__deleted_* marker entries — these are orphaned pages from
+    // files that had open fds when the process crashed. They'll be
+    // cleaned up by the first syncfs call (orphan cleanup pass).
+    const livePaths = paths.filter((p) => !p.startsWith("/__deleted_"));
 
-      const meta = backend.readMeta(path);
+    // Batch-read all metadata in a single backend call to reduce SAB bridge
+    // round-trips from O(n) to O(1) during mount/restore.
+    const allMeta = backend.readMetas(livePaths);
+
+    for (let i = 0; i < livePaths.length; i++) {
+      const path = livePaths[i];
+      const meta = allMeta[i];
       if (!meta) continue;
 
       // Split path into parent + name
@@ -782,10 +787,28 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         } else if (actualPageCount === pagesFromMeta) {
           // Page count matches metadata — trust meta.size for sub-page precision
           fileSize = meta.size;
+        } else if (actualPageCount < pagesFromMeta) {
+          // Fewer pages than expected. Two possible causes:
+          // (a) Sparse file with zero-filled gaps — the last page exists but
+          //     intermediate pages were never written. Trust meta.size.
+          // (b) Crash after truncation deleted tail pages but before metadata
+          //     was updated. The last expected page is missing. Fall back to
+          //     page-count sizing to avoid reading beyond stored data.
+          // Distinguish by probing the last page implied by meta.size.
+          const lastPageIndex = pagesFromMeta - 1;
+          const lastPage = backend.readPage(storagePath, lastPageIndex);
+          if (lastPage !== null) {
+            // Last page exists — sparse file with gaps, trust metadata
+            fileSize = meta.size;
+          } else {
+            // Last page missing — crash recovery, use page count
+            fileSize = actualPageCount * PAGE_SIZE;
+          }
         } else {
-          // Mismatch: crash occurred between page writes and metadata sync.
-          // Use page count as ground truth — we lose sub-page precision
-          // but preserve all data that made it to the backend.
+          // More pages than metadata expects: crash occurred between page
+          // writes and metadata sync. Use page count as ground truth — we
+          // lose sub-page precision but preserve all data that made it to
+          // the backend.
           fileSize = actualPageCount * PAGE_SIZE;
         }
         node.usedBytes = fileSize;

@@ -276,6 +276,29 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async readMetas(paths: string[]): Promise<Array<FileMeta | null>> {
+    if (paths.length === 0) return [];
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(META_STORE, "readonly");
+      const store = tx.objectStore(META_STORE);
+      const results: Array<FileMeta | null> = new Array(paths.length);
+      let completed = 0;
+
+      for (let i = 0; i < paths.length; i++) {
+        const request = store.get(paths[i]);
+        request.onsuccess = () => {
+          results[i] = request.result ?? null;
+          completed++;
+          if (completed === paths.length) resolve(results);
+        };
+        request.onerror = () => reject(request.error);
+      }
+
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async writeMeta(path: string, meta: FileMeta): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {

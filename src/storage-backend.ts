@@ -49,6 +49,9 @@ export interface StorageBackend {
   /** Delete file metadata. */
   deleteMeta(path: string): Promise<void>;
 
+  /** Read multiple metadata entries in a single batch. Returns an array parallel to paths. */
+  readMetas(paths: string[]): Promise<Array<FileMeta | null>>;
+
   /** Delete multiple metadata entries in a single batch. */
   deleteMetas(paths: string[]): Promise<void>;
 

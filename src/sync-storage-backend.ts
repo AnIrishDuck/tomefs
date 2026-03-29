@@ -46,6 +46,9 @@ export interface SyncStorageBackend {
   /** Delete file metadata. */
   deleteMeta(path: string): void;
 
+  /** Read multiple metadata entries in a single batch. Returns an array parallel to paths. */
+  readMetas(paths: string[]): Array<FileMeta | null>;
+
   /** Delete multiple metadata entries in a single batch. */
   deleteMetas(paths: string[]): void;
 
