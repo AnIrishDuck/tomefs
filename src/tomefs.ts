@@ -271,13 +271,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // so open fds can still read the old data (POSIX unlink semantics).
           // The source is about to take over this storagePath.
           const tempPath = `/__deleted_${nextPathId++}`;
-          pageCache.renameFile(targetStoragePath, tempPath);
-          new_node.storagePath = tempPath;
-          new_node.unlinked = true;
-          // Write marker metadata so the orphaned pages are discoverable
-          // after a crash. On normal close, this metadata is deleted along
-          // with the pages. After a crash, syncfs orphan cleanup finds it
-          // via listFiles() and removes both pages and metadata.
+          // Write marker metadata BEFORE renaming pages. This ensures
+          // crash safety: if the process dies after page rename but before
+          // marker write, orphan cleanup can still discover the pages via
+          // listFiles() (which returns paths with metadata). Without this
+          // ordering, pages at tempPath would be permanently leaked.
           backend.writeMeta(tempPath, {
             size: new_node.usedBytes,
             mode: new_node.mode,
@@ -285,6 +283,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             mtime: new_node.mtime,
             atime: new_node.atime,
           });
+          pageCache.renameFile(targetStoragePath, tempPath);
+          new_node.storagePath = tempPath;
+          new_node.unlinked = true;
         } else {
           pageCache.deleteFile(targetStoragePath);
         }
@@ -381,11 +382,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // entries with the unlinked node, causing data corruption.
         const originalPath = node.storagePath;
         const tempPath = `/__deleted_${nextPathId++}`;
-        pageCache.renameFile(originalPath, tempPath);
-        node.storagePath = tempPath;
-        backend.deleteMeta(originalPath);
-        // Write marker metadata so orphaned pages are discoverable after
-        // a crash. Cleaned up on last fd close or by syncfs orphan cleanup.
+        // Write marker metadata BEFORE renaming pages. This ensures that
+        // if the process crashes after the page rename but before the
+        // marker write, the /__deleted_* pages are still discoverable
+        // via listFiles() for orphan cleanup. Without this ordering, a
+        // crash between renameFile and writeMeta leaves pages at tempPath
+        // with no metadata — permanently leaked since listFiles() only
+        // returns paths with metadata.
         backend.writeMeta(tempPath, {
           size: node.usedBytes,
           mode: node.mode,
@@ -393,6 +396,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           mtime: node.mtime,
           atime: node.atime,
         });
+        pageCache.renameFile(originalPath, tempPath);
+        node.storagePath = tempPath;
+        backend.deleteMeta(originalPath);
       }
       // Only remove from tracking if no open fds — syncfs needs to
       // preserve /__deleted_* paths for nodes with live fds.
