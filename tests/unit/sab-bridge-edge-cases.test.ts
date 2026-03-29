@@ -879,6 +879,92 @@ describe("SAB bridge: metadata batch chunking", () => {
       expect(result.size).toBe(i);
     }
   });
+
+  it("@fast readMetas with 50 paths succeeds via auto-chunking on tiny buffer", async () => {
+    // First write 50 metadata entries
+    const entries = Array.from({ length: 50 }, (_, i) => ({
+      path: `/read-${i}`,
+      meta: { size: i * 100, mode: 0o644, ctime: i, mtime: i + 1000 } as FileMeta,
+    }));
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    // Read all 50 in a single readMetas call — requires chunking on tiny buffer.
+    // Without chunking, the response JSON (50 FileMeta objects) overflows the 16KB buffer.
+    const paths = Array.from({ length: 50 }, (_, i) => `/read-${i}`);
+    const results = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+
+    expect(results).toHaveLength(50);
+    for (let i = 0; i < 50; i++) {
+      expect(results[i]).toEqual({
+        size: i * 100,
+        mode: 0o644,
+        ctime: i,
+        mtime: i + 1000,
+      });
+    }
+  });
+
+  it("readMetas chunking preserves order across chunk boundaries", async () => {
+    // Write 50 entries with distinct values to verify ordering
+    const entries = Array.from({ length: 50 }, (_, i) => ({
+      path: `/order-${i}`,
+      meta: { size: i, mode: 0o755, ctime: i * 10, mtime: i * 20 } as FileMeta,
+    }));
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    // Read all 50 — spans chunk boundaries (24 per chunk on 16KB buffer)
+    const paths = Array.from({ length: 50 }, (_, i) => `/order-${i}`);
+    const results = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+
+    // Verify every entry matches — catches off-by-one at chunk boundaries
+    for (let i = 0; i < 50; i++) {
+      expect(results[i]).not.toBeNull();
+      expect(results[i]!.size).toBe(i);
+      expect(results[i]!.ctime).toBe(i * 10);
+      expect(results[i]!.mtime).toBe(i * 20);
+    }
+  });
+
+  it("readMetas with mix of existing and missing paths across chunks", async () => {
+    // Write only even-numbered entries
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      path: `/mix-${i * 2}`,
+      meta: { size: i * 2, mode: 0o644, ctime: 0, mtime: 0 } as FileMeta,
+    }));
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    // Read 50 paths — odd-numbered don't exist
+    const paths = Array.from({ length: 50 }, (_, i) => `/mix-${i}`);
+    const results = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+
+    expect(results).toHaveLength(50);
+    for (let i = 0; i < 50; i++) {
+      if (i % 2 === 0) {
+        expect(results[i]).not.toBeNull();
+        expect(results[i]!.size).toBe(i);
+      } else {
+        expect(results[i]).toBeNull();
+      }
+    }
+  });
+
+  it("readMetas below chunk threshold uses single call", async () => {
+    // 5 entries — well within maxBatchMetas of 24, no chunking needed
+    const entries = Array.from({ length: 5 }, (_, i) => ({
+      path: `/few-${i}`,
+      meta: { size: i, mode: 0o644, ctime: 0, mtime: 0 } as FileMeta,
+    }));
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    const paths = Array.from({ length: 5 }, (_, i) => `/few-${i}`);
+    const results = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+
+    expect(results).toHaveLength(5);
+    for (let i = 0; i < 5; i++) {
+      expect(results[i]).not.toBeNull();
+      expect(results[i]!.size).toBe(i);
+    }
+  });
 });
 
 describe("SAB bridge: large batch operations", () => {
