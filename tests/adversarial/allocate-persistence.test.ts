@@ -291,6 +291,112 @@ describe("adversarial: allocate + persistence", () => {
     }
   });
 
+  it("large allocate far exceeding cache does not thrash (O(1) materialization) @fast", async () => {
+    const backend = new SyncMemoryBackend();
+    // Allocate 32 pages with a 4-page cache. Before optimization, this
+    // materialized all 32 pages — causing 28 eviction flushes of zero-filled
+    // pages. After optimization, only the last page is materialized (O(1)).
+    const ALLOC_PAGES = 32;
+    const allocSize = ALLOC_PAGES * PAGE_SIZE;
+
+    {
+      const { FS, tomefs } = await mountTome(backend, MAX_PAGES);
+      const stream = FS.open(`${MOUNT}/big_wal`, O.RDWR | O.CREAT, 0o666);
+
+      // Write first page so the file has some real data
+      const data = fillPattern(PAGE_SIZE, 0xDD);
+      FS.write(stream, data, 0, PAGE_SIZE, 0);
+
+      // Pre-allocate far beyond cache capacity
+      stream.stream_ops.allocate(stream, 0, allocSize);
+      expect(FS.fstat(stream.fd).size).toBe(allocSize);
+
+      // Check cache stats: only 2 pages should have been loaded/created
+      // (page 0 from the write, page 31 from allocate's sentinel).
+      // Without the optimization, all 32 pages would have been touched.
+      const stats = tomefs.pageCache.getStats();
+      expect(stats.evictions).toBeLessThan(ALLOC_PAGES);
+
+      FS.close(stream);
+      syncfs(FS, tomefs);
+    }
+
+    // Verify persistence: size, data, and zeros all survive remount
+    {
+      const { FS } = await mountTome(backend, MAX_PAGES);
+      expect(FS.stat(`${MOUNT}/big_wal`).size).toBe(allocSize);
+
+      const stream = FS.open(`${MOUNT}/big_wal`, O.RDONLY);
+
+      // Page 0 has written data
+      const buf0 = new Uint8Array(PAGE_SIZE);
+      FS.read(stream, buf0, 0, PAGE_SIZE, 0);
+      expect(verifyPattern(buf0, PAGE_SIZE, 0xDD)).toBe(true);
+
+      // Intermediate sparse pages are zeros
+      const midBuf = new Uint8Array(PAGE_SIZE);
+      FS.read(stream, midBuf, 0, PAGE_SIZE, 15 * PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        expect(midBuf[i]).toBe(0);
+      }
+
+      // Last page is zeros (sentinel)
+      const lastBuf = new Uint8Array(PAGE_SIZE);
+      FS.read(stream, lastBuf, 0, PAGE_SIZE, (ALLOC_PAGES - 1) * PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        expect(lastBuf[i]).toBe(0);
+      }
+
+      FS.close(stream);
+    }
+  });
+
+  it("allocate + write at sparse middle + syncfs preserves all data @fast", async () => {
+    const backend = new SyncMemoryBackend();
+    // Allocate large, write at a sparse middle page, verify persistence
+    const ALLOC_PAGES = 16;
+
+    {
+      const { FS, tomefs } = await mountTome(backend, MAX_PAGES);
+      const stream = FS.open(`${MOUNT}/sparse`, O.RDWR | O.CREAT, 0o666);
+
+      stream.stream_ops.allocate(stream, 0, ALLOC_PAGES * PAGE_SIZE);
+
+      // Write data at page 7 (middle of sparse region)
+      const data = fillPattern(PAGE_SIZE, 0xEE);
+      FS.write(stream, data, 0, PAGE_SIZE, 7 * PAGE_SIZE);
+
+      expect(FS.fstat(stream.fd).size).toBe(ALLOC_PAGES * PAGE_SIZE);
+      FS.close(stream);
+      syncfs(FS, tomefs);
+    }
+
+    {
+      const { FS } = await mountTome(backend, MAX_PAGES);
+      expect(FS.stat(`${MOUNT}/sparse`).size).toBe(ALLOC_PAGES * PAGE_SIZE);
+
+      const stream = FS.open(`${MOUNT}/sparse`, O.RDONLY);
+
+      // Page 7 has written data
+      const buf7 = new Uint8Array(PAGE_SIZE);
+      FS.read(stream, buf7, 0, PAGE_SIZE, 7 * PAGE_SIZE);
+      expect(verifyPattern(buf7, PAGE_SIZE, 0xEE)).toBe(true);
+
+      // Pages before and after the write are zeros
+      for (const p of [0, 3, 10, ALLOC_PAGES - 2]) {
+        const buf = new Uint8Array(PAGE_SIZE);
+        FS.read(stream, buf, 0, PAGE_SIZE, p * PAGE_SIZE);
+        for (let i = 0; i < PAGE_SIZE; i++) {
+          if (buf[i] !== 0) {
+            expect.fail(`page ${p} offset ${i}: expected 0, got ${buf[i]}`);
+          }
+        }
+      }
+
+      FS.close(stream);
+    }
+  });
+
   it("WAL preallocation pattern: allocate → sequential write → syncfs", async () => {
     const backend = new SyncMemoryBackend();
     const WAL_SIZE = 6 * PAGE_SIZE; // pre-allocate 6 pages
