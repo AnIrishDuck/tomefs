@@ -347,6 +347,83 @@ for (const factory of factories) {
     });
 
     // ---------------------------------------------------------------
+    // deleteFiles batch
+    // ---------------------------------------------------------------
+
+    describe("deleteFiles batch", () => {
+      it("deletes all pages for multiple files @fast", async () => {
+        await backend.writePage("/a", 0, filledPage(0x01));
+        await backend.writePage("/a", 1, filledPage(0x02));
+        await backend.writePage("/b", 0, filledPage(0x03));
+
+        await backend.deleteFiles(["/a", "/b"]);
+
+        expect(await backend.readPage("/a", 0)).toBeNull();
+        expect(await backend.readPage("/a", 1)).toBeNull();
+        expect(await backend.readPage("/b", 0)).toBeNull();
+      });
+
+      it("empty array is a no-op", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.deleteFiles([]);
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
+      });
+
+      it("non-existent files are a no-op", async () => {
+        await backend.deleteFiles(["/nonexistent1", "/nonexistent2"]);
+      });
+
+      it("does not affect other files", async () => {
+        await backend.writePage("/a", 0, filledPage(0xaa));
+        await backend.writePage("/b", 0, filledPage(0xbb));
+        await backend.writePage("/c", 0, filledPage(0xcc));
+
+        await backend.deleteFiles(["/a", "/b"]);
+
+        expect(await backend.readPage("/c", 0)).toEqual(filledPage(0xcc));
+      });
+
+      it("does not delete files with a prefix match", async () => {
+        await backend.writePage("/file1", 0, filledPage(0x01));
+        await backend.writePage("/file10", 0, filledPage(0x10));
+        await backend.writePage("/file100", 0, filledPage(0xff));
+
+        await backend.deleteFiles(["/file1"]);
+
+        expect(await backend.readPage("/file1", 0)).toBeNull();
+        expect(await backend.readPage("/file10", 0)).toEqual(filledPage(0x10));
+        expect(await backend.readPage("/file100", 0)).toEqual(filledPage(0xff));
+      });
+
+      it("countPages returns 0 after batch delete", async () => {
+        await backend.writePage("/a", 0, filledPage(0x01));
+        await backend.writePage("/a", 1, filledPage(0x02));
+        await backend.writePage("/b", 0, filledPage(0x03));
+
+        await backend.deleteFiles(["/a", "/b"]);
+
+        expect(await backend.countPages("/a")).toBe(0);
+        expect(await backend.countPages("/b")).toBe(0);
+      });
+
+      it("handles duplicate paths in batch", async () => {
+        await backend.writePage("/f", 0, filledPage(0x42));
+
+        await backend.deleteFiles(["/f", "/f"]);
+
+        expect(await backend.readPage("/f", 0)).toBeNull();
+      });
+
+      it("mixed existing and non-existent files", async () => {
+        await backend.writePage("/exists", 0, filledPage(0xaa));
+
+        await backend.deleteFiles(["/exists", "/missing1", "/missing2"]);
+
+        expect(await backend.readPage("/exists", 0)).toBeNull();
+      });
+    });
+
+    // ---------------------------------------------------------------
     // Metadata operations
     // ---------------------------------------------------------------
 
