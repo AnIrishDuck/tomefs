@@ -229,6 +229,7 @@ describe("PreloadBackend", () => {
         async deleteMetas() {},
         async countPages() { return 0; },
         async deleteFiles() {},
+        async maxPageIndex() { return -1; },
       };
 
       const backend = new PreloadBackend(failOnce);
@@ -282,6 +283,7 @@ describe("PreloadBackend", () => {
         async deleteMetas(paths: string[]) { return inner.deleteMetas(paths); },
         async countPages(p: string) { return inner.countPages(p); },
         async deleteFiles(ps: string[]) { return inner.deleteFiles(ps); },
+        async maxPageIndex(p: string) { return inner.maxPageIndex(p); },
       };
 
       const backend = new PreloadBackend(failFirstReadMetas);
@@ -319,6 +321,7 @@ describe("PreloadBackend", () => {
         async deleteMetas() {},
         async countPages() { return 0; },
         async deleteFiles() {},
+        async maxPageIndex() { return -1; },
       };
 
       const backend = new PreloadBackend(alwaysFails);
