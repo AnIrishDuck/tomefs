@@ -37,6 +37,7 @@ export const OpCode = {
   READ_METAS: 15,
   DELETE_FILES: 16,
   MAX_PAGE_INDEX: 17,
+  LIST_FILES_RANGE: 18,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];

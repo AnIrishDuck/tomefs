@@ -967,6 +967,152 @@ describe("SAB bridge: metadata batch chunking", () => {
   });
 });
 
+describe("SAB bridge: listFiles and deleteFiles chunking", () => {
+  let backend: MemoryBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    backend = new MemoryBackend();
+    // Use a tiny 16KB buffer to force chunking at small file counts.
+    // maxBatchFiles = floor((16384 - 4096) / 256) = 48, so 100 files = 3 chunks.
+    sab = SabClient.createBuffer(CONTROL_BYTES + 16 * 1024);
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 0 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("@fast listFiles with 100 entries succeeds via auto-chunking on tiny buffer", async () => {
+    // Create 100 files with metadata in the backend
+    for (let i = 0; i < 100; i++) {
+      await backend.writeMeta(`/file-${String(i).padStart(3, "0")}`, {
+        size: i * 100,
+        mode: 0o644,
+        ctime: i,
+        mtime: i + 1000,
+      });
+    }
+
+    const result = (await callClient(clientWorker, "listFiles", [])) as string[];
+    expect(result).toHaveLength(100);
+
+    // Verify all paths are present
+    for (let i = 0; i < 100; i++) {
+      expect(result).toContain(`/file-${String(i).padStart(3, "0")}`);
+    }
+  });
+
+  it("listFiles preserves complete path list across chunk boundaries", async () => {
+    // Create files with varying path lengths to stress JSON size estimation
+    const expectedPaths: string[] = [];
+    for (let i = 0; i < 80; i++) {
+      const path = `/dir-${i % 5}/subdir-${i % 3}/file-${i}.dat`;
+      expectedPaths.push(path);
+      await backend.writeMeta(path, {
+        size: 0,
+        mode: 0o644,
+        ctime: 0,
+        mtime: 0,
+      });
+    }
+
+    const result = (await callClient(clientWorker, "listFiles", [])) as string[];
+    expect(result).toHaveLength(80);
+
+    // Every expected path must appear exactly once
+    for (const path of expectedPaths) {
+      expect(result.filter((p) => p === path)).toHaveLength(1);
+    }
+  });
+
+  it("listFiles returns empty array for empty backend", async () => {
+    const result = (await callClient(clientWorker, "listFiles", [])) as string[];
+    expect(result).toEqual([]);
+  });
+
+  it("listFiles below chunk threshold uses single call", async () => {
+    // 5 files — well within maxBatchFiles, no chunking needed
+    for (let i = 0; i < 5; i++) {
+      await backend.writeMeta(`/small-${i}`, {
+        size: 0,
+        mode: 0o644,
+        ctime: 0,
+        mtime: 0,
+      });
+    }
+
+    const result = (await callClient(clientWorker, "listFiles", [])) as string[];
+    expect(result).toHaveLength(5);
+    for (let i = 0; i < 5; i++) {
+      expect(result).toContain(`/small-${i}`);
+    }
+  });
+
+  it("@fast deleteFiles with 50 paths succeeds via auto-chunking on tiny buffer", async () => {
+    // Create 50 files with metadata and pages
+    for (let i = 0; i < 50; i++) {
+      await backend.writeMeta(`/del-${i}`, {
+        size: PAGE_SIZE,
+        mode: 0o644,
+        ctime: 0,
+        mtime: 0,
+      });
+      await backend.writePage(`/del-${i}`, 0, new Uint8Array(PAGE_SIZE));
+    }
+
+    // Delete all 50 in a single call — requires chunking on tiny buffer
+    const paths = Array.from({ length: 50 }, (_, i) => `/del-${i}`);
+    await callClient(clientWorker, "deleteFiles", [paths]);
+
+    // Verify all pages are deleted (metadata is managed separately)
+    for (const i of [0, 12, 24, 36, 49]) {
+      const page = await backend.readPage(`/del-${i}`, 0);
+      expect(page).toBeNull();
+    }
+  });
+
+  it("deleteFiles chunking does not affect files outside the batch", async () => {
+    // Create 60 files
+    for (let i = 0; i < 60; i++) {
+      await backend.writeMeta(`/keep-${i}`, {
+        size: PAGE_SIZE,
+        mode: 0o644,
+        ctime: 0,
+        mtime: 0,
+      });
+      await backend.writePage(`/keep-${i}`, 0, new Uint8Array(PAGE_SIZE));
+    }
+
+    // Delete only even-numbered (30 paths, may require chunking)
+    const deletePaths = Array.from({ length: 30 }, (_, i) => `/keep-${i * 2}`);
+    await callClient(clientWorker, "deleteFiles", [deletePaths]);
+
+    // Verify even-numbered pages are gone, odd-numbered survive
+    for (let i = 0; i < 60; i++) {
+      const page = await backend.readPage(`/keep-${i}`, 0);
+      if (i % 2 === 0) {
+        expect(page).toBeNull();
+      } else {
+        expect(page).not.toBeNull();
+      }
+    }
+  });
+});
+
 describe("SAB bridge: large batch operations", () => {
   let backend: MemoryBackend;
   let sabWorker: SabWorker;

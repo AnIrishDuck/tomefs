@@ -73,6 +73,16 @@ export class SabClient implements SyncStorageBackend {
    */
   private readonly maxBatchMetas: number;
 
+  /**
+   * Maximum file paths per listFiles response chunk. Computed from buffer
+   * size to prevent overflow when the backend has many files (e.g., Postgres
+   * databases with thousands of tables/indexes/TOAST tables).
+   *
+   * Each path in the response is a JSON string: path (~80 bytes typical) +
+   * quotes + comma + overhead. We conservatively estimate 256 bytes per path.
+   */
+  private readonly maxBatchFiles: number;
+
   constructor(sab: SharedArrayBuffer, options?: SabClientOptions) {
     this.sab = sab;
     this.controlView = new Int32Array(sab, 0, 3);
@@ -88,6 +98,10 @@ export class SabClient implements SyncStorageBackend {
     this.maxBatchMetas = Math.max(
       1,
       Math.floor((dataRegionSize - 4096) / 512),
+    );
+    this.maxBatchFiles = Math.max(
+      1,
+      Math.floor((dataRegionSize - 4096) / 256),
     );
   }
 
@@ -196,7 +210,19 @@ export class SabClient implements SyncStorageBackend {
 
   deleteFiles(paths: string[]): void {
     if (paths.length === 0) return;
-    this.call(OpCode.DELETE_FILES, { paths });
+
+    // If the batch fits in a single call, use the fast path.
+    // Otherwise chunk to avoid overflowing the SAB request buffer.
+    if (paths.length <= this.maxBatchMetas) {
+      this.call(OpCode.DELETE_FILES, { paths });
+      return;
+    }
+
+    for (let i = 0; i < paths.length; i += this.maxBatchMetas) {
+      this.call(OpCode.DELETE_FILES, {
+        paths: paths.slice(i, i + this.maxBatchMetas),
+      });
+    }
   }
 
   deletePagesFrom(path: string, fromPageIndex: number): void {
@@ -286,8 +312,34 @@ export class SabClient implements SyncStorageBackend {
   }
 
   listFiles(): string[] {
-    const { json } = this.call(OpCode.LIST_FILES, {});
-    return (json as { files: string[] }).files;
+    // Use paginated LIST_FILES_RANGE to prevent SAB buffer overflow when
+    // the backend has many files (e.g., Postgres databases with thousands
+    // of tables/indexes). Each chunk returns at most maxBatchFiles paths.
+    const firstResult = this.call(OpCode.LIST_FILES_RANGE, {
+      offset: 0,
+      limit: this.maxBatchFiles,
+    });
+    const first = firstResult.json as { files: string[]; total: number };
+
+    // Fast path: all files fit in the first chunk
+    if (first.total <= this.maxBatchFiles) {
+      return first.files;
+    }
+
+    // Multi-chunk: concatenate remaining pages
+    const allFiles = [...first.files];
+    let offset = allFiles.length;
+    while (offset < first.total) {
+      const { json } = this.call(OpCode.LIST_FILES_RANGE, {
+        offset,
+        limit: this.maxBatchFiles,
+      });
+      const chunk = (json as { files: string[]; total: number }).files;
+      allFiles.push(...chunk);
+      offset += chunk.length;
+      if (chunk.length === 0) break; // safety: avoid infinite loop
+    }
+    return allFiles;
   }
 
   /**
