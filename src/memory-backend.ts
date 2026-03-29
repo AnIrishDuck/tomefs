@@ -101,6 +101,10 @@ export class MemoryBackend implements StorageBackend {
   }
 
   async renameFile(oldPath: string, newPath: string): Promise<void> {
+    // Clear destination pages first to avoid orphans when source has fewer
+    // pages than destination (same contract as IDB and OPFS backends).
+    await this.deleteFile(newPath);
+
     const oldKeys = this.filePageKeys.get(oldPath);
     if (!oldKeys) return;
     const oldPrefix = `${oldPath}\0`;

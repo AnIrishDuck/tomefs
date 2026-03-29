@@ -89,6 +89,10 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   }
 
   renameFile(oldPath: string, newPath: string): void {
+    // Clear destination pages first to avoid orphans when source has fewer
+    // pages than destination (same contract as IDB and OPFS backends).
+    this.deleteFile(newPath);
+
     const oldKeys = this.filePageKeys.get(oldPath);
     if (!oldKeys) return;
     const oldPrefix = `${oldPath}\0`;
