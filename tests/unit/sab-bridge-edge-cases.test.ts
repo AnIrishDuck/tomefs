@@ -728,6 +728,141 @@ describe("SAB bridge: automatic batch chunking", () => {
   });
 });
 
+describe("SAB bridge: metadata batch chunking", () => {
+  let backend: MemoryBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    backend = new MemoryBackend();
+    // Use a tiny 16KB buffer to force metadata chunking at small entry counts.
+    // maxBatchMetas = floor((16384 - 4096) / 512) = 24, so 50 entries = 3 chunks.
+    sab = SabClient.createBuffer(CONTROL_BYTES + 16 * 1024);
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 0 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("@fast writeMetas with 50 entries succeeds via auto-chunking on tiny buffer", async () => {
+    // 50 entries on a 16KB buffer — exceeds maxBatchMetas of 24.
+    // Without chunking, this would throw "SAB buffer overflow" for large entries.
+    const entries = Array.from({ length: 50 }, (_, i) => ({
+      path: `/meta-${i}`,
+      meta: { size: i * 100, mode: 0o644, ctime: i, mtime: i + 1000 } as FileMeta,
+    }));
+
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    // Verify all entries were written correctly
+    for (const i of [0, 12, 24, 36, 49]) {
+      const result = await callClient(clientWorker, "readMeta", [`/meta-${i}`]);
+      expect(result).toEqual({
+        size: i * 100,
+        mode: 0o644,
+        ctime: i,
+        mtime: i + 1000,
+      });
+    }
+  });
+
+  it("@fast deleteMetas with 50 paths succeeds via auto-chunking on tiny buffer", async () => {
+    // First write 50 metadata entries
+    const entries = Array.from({ length: 50 }, (_, i) => ({
+      path: `/del-${i}`,
+      meta: { size: 0, mode: 0o644, ctime: 0, mtime: 0 } as FileMeta,
+    }));
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    // Delete all 50 in a single call — requires chunking on tiny buffer
+    const paths = Array.from({ length: 50 }, (_, i) => `/del-${i}`);
+    await callClient(clientWorker, "deleteMetas", [paths]);
+
+    // Verify all deleted
+    for (const i of [0, 12, 24, 36, 49]) {
+      const result = await callClient(clientWorker, "readMeta", [`/del-${i}`]);
+      expect(result).toBeNull();
+    }
+  });
+
+  it("writeMetas chunking preserves all entries across chunk boundaries", async () => {
+    // Write 50 entries, then verify every single one (not just samples)
+    const entries = Array.from({ length: 50 }, (_, i) => ({
+      path: `/all-${i}`,
+      meta: { size: i, mode: 0o755, ctime: i * 10, mtime: i * 20 } as FileMeta,
+    }));
+
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    // Verify every entry — catches off-by-one errors at chunk boundaries
+    for (let i = 0; i < 50; i++) {
+      const result = (await callClient(
+        clientWorker,
+        "readMeta",
+        [`/all-${i}`],
+      )) as FileMeta;
+      expect(result.size).toBe(i);
+      expect(result.ctime).toBe(i * 10);
+      expect(result.mtime).toBe(i * 20);
+    }
+  });
+
+  it("deleteMetas chunking does not delete paths outside the batch", async () => {
+    // Write 60 entries
+    const entries = Array.from({ length: 60 }, (_, i) => ({
+      path: `/keep-${i}`,
+      meta: { size: i, mode: 0o644, ctime: 0, mtime: 0 } as FileMeta,
+    }));
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    // Delete only the even-numbered ones (30 entries, requires chunking)
+    const deletePaths = Array.from({ length: 30 }, (_, i) => `/keep-${i * 2}`);
+    await callClient(clientWorker, "deleteMetas", [deletePaths]);
+
+    // Verify even-numbered are gone, odd-numbered survive
+    for (let i = 0; i < 60; i++) {
+      const result = await callClient(clientWorker, "readMeta", [`/keep-${i}`]);
+      if (i % 2 === 0) {
+        expect(result).toBeNull();
+      } else {
+        expect(result).not.toBeNull();
+      }
+    }
+  });
+
+  it("writeMetas below chunk threshold uses single call", async () => {
+    // 5 entries — well within maxBatchMetas of 24, no chunking needed
+    const entries = Array.from({ length: 5 }, (_, i) => ({
+      path: `/small-${i}`,
+      meta: { size: i, mode: 0o644, ctime: 0, mtime: 0 } as FileMeta,
+    }));
+
+    await callClient(clientWorker, "writeMetas", [entries]);
+
+    for (let i = 0; i < 5; i++) {
+      const result = (await callClient(
+        clientWorker,
+        "readMeta",
+        [`/small-${i}`],
+      )) as FileMeta;
+      expect(result.size).toBe(i);
+    }
+  });
+});
+
 describe("SAB bridge: large batch operations", () => {
   let backend: MemoryBackend;
   let sabWorker: SabWorker;
