@@ -170,6 +170,7 @@ type Op =
   | { type: "statOp"; path: string }
   | { type: "mmapRead"; fdId: number; length: number; position: number }
   | { type: "mmapWrite"; fdId: number; length: number; position: number; data: Uint8Array }
+  | { type: "allocateFd"; fdId: number; offset: number; length: number }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -217,6 +218,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["statOp", allFiles.length > 0 ? 6 : 0],
     ["mmapRead", model.openFds.size > 0 ? 6 : 0],
     ["mmapWrite", model.openFds.size > 0 ? 6 : 0],
+    ["allocateFd", model.openFds.size > 0 ? 6 : 0],
     ["syncfs", 3],
   ];
 
@@ -478,6 +480,20 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "mmapWrite", fdId, length, position, data };
     }
 
+    case "allocateFd": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const fdInfo = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+      // Generate offset + length combinations that exercise interesting cases:
+      // - Within current size (no-op), at boundary, beyond (extending)
+      const offsetChoices = [0, Math.max(0, currentSize - PAGE_SIZE), currentSize, currentSize + PAGE_SIZE];
+      const offset = rng.pick(offsetChoices);
+      const lengthChoices = [1, PAGE_SIZE, PAGE_SIZE * 2, PAGE_SIZE * 3 + 137];
+      const length = rng.pick(lengthChoices);
+      return { type: "allocateFd", fdId, offset, length };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -719,6 +735,34 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         return { error: null, size: fstatResult.size };
       }
 
+      case "allocateFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        // tomefs implements stream_ops.allocate; MEMFS does not.
+        // For MEMFS, emulate allocate by extending the node's storage
+        // directly. Can't use FS.ftruncate because it does a path
+        // lookup that fails with ENOENT on unlinked-but-open files,
+        // while allocate operates on the node via the open fd.
+        if (stream.stream_ops.allocate) {
+          stream.stream_ops.allocate(stream, op.offset, op.length);
+        } else {
+          const node = stream.node;
+          const targetSize = Math.max(node.usedBytes, op.offset + op.length);
+          if (targetSize > node.usedBytes) {
+            // Emulate MEMFS.resizeFileStorage: extend with zero-filled storage
+            const oldContents = node.contents;
+            const newContents = new Uint8Array(targetSize);
+            if (oldContents && oldContents.length > 0) {
+              newContents.set(oldContents.subarray(0, Math.min(oldContents.length, node.usedBytes)));
+            }
+            node.contents = newContents;
+            node.usedBytes = targetSize;
+          }
+        }
+        const fstatResult = FS.fstat(stream.fd ?? stream);
+        return { error: null, size: fstatResult.size };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -850,6 +894,14 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
       }
       break;
     }
+    case "allocateFd": {
+      const fdInfo = model.openFds.get(op.fdId);
+      if (fdInfo) {
+        const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+        model.files.set(fdInfo.currentPath, Math.max(currentSize, op.offset + op.length));
+      }
+      break;
+    }
     // readFd, readlink, readThroughSymlink, seekFd, mmapRead don't modify file state
     // mmapWrite modifies file contents via msync but doesn't change size
   }
@@ -916,6 +968,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] mmapRead(fdId=${op.fdId}, len=${op.length}, pos=${op.position})`;
     case "mmapWrite":
       return `[${index}] mmapWrite(fdId=${op.fdId}, len=${op.length}, pos=${op.position}, ${op.data.length}B)`;
+    case "allocateFd":
+      return `[${index}] allocateFd(fdId=${op.fdId}, offset=${op.offset}, len=${op.length})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -1183,6 +1237,11 @@ async function runFuzzSequence(
       expect(tomeResult.size, `${desc}: seek position mismatch`).toBe(memResult.size);
     }
 
+    // For allocate, compare resulting file sizes
+    if (op.type === "allocateFd" && !memResult.error) {
+      expect(tomeResult.size, `${desc}: size mismatch`).toBe(memResult.size);
+    }
+
     // For ftruncate and appendWrite, compare resulting file sizes
     if ((op.type === "ftruncateFd" || op.type === "appendWrite") && !memResult.error) {
       expect(tomeResult.size, `${desc}: size mismatch`).toBe(memResult.size);
@@ -1379,6 +1438,26 @@ describe("fuzz: randomized differential testing", () => {
 
     it("seed 66666 small cache", async () => {
       await runFuzzSequence(66666, 150, 16);
+    }, 30_000);
+  });
+
+  describe("allocate operations (fallocate)", () => {
+    // Seeds chosen to exercise allocate (fallocate) paths. These create
+    // sparse files that interact with the page cache: only the last page
+    // is materialized, intermediate pages read as zeros on demand. Under
+    // cache pressure, evicted sparse pages must survive round-trips
+    // through the backend correctly.
+
+    it("seed 22222 tiny cache @fast", async () => {
+      await runFuzzSequence(22222, 120, 4);
+    }, 30_000);
+
+    it("seed 33333 tiny cache", async () => {
+      await runFuzzSequence(33333, 120, 4);
+    }, 30_000);
+
+    it("seed 54321 small cache", async () => {
+      await runFuzzSequence(54321, 150, 16);
     }, 30_000);
   });
 });
