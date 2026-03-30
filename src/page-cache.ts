@@ -118,6 +118,7 @@ export class PageCache {
       pageIndex,
       data: data ? new Uint8Array(data) : new Uint8Array(PAGE_SIZE),
       dirty: false,
+      evicted: false,
     };
 
     await this.ensureCapacity();
@@ -195,6 +196,7 @@ export class PageCache {
               ? new Uint8Array(results[i]!)
               : new Uint8Array(PAGE_SIZE),
             dirty: false,
+            evicted: false,
           };
           await this.ensureCapacity();
           this.cache.set(key, page);
@@ -321,6 +323,7 @@ export class PageCache {
                 ? new Uint8Array(results[i]!)
                 : new Uint8Array(PAGE_SIZE),
               dirty: false,
+              evicted: false,
             };
             await this.ensureCapacity();
             this.cache.set(key, page);
@@ -458,6 +461,8 @@ export class PageCache {
     const keys = this.filePages.get(path);
     if (!keys) return;
     for (const key of keys) {
+      const page = this.cache.get(key)!;
+      page.evicted = true;
       this.cache.delete(key);
       if (key === this.mruKey) this.mruKey = null;
     }
@@ -476,6 +481,7 @@ export class PageCache {
     for (const key of keys) {
       const page = this.cache.get(key)!;
       if (page.pageIndex >= fromPageIndex) {
+        page.evicted = true;
         this.cache.delete(key);
         if (key === this.mruKey) this.mruKey = null;
         this.dirtyKeys.delete(key);
@@ -521,6 +527,8 @@ export class PageCache {
     const keys = this.filePages.get(path);
     if (keys) {
       for (const key of keys) {
+        const page = this.cache.get(key)!;
+        page.evicted = true;
         this.cache.delete(key);
         if (key === this.mruKey) this.mruKey = null;
         this.dirtyKeys.delete(key);
@@ -547,6 +555,8 @@ export class PageCache {
     const destKeys = this.filePages.get(newPath);
     if (destKeys) {
       for (const key of destKeys) {
+        const page = this.cache.get(key)!;
+        page.evicted = true;
         this.cache.delete(key);
         if (key === this.mruKey) this.mruKey = null;
         this.dirtyKeys.delete(key);
@@ -668,6 +678,7 @@ export class PageCache {
       this._flushes++;
     }
 
+    victim.evicted = true;
     this._evictions++;
     this.cache.delete(firstKey);
     if (firstKey === this.mruKey) this.mruKey = null;
@@ -734,6 +745,7 @@ export class PageCache {
       const key = victimKeys[i];
       const victim = victims[i];
 
+      victim.evicted = true;
       this.cache.delete(key);
       if (key === this.mruKey) this.mruKey = null;
 

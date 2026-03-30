@@ -21,6 +21,16 @@ export interface CachedPage {
   data: Uint8Array;
   /** Whether this page has been modified since last flush. */
   dirty: boolean;
+  /**
+   * Set to true when this page is evicted from the cache.
+   *
+   * Enables external code (e.g., tomefs node-level MRU) to hold references
+   * to CachedPage objects and detect when the reference is stale. After
+   * eviction, the page data reflects the last flushed state but may not
+   * match the current cache contents if the same page was later re-loaded
+   * and modified.
+   */
+  evicted: boolean;
 }
 
 /** File metadata stored alongside page data. */
