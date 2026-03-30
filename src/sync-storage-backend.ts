@@ -61,6 +61,9 @@ export interface SyncStorageBackend {
   /** Count the number of pages stored for a file. Returns 0 if no pages exist. */
   countPages(path: string): number;
 
+  /** Count pages for multiple files in a single batch. Returns an array parallel to paths. */
+  countPagesBatch(paths: string[]): number[];
+
   /** Return the highest page index stored for a file, or -1 if no pages exist. */
   maxPageIndex(path: string): number;
 

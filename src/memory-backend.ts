@@ -99,6 +99,10 @@ export class MemoryBackend implements StorageBackend {
     return this.filePageKeys.get(path)?.size ?? 0;
   }
 
+  async countPagesBatch(paths: string[]): Promise<number[]> {
+    return paths.map((path) => this.filePageKeys.get(path)?.size ?? 0);
+  }
+
   async maxPageIndex(path: string): Promise<number> {
     const keys = this.filePageKeys.get(path);
     if (!keys || keys.size === 0) return -1;

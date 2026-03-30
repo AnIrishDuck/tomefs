@@ -230,6 +230,11 @@ export class PreloadBackend implements SyncStorageBackend {
     return keys ? keys.size : 0;
   }
 
+  countPagesBatch(paths: string[]): number[] {
+    this.assertInitialized();
+    return paths.map((path) => this.filePageKeys.get(path)?.size ?? 0);
+  }
+
   maxPageIndex(path: string): number {
     this.assertInitialized();
     const keys = this.filePageKeys.get(path);

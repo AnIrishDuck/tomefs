@@ -848,6 +848,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // round-trips from O(n) to O(1) during mount/restore.
     const allMeta = backend.readMetas(livePaths);
 
+    // First pass: create directories and symlinks, collect file entries.
+    // Files need countPages verification, which we batch in a single call
+    // to reduce SAB bridge round-trips from O(n) to O(1).
+    interface FileEntry {
+      path: string;
+      meta: FileMeta;
+      parent: any;
+      name: string;
+      storagePath: string;
+    }
+    const fileEntries: FileEntry[] = [];
+
     for (let i = 0; i < livePaths.length; i++) {
       const path = livePaths[i];
       const meta = allMeta[i];
@@ -870,16 +882,31 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.mtime = meta.mtime;
         node.ctime = meta.ctime;
       } else if (typeMode === S_IFREG) {
+        const storagePath = computeStoragePath(parent, name);
+        fileEntries.push({ path, meta, parent, name, storagePath });
+      } else if (typeMode === S_IFLNK) {
+        const node = TOMEFS.createNode(parent, name, meta.mode, 0);
+        node.link = meta.link ?? "";
+        node.atime = meta.atime ?? meta.mtime;
+        node.mtime = meta.mtime;
+        node.ctime = meta.ctime;
+      }
+    }
+
+    // Batch countPages for all files in a single backend call.
+    // Reduces O(n) SAB bridge round-trips to O(1) during mount/restore.
+    if (fileEntries.length > 0) {
+      const storagePaths = fileEntries.map((e) => e.storagePath);
+      const allPageCounts = backend.countPagesBatch(storagePaths);
+
+      for (let i = 0; i < fileEntries.length; i++) {
+        const { meta, parent, name, storagePath } = fileEntries[i];
         const node = TOMEFS.createNode(parent, name, meta.mode, 0);
         // Use metadata size, but verify against actual backend pages.
         // Pages may extend beyond meta.size if writes occurred after the
         // last metadata sync (e.g., Postgres shutdown writes during close),
         // or may be fewer if a truncation wasn't synced before a crash.
-        // A single countPages call replaces the previous O(log n)
-        // readPage-based binary search probing — no data transfer needed,
-        // just a count query on the backend's page store.
-        const storagePath = computeStoragePath(parent, name);
-        const actualPageCount = backend.countPages(storagePath);
+        const actualPageCount = allPageCounts[i];
         const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
 
         let fileSize: number;
@@ -921,12 +948,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
         }
         node.usedBytes = fileSize;
-        node.atime = meta.atime ?? meta.mtime;
-        node.mtime = meta.mtime;
-        node.ctime = meta.ctime;
-      } else if (typeMode === S_IFLNK) {
-        const node = TOMEFS.createNode(parent, name, meta.mode, 0);
-        node.link = meta.link ?? "";
         node.atime = meta.atime ?? meta.mtime;
         node.mtime = meta.mtime;
         node.ctime = meta.ctime;

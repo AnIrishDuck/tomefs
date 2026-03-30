@@ -38,6 +38,7 @@ export const OpCode = {
   DELETE_FILES: 16,
   MAX_PAGE_INDEX: 17,
   LIST_FILES_RANGE: 18,
+  COUNT_PAGES_BATCH: 19,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];
