@@ -72,6 +72,10 @@ interface FileState {
   content: Uint8Array;
   /** Permission bits (e.g. 0o644). Excludes type bits (S_IFREG). */
   mode: number;
+  /** Access time in ms (set by utime). null = not explicitly set. */
+  atime: number | null;
+  /** Modification time in ms (set by utime). null = not explicitly set. */
+  mtime: number | null;
 }
 
 interface OpenFdState {
@@ -163,6 +167,8 @@ type Op =
   | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "appendWrite"; path: string; data: Uint8Array }
   | { type: "allocate"; path: string; offset: number; length: number }
+  | { type: "utime"; path: string; atime: number; mtime: number }
+  | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array }
   | { type: "checkpoint" };
 
 const DIR_NAMES = ["aa", "bb", "cc"];
@@ -205,6 +211,8 @@ function generateOp(rng: Rng, model: Model): Op {
     ["ftruncateFd", activeFdIds.length > 0 ? 5 : 0],
     ["appendWrite", allFiles.length > 0 ? 8 : 0],
     ["allocate", allFiles.length > 0 ? 8 : 0],
+    ["utime", allFiles.length > 0 ? 6 : 0],
+    ["mmapWriteAt", allFiles.length > 0 ? 6 : 0],
     ["checkpoint", 8],
   ];
 
@@ -379,6 +387,28 @@ function generateOp(rng: Rng, model: Model): Op {
       return { type: "allocate", path, offset: 0, length: totalSize };
     }
 
+    case "utime": {
+      const path = rng.pick(allFiles);
+      // Use fixed timestamps for deterministic verification
+      const baseTime = 1000000000000; // ~2001
+      const atime = baseTime + rng.int(1000000000);
+      const mtime = baseTime + rng.int(1000000000);
+      return { type: "utime", path, atime, mtime };
+    }
+
+    case "mmapWriteAt": {
+      const path = rng.pick(allFiles);
+      const state = model.files.get(path)!;
+      const fileSize = state.content.length;
+      if (fileSize === 0) return { type: "checkpoint" };
+      // Write within existing file bounds via mmap+msync
+      const maxLen = Math.min(fileSize, PAGE_SIZE * 2);
+      const length = Math.max(1, rng.int(maxLen + 1));
+      const position = rng.int(Math.max(1, fileSize - length + 1));
+      const data = rng.bytes(length);
+      return { type: "mmapWriteAt", path, position, data };
+    }
+
     case "checkpoint":
     default:
       return { type: "checkpoint" };
@@ -408,6 +438,8 @@ function formatOp(op: Op, index: number): string {
     case "ftruncateFd": return `[${index}] ftruncateFd(fd#${op.fdId}, ${op.size})`;
     case "appendWrite": return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
     case "allocate": return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
+    case "utime": return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
+    case "mmapWriteAt": return `[${index}] mmapWriteAt(${op.path}, @${op.position}, ${op.data.length}B)`;
 
     case "checkpoint": return `[${index}] CHECKPOINT`;
   }
@@ -422,7 +454,7 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
 
   switch (op.type) {
     case "createFile": {
-      model.files.set(op.path, { content: new Uint8Array(op.data), mode: DEFAULT_FILE_MODE });
+      model.files.set(op.path, { content: new Uint8Array(op.data), mode: DEFAULT_FILE_MODE, atime: null, mtime: null });
       break;
     }
     case "writeAt": {
@@ -432,6 +464,8 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       newContent.set(state.content); // copy existing (zero-extends if growing)
       newContent.set(op.data, op.offset);
       state.content = newContent;
+      // Write updates mtime, invalidating any explicit utime value
+      state.mtime = null;
       break;
     }
     case "truncate": {
@@ -443,6 +477,7 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
         newContent.set(state.content);
         state.content = newContent;
       }
+      state.mtime = null;
       break;
     }
     case "renameFile": {
@@ -551,6 +586,7 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       newContent.set(op.data, fd.position);
       fileState.content = newContent;
       fd.position += op.data.length;
+      fileState.mtime = null;
       break;
     }
     case "closeFd":
@@ -588,6 +624,7 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
       newContent.set(state.content);
       newContent.set(op.data, state.content.length);
       state.content = newContent;
+      state.mtime = null;
       break;
     }
     case "ftruncateFd": {
@@ -600,6 +637,7 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
         newContent.set(fileState.content);
         fileState.content = newContent;
       }
+      fileState.mtime = null;
       break;
     }
     case "allocate": {
@@ -610,6 +648,22 @@ function applyToModel(model: Model, op: Op, success: boolean): void {
         newContent.set(state.content);
         state.content = newContent;
       }
+      break;
+    }
+    case "utime": {
+      const state = model.files.get(op.path);
+      if (state) {
+        state.atime = op.atime;
+        state.mtime = op.mtime;
+      }
+      break;
+    }
+    case "mmapWriteAt": {
+      const state = model.files.get(op.path)!;
+      state.content.set(op.data, op.position);
+      // msync modifies file content but doesn't change size
+      // mtime is updated by the write (clear explicit utime tracking)
+      state.mtime = null;
       break;
     }
   }
@@ -797,6 +851,19 @@ function execOp(harness: PersistenceHarness, op: Op): boolean {
         FS.close(s);
         return true;
       }
+      case "utime":
+        FS.utime(op.path, op.atime, op.mtime);
+        return true;
+      case "mmapWriteAt": {
+        const s = FS.open(op.path, O.RDWR);
+        // mmap the region, write data, msync back
+        const mmapResult = s.stream_ops.mmap(s, op.data.length, op.position, 0, 0);
+        const buf = mmapResult.ptr instanceof Uint8Array ? mmapResult.ptr : new Uint8Array(mmapResult.ptr);
+        buf.set(op.data);
+        s.stream_ops.msync(s, buf, op.position, op.data.length, 0);
+        FS.close(s);
+        return true;
+      }
       default:
         return true;
     }
@@ -829,6 +896,22 @@ function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
       actualPerm,
       `${context}: mode mismatch for ${path}: expected 0o${state.mode.toString(8)}, got 0o${actualPerm.toString(8)}`,
     ).toBe(state.mode);
+
+    // Verify timestamps survived persistence (only when explicitly set via utime)
+    if (state.atime !== null) {
+      const actualAtime = new Date(stat.atime).getTime();
+      expect(
+        actualAtime,
+        `${context}: atime mismatch for ${path}: expected ${state.atime}, got ${actualAtime}`,
+      ).toBe(state.atime);
+    }
+    if (state.mtime !== null) {
+      const actualMtime = new Date(stat.mtime).getTime();
+      expect(
+        actualMtime,
+        `${context}: mtime mismatch for ${path}: expected ${state.mtime}, got ${actualMtime}`,
+      ).toBe(state.mtime);
+    }
 
     if (state.content.length > 0) {
       const buf = new Uint8Array(stat.size);
@@ -1063,6 +1146,50 @@ describe("fuzz: persistence through syncfs + remount cycles", () => {
 
     it("150 ops, tiny cache, seed 55555 — extended chmod sequence", async () => {
       await runPersistenceFuzz(55555, 150, 4);
+    }, 60_000);
+  });
+
+  describe("utime + timestamp persistence through remount cycles", () => {
+    it("seed 80001 — tiny cache, utime between checkpoints @fast", async () => {
+      await runPersistenceFuzz(80001, 80, 4);
+    }, 30_000);
+
+    it("seed 80002 — small cache, utime + rename + persist", async () => {
+      await runPersistenceFuzz(80002, 80, 16);
+    }, 30_000);
+
+    it("seed 80003 — tiny cache, utime + write invalidation + persist", async () => {
+      await runPersistenceFuzz(80003, 80, 4);
+    }, 30_000);
+
+    it("seed 80004 — large cache, utime interleaved with truncate + allocate", async () => {
+      await runPersistenceFuzz(80004, 100, 4096);
+    }, 30_000);
+
+    it("150 ops, tiny cache, seed 80099 — extended utime sequence", async () => {
+      await runPersistenceFuzz(80099, 150, 4);
+    }, 60_000);
+  });
+
+  describe("mmapWrite (msync) persistence through remount cycles", () => {
+    it("seed 90001 — tiny cache, msync writes between checkpoints @fast", async () => {
+      await runPersistenceFuzz(90001, 80, 4);
+    }, 30_000);
+
+    it("seed 90002 — small cache, msync + rename + persist", async () => {
+      await runPersistenceFuzz(90002, 80, 16);
+    }, 30_000);
+
+    it("seed 90003 — tiny cache, msync interleaved with fd writes", async () => {
+      await runPersistenceFuzz(90003, 80, 4);
+    }, 30_000);
+
+    it("seed 90004 — large cache, msync + truncate + allocate + persist", async () => {
+      await runPersistenceFuzz(90004, 100, 4096);
+    }, 30_000);
+
+    it("150 ops, tiny cache, seed 90099 — extended msync+utime sequence", async () => {
+      await runPersistenceFuzz(90099, 150, 4);
     }, 60_000);
   });
 });
