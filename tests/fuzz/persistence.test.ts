@@ -964,6 +964,71 @@ function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
     }
     expect(linkTarget, `${context}: symlink ${path} target mismatch`).toBe(target);
   }
+
+  // Reverse verification: walk the filesystem tree and ensure no extra
+  // entries exist beyond what the model expects. This catches orphaned
+  // files/dirs/symlinks that survived persistence incorrectly (e.g.,
+  // stale metadata not cleaned up by syncfs orphan cleanup, or extra
+  // entries created by buggy restoreTree).
+  const fsFiles = new Set<string>();
+  const fsDirs = new Set<string>();
+  const fsSymlinks = new Set<string>();
+
+  function walkTree(dirPath: string): void {
+    let entries: string[];
+    try {
+      entries = FS.readdir(dirPath);
+    } catch {
+      return; // directory doesn't exist or can't be read
+    }
+    for (const name of entries) {
+      if (name === "." || name === "..") continue;
+      const childPath = dirPath === "/" ? `/${name}` : `${dirPath}/${name}`;
+      let stat: any;
+      try {
+        stat = FS.lstat(childPath);
+      } catch {
+        continue; // can't stat — skip
+      }
+      if (FS.isLink(stat.mode)) {
+        fsSymlinks.add(childPath);
+      } else if (FS.isDir(stat.mode)) {
+        fsDirs.add(childPath);
+        walkTree(childPath);
+      } else if (FS.isFile(stat.mode)) {
+        fsFiles.add(childPath);
+      }
+    }
+  }
+
+  walkTree("/");
+
+  // Check for extra files not in the model
+  for (const path of fsFiles) {
+    if (!model.files.has(path)) {
+      throw new Error(
+        `${context}: unexpected file ${path} exists in filesystem but not in model`,
+      );
+    }
+  }
+
+  // Check for extra directories not in the model
+  for (const path of fsDirs) {
+    if (!model.dirs.has(path)) {
+      throw new Error(
+        `${context}: unexpected directory ${path} exists in filesystem but not in model`,
+      );
+    }
+  }
+
+  // Check for extra symlinks not in the model
+  for (const path of fsSymlinks) {
+    if (!model.symlinks.has(path)) {
+      throw new Error(
+        `${context}: unexpected symlink ${path} exists in filesystem but not in model`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------

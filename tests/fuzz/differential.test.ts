@@ -157,6 +157,7 @@ type Op =
   | { type: "symlink"; target: string; path: string }
   | { type: "readlink"; path: string }
   | { type: "unlinkSymlink"; path: string }
+  | { type: "renameSymlink"; oldPath: string; newPath: string }
   | { type: "readThroughSymlink"; path: string; realPath: string }
   | { type: "openFd"; path: string; fdId: number }
   | { type: "readFd"; fdId: number }
@@ -205,6 +206,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["symlink", allFiles.length > 0 ? 8 : 0],
     ["readlink", allSymlinks.length > 0 ? 4 : 0],
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
+    ["renameSymlink", allSymlinks.length > 0 ? 5 : 0],
     ["readThroughSymlink", validSymlinks.length > 0 ? 6 : 0],
     ["openFd", allFiles.length > 0 && model.openFds.size < 4 ? 8 : 0],
     ["readFd", model.openFds.size > 0 ? 8 : 0],
@@ -350,6 +352,14 @@ function generateOp(rng: Rng, model: FSModel): Op {
 
     case "unlinkSymlink":
       return { type: "unlinkSymlink", path: rng.pick(allSymlinks) };
+
+    case "renameSymlink": {
+      const oldPath = rng.pick(allSymlinks);
+      const dir = rng.pick(allContainerDirs);
+      const name = rng.pick(LINK_NAMES);
+      const newPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+      return { type: "renameSymlink", oldPath, newPath };
+    }
 
     case "readThroughSymlink": {
       const linkPath = rng.pick(validSymlinks);
@@ -601,6 +611,11 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
 
       case "unlinkSymlink": {
         FS.unlink(op.path);
+        return { error: null };
+      }
+
+      case "renameSymlink": {
+        FS.rename(op.oldPath, op.newPath);
         return { error: null };
       }
 
@@ -859,6 +874,17 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
     case "unlinkSymlink":
       model.symlinks.delete(op.path);
       break;
+    case "renameSymlink": {
+      const target = model.symlinks.get(op.oldPath);
+      if (target !== undefined) {
+        model.symlinks.delete(op.oldPath);
+        // If destination is an existing symlink, it's overwritten
+        model.symlinks.set(op.newPath, target);
+        // If destination is an existing file, it's replaced
+        model.files.delete(op.newPath);
+      }
+      break;
+    }
     case "openFd":
       model.openFds.set(op.fdId, { id: op.fdId, path: op.path, currentPath: op.path });
       model.nextFdId++;
@@ -940,6 +966,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] readlink(${op.path})`;
     case "unlinkSymlink":
       return `[${index}] unlinkSymlink(${op.path})`;
+    case "renameSymlink":
+      return `[${index}] renameSymlink(${op.oldPath} -> ${op.newPath})`;
     case "readThroughSymlink":
       return `[${index}] readThroughSymlink(${op.path} -> ${op.realPath})`;
     case "openFd":
