@@ -23,8 +23,8 @@ export class PageCache {
   /** Cache entries keyed by pageKeyStr. Insertion order = LRU order (oldest first). */
   private cache = new Map<string, CachedPage>();
 
-  /** Key of the most-recently-used page (last entry in Map). Skip LRU touch if hit. */
-  private mruKey: string | null = null;
+  /** Most-recently-used page reference. Avoids key construction + Map lookup on hot path. */
+  private mruPage: CachedPage | null = null;
 
   /** Secondary index: file path → set of cache keys belonging to that file. */
   private filePages = new Map<string, Set<string>>();
@@ -81,19 +81,14 @@ export class PageCache {
     pageIndex: number,
     readBackend: boolean,
   ): Promise<CachedPage> {
-    const key = pageKeyStr(path, pageIndex);
-    // Fast path: if this is already the MRU page, skip Map reordering.
-    // Defensive: verify the page is still in cache (mruKey should always be
-    // nulled on eviction, but guard against future code paths that miss it).
-    if (key === this.mruKey) {
-      const mruPage = this.cache.get(key);
-      if (mruPage) {
-        this._hits++;
-        return mruPage;
-      }
-      this.mruKey = null;
+    // Fast path: exact same page as last access — no key construction or Map ops
+    const mru = this.mruPage;
+    if (mru !== null && mru.path === path && mru.pageIndex === pageIndex) {
+      this._hits++;
+      return mru;
     }
 
+    const key = pageKeyStr(path, pageIndex);
     const existing = this.cache.get(key);
     if (existing) {
       this._hits++;
@@ -104,7 +99,7 @@ export class PageCache {
         this.cache.delete(key);
         this.cache.set(key, existing);
       }
-      this.mruKey = key;
+      this.mruPage = existing;
       return existing;
     }
 
@@ -123,7 +118,7 @@ export class PageCache {
 
     await this.ensureCapacity();
     this.cache.set(key, page);
-    this.mruKey = key;
+    this.mruPage = page;
     this.trackPage(path, key);
     return page;
   }
@@ -200,7 +195,7 @@ export class PageCache {
           };
           await this.ensureCapacity();
           this.cache.set(key, page);
-          this.mruKey = key;
+          this.mruPage = page;
           this.trackPage(path, key);
         }
       }
@@ -327,7 +322,7 @@ export class PageCache {
             };
             await this.ensureCapacity();
             this.cache.set(key, page);
-            this.mruKey = key;
+            this.mruPage = page;
             this.trackPage(path, key);
           }
         }
@@ -464,7 +459,7 @@ export class PageCache {
       const page = this.cache.get(key)!;
       page.evicted = true;
       this.cache.delete(key);
-      if (key === this.mruKey) this.mruKey = null;
+      if (page === this.mruPage) this.mruPage = null;
     }
     this.filePages.delete(path);
   }
@@ -483,7 +478,7 @@ export class PageCache {
       if (page.pageIndex >= fromPageIndex) {
         page.evicted = true;
         this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
+        if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
         keys.delete(key);
       }
@@ -530,7 +525,7 @@ export class PageCache {
         const page = this.cache.get(key)!;
         page.evicted = true;
         this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
+        if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
       this.filePages.delete(path);
@@ -558,7 +553,7 @@ export class PageCache {
         const page = this.cache.get(key)!;
         page.evicted = true;
         this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
+        if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
       this.filePages.delete(newPath);
@@ -572,9 +567,10 @@ export class PageCache {
     const toMove: CachedPage[] = [];
     if (oldKeys) {
       for (const key of oldKeys) {
-        toMove.push(this.cache.get(key)!);
+        const page = this.cache.get(key)!;
+        toMove.push(page);
         this.cache.delete(key);
-        if (key === this.mruKey) this.mruKey = null;
+        if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
       this.filePages.delete(oldPath);
@@ -602,6 +598,17 @@ export class PageCache {
       page.dirty = true;
       this.dirtyKeys.add(pageKeyStr(path, pageIndex));
     }
+  }
+
+  /**
+   * Register a page as dirty by key alone (no page lookup).
+   *
+   * Used when the caller already holds a valid CachedPage reference and
+   * has set page.dirty = true — this adds the key to the dirtyKeys index
+   * without the overhead of getPage().
+   */
+  addDirtyKey(path: string, pageIndex: number): void {
+    this.dirtyKeys.add(pageKeyStr(path, pageIndex));
   }
 
   /** Check if a specific page is in the cache. */
@@ -681,7 +688,7 @@ export class PageCache {
     victim.evicted = true;
     this._evictions++;
     this.cache.delete(firstKey);
-    if (firstKey === this.mruKey) this.mruKey = null;
+    if (victim === this.mruPage) this.mruPage = null;
 
     const fileKeys = this.filePages.get(victim.path);
     if (fileKeys) {
@@ -747,7 +754,7 @@ export class PageCache {
 
       victim.evicted = true;
       this.cache.delete(key);
-      if (key === this.mruKey) this.mruKey = null;
+      if (victim === this.mruPage) this.mruPage = null;
 
       if (victim.dirty) {
         victim.dirty = false;

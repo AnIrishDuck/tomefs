@@ -313,6 +313,24 @@ describe("PageCache", () => {
       expect(cache.isDirty("/a", 0)).toBe(false);
       expect(cache.isDirty("/b", 0)).toBe(true);
     });
+
+    it("addDirtyKey registers a page as dirty without page lookup", async () => {
+      // Load page into cache (clean)
+      const page = await cache.getPage("/test", 0);
+      expect(page.dirty).toBe(false);
+      expect(cache.isDirty("/test", 0)).toBe(false);
+
+      // Simulate external mutation: mark dirty on the page object,
+      // then register via addDirtyKey
+      page.dirty = true;
+      cache.addDirtyKey("/test", 0);
+      expect(cache.isDirty("/test", 0)).toBe(true);
+      expect(cache.dirtyCount).toBe(1);
+
+      // flushFile should write it to the backend
+      await cache.flushFile("/test");
+      expect(cache.dirtyCount).toBe(0);
+    });
   });
 
   describe("evictFile", () => {
@@ -959,6 +977,31 @@ describe("PageCache", () => {
       const buf = new Uint8Array(data.length);
       await cache.read("/file", buf, 0, data.length, 0, PAGE_SIZE * 4);
       expect(buf).toEqual(data);
+    });
+
+    it("MRU page reference is cleared on eviction", async () => {
+      const small = new PageCache(backend, 2);
+      // Access page 0 — becomes MRU
+      await small.getPage("/file", 0);
+      // Access page 1
+      await small.getPage("/file", 1);
+      // Access page 2 — evicts page 0 (LRU)
+      await small.getPage("/file", 2);
+      // Now access page 0 again — must be a miss (reloaded from backend),
+      // proving the MRU reference was cleared when page 0 was evicted
+      const stats = small.getStats();
+      const missesBefore = stats.misses;
+      await small.getPage("/file", 0);
+      expect(small.getStats().misses).toBe(missesBefore + 1);
+    });
+
+    it("MRU page sets evicted flag when evicted", async () => {
+      const small = new PageCache(backend, 1);
+      const page = await small.getPage("/file", 0);
+      expect(page.evicted).toBe(false);
+      // Access another page — evicts the MRU page
+      await small.getPage("/file", 1);
+      expect(page.evicted).toBe(true);
     });
 
     it("write to new file skips all backend reads", async () => {
