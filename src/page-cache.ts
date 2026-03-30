@@ -82,10 +82,16 @@ export class PageCache {
     readBackend: boolean,
   ): Promise<CachedPage> {
     const key = pageKeyStr(path, pageIndex);
-    // Fast path: if this is already the MRU page, skip Map reordering
+    // Fast path: if this is already the MRU page, skip Map reordering.
+    // Defensive: verify the page is still in cache (mruKey should always be
+    // nulled on eviction, but guard against future code paths that miss it).
     if (key === this.mruKey) {
-      this._hits++;
-      return this.cache.get(key)!;
+      const mruPage = this.cache.get(key);
+      if (mruPage) {
+        this._hits++;
+        return mruPage;
+      }
+      this.mruKey = null;
     }
 
     const existing = this.cache.get(key);

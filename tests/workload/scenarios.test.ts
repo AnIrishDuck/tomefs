@@ -433,3 +433,219 @@ describeScenario("Scenario 8: Rename Atomicity @fast", (h) => {
     expect(threw).toBe(true);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Scenario 9: B-tree Index Traversal (Random Read-Modify-Write)
+//
+// Postgres B-tree index lookups follow a root→internal→leaf page path,
+// reading 3-4 random pages per lookup, then potentially modifying a leaf
+// page (INSERT/UPDATE). This creates scattered dirty pages across the
+// cache — a fundamentally different access pattern than sequential scan
+// or append. At small cache sizes, the random access pattern thrashes
+// the LRU cache, forcing eviction of recently-dirtied pages.
+// ---------------------------------------------------------------------------
+
+describeScenario("Scenario 9: B-tree Index Traversal", (h) => {
+  const { FS } = h;
+  const indexPages = 32; // 256 KB index file
+  const totalBytes = PAGE_SIZE * indexPages;
+
+  // Create an index file with known data
+  writeFileData(FS, "/idx", totalBytes);
+
+  // Simulate 100 index lookups, each reading a "root→internal→leaf" path
+  // and then modifying the leaf page (simulating an INSERT updating the index)
+  const stream = FS.open("/idx", O.RDWR);
+  const buf = new Uint8Array(PAGE_SIZE);
+
+  // Track modifications: pageIndex → last modification seed
+  const modifications = new Map<number, number>();
+
+  for (let lookup = 0; lookup < 100; lookup++) {
+    // Deterministic "random" page path: root(0) → internal → leaf
+    const root = 0;
+    const internal = 1 + ((lookup * 7 + 3) % 4); // pages 1-4 (internal nodes)
+    const leaf = 5 + ((lookup * 13 + 11) % (indexPages - 5)); // pages 5-31
+
+    // Read root page
+    FS.llseek(stream, root * PAGE_SIZE, SEEK_SET);
+    FS.read(stream, buf, 0, PAGE_SIZE);
+
+    // Read internal page
+    FS.llseek(stream, internal * PAGE_SIZE, SEEK_SET);
+    FS.read(stream, buf, 0, PAGE_SIZE);
+
+    // Read leaf page
+    FS.llseek(stream, leaf * PAGE_SIZE, SEEK_SET);
+    const n = FS.read(stream, buf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+
+    // Verify leaf page has expected content (original or last modification)
+    const expectedSeed = modifications.get(leaf);
+    if (expectedSeed !== undefined) {
+      // Was modified — check modification pattern
+      for (let i = 0; i < 64; i++) {
+        if (buf[i] !== ((expectedSeed + i * 37) & 0xff)) {
+          throw new Error(
+            `Leaf page ${leaf} modified data mismatch at byte ${i} ` +
+            `(lookup ${lookup}): expected ${(expectedSeed + i * 37) & 0xff}, got ${buf[i]}`,
+          );
+        }
+      }
+    } else {
+      // Unmodified — check original pattern
+      const expected = generatePageData(leaf);
+      expectBytesEqual(buf, expected);
+    }
+
+    // Modify the leaf page header (first 64 bytes) — simulates index tuple insert
+    const modSeed = lookup * 1000 + leaf;
+    for (let i = 0; i < 64; i++) {
+      buf[i] = (modSeed + i * 37) & 0xff;
+    }
+    FS.llseek(stream, leaf * PAGE_SIZE, SEEK_SET);
+    FS.write(stream, buf, 0, PAGE_SIZE);
+    modifications.set(leaf, modSeed);
+  }
+  FS.close(stream);
+
+  // Verify all pages: unmodified pages should have original data,
+  // modified pages should have the last modification applied
+  const verifyStream = FS.open("/idx", O.RDONLY);
+  for (let p = 0; p < indexPages; p++) {
+    FS.llseek(verifyStream, p * PAGE_SIZE, SEEK_SET);
+    const n = FS.read(verifyStream, buf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+
+    const modSeed = modifications.get(p);
+    if (modSeed !== undefined) {
+      // First 64 bytes modified, rest is original
+      for (let i = 0; i < 64; i++) {
+        if (buf[i] !== ((modSeed + i * 37) & 0xff)) {
+          throw new Error(
+            `Final verify page ${p} header mismatch at byte ${i}: ` +
+            `expected ${(modSeed + i * 37) & 0xff}, got ${buf[i]}`,
+          );
+        }
+      }
+      const expected = generatePageData(p);
+      expectBytesEqual(
+        buf.subarray(64),
+        expected.subarray(64),
+        PAGE_SIZE - 64,
+      );
+    } else {
+      const expected = generatePageData(p);
+      expectBytesEqual(buf, expected);
+    }
+  }
+  FS.close(verifyStream);
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 10: Concurrent Sequential Scan + Point Lookups
+//
+// Realistic OLTP+analytic mixed workload: one fd performs a full sequential
+// scan (analytic query / VACUUM) while another fd does random point lookups
+// (OLTP SELECTs by primary key). The sequential scan evicts pages that the
+// point lookup needs, and vice versa. At small cache sizes this creates
+// severe thrashing — the LRU cache bounces between scan and lookup pages.
+// ---------------------------------------------------------------------------
+
+describeScenario("Scenario 10: Sequential Scan + Point Lookups", (h) => {
+  const { FS } = h;
+  const heapPages = 48; // 384 KB heap
+  const totalBytes = PAGE_SIZE * heapPages;
+
+  // Create heap file
+  writeFileData(FS, "/heap", totalBytes);
+
+  // Open two fds: one for sequential scan, one for point lookups
+  const scanFd = FS.open("/heap", O.RDONLY);
+  const lookupFd = FS.open("/heap", O.RDONLY);
+
+  const scanBuf = new Uint8Array(PAGE_SIZE);
+  const lookupBuf = new Uint8Array(PAGE_SIZE);
+
+  // Interleave: scan reads 2 pages, then a point lookup reads 1 random page
+  let scanPos = 0;
+  for (let round = 0; round < heapPages / 2; round++) {
+    // Sequential scan: read 2 pages
+    for (let i = 0; i < 2 && scanPos < heapPages; i++) {
+      FS.llseek(scanFd, scanPos * PAGE_SIZE, SEEK_SET);
+      const n = FS.read(scanFd, scanBuf, 0, PAGE_SIZE);
+      expect(n).toBe(PAGE_SIZE);
+      const expected = generatePageData(scanPos);
+      expectBytesEqual(scanBuf, expected);
+      scanPos++;
+    }
+
+    // Point lookup: read a random page (deterministic)
+    const lookupPage = (round * 31 + 5) % heapPages;
+    FS.llseek(lookupFd, lookupPage * PAGE_SIZE, SEEK_SET);
+    const n = FS.read(lookupFd, lookupBuf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+    const expected = generatePageData(lookupPage);
+    expectBytesEqual(lookupBuf, expected);
+  }
+
+  FS.close(scanFd);
+  FS.close(lookupFd);
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 11: Multi-file Random Access (Heap + Index + TOAST)
+//
+// Postgres queries often access multiple files simultaneously: the heap
+// for tuple data, one or more indexes for lookup, and TOAST tables for
+// large values. Each file competes for the same cache slots. This tests
+// interleaved random reads across 3 files with different sizes and access
+// patterns, exercising inter-file eviction pressure.
+// ---------------------------------------------------------------------------
+
+describeScenario("Scenario 11: Multi-file Random Access", (h) => {
+  const { FS } = h;
+  const heapPages = 24;
+  const idxPages = 16;
+  const toastPages = 12;
+
+  // Create three files with distinct data
+  writeFileData(FS, "/heap", PAGE_SIZE * heapPages);
+  writeFileData(FS, "/idx", PAGE_SIZE * idxPages);
+  writeFileData(FS, "/toast", PAGE_SIZE * toastPages);
+
+  const heapFd = FS.open("/heap", O.RDONLY);
+  const idxFd = FS.open("/idx", O.RDONLY);
+  const toastFd = FS.open("/toast", O.RDONLY);
+  const buf = new Uint8Array(PAGE_SIZE);
+
+  // Simulate 60 queries: each does index lookup → heap fetch → optional TOAST fetch
+  for (let q = 0; q < 60; q++) {
+    // Index lookup (random page in index)
+    const idxPage = (q * 7 + 3) % idxPages;
+    FS.llseek(idxFd, idxPage * PAGE_SIZE, SEEK_SET);
+    let n = FS.read(idxFd, buf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+    expectBytesEqual(buf, generatePageData(idxPage));
+
+    // Heap fetch (random page derived from "index lookup result")
+    const heapPage = (idxPage * 3 + q * 11 + 1) % heapPages;
+    FS.llseek(heapFd, heapPage * PAGE_SIZE, SEEK_SET);
+    n = FS.read(heapFd, buf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+    expectBytesEqual(buf, generatePageData(heapPage));
+
+    // TOAST fetch (every 3rd query, simulating large column access)
+    if (q % 3 === 0) {
+      const toastPage = (q * 5 + 2) % toastPages;
+      FS.llseek(toastFd, toastPage * PAGE_SIZE, SEEK_SET);
+      n = FS.read(toastFd, buf, 0, PAGE_SIZE);
+      expect(n).toBe(PAGE_SIZE);
+      expectBytesEqual(buf, generatePageData(toastPage));
+    }
+  }
+
+  FS.close(heapFd);
+  FS.close(idxFd);
+  FS.close(toastFd);
+});
