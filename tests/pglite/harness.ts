@@ -31,6 +31,14 @@ export interface PGliteHarness {
   syncToFs(): Promise<void>;
   /** Clean up resources. */
   destroy(): Promise<void>;
+  /**
+   * Simulate a dirty shutdown (e.g., browser tab crash).
+   * Abandons the PGlite instance WITHOUT calling syncfs or close.
+   * The backend retains whatever pages were evicted during operations
+   * plus metadata from the last explicit syncToFs call. On remount,
+   * Postgres must recover via WAL replay.
+   */
+  dirtyDestroy(): void;
 }
 
 export interface PGliteHarnessOptions {
@@ -79,6 +87,10 @@ export async function createPGliteHarness(
       } catch (_e) {
         // Ignore "PGlite is closed" errors from double-close
       }
+    },
+    dirtyDestroy() {
+      // Intentionally do NOT call pg.close() or syncToFs().
+      // The backend retains partially-flushed state from cache evictions.
     },
   };
 }
