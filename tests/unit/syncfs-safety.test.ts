@@ -150,8 +150,12 @@ describe("syncfs safety", () => {
     FS.close(s);
     syncAndUnmount(FS, tomefs);
 
-    // Remount, delete one file, then record operations during syncfs
+    // Remount, modify one file and delete the other, then record during syncfs
     const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+    // Modify "keep" so its metadata is dirty and will be written during sync
+    const s2 = FS2.open(`${MOUNT}/keep`, O.RDWR);
+    FS2.write(s2, encode("kept"), 0, 4);
+    FS2.close(s2);
     FS2.unlink(`${MOUNT}/stale`);
 
     // The unlink already called deleteMeta eagerly. Now we need a scenario
@@ -572,10 +576,13 @@ describe("syncfs detached node handling", () => {
       .find((f) => f.meta && f.meta.size === 7);
     expect(detachedMeta).toBeDefined();
 
-    // Modify the file's size (simulate Postgres writing more data)
+    // Modify the file's size (simulate Postgres writing more data).
+    // Set _metaDirty to simulate a real write through stream_ops, which
+    // marks metadata dirty when updating mtime/ctime/size.
     const detachedPath = fileNode.storagePath;
     tomefs.pageCache.write(detachedPath, encode("much longer data"), 0, 16, 0, 7);
     fileNode.usedBytes = 16;
+    fileNode._metaDirty = true;
 
     // Second sync — metadata MUST be updated (this was the bug)
     syncfs(FS, tomefs);
@@ -707,5 +714,107 @@ describe("syncfs detached node handling", () => {
     expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
 
     FS.unmount(MOUNT);
+  });
+
+  it("skips metadata writes for unmodified files after first sync @fast", async () => {
+    // Create several files and sync (first sync writes all metadata)
+    const { FS, tomefs } = await mountTome(backend);
+    for (let i = 0; i < 5; i++) {
+      const s = FS.open(`${MOUNT}/f${i}`, O.RDWR | O.CREAT, 0o666);
+      FS.write(s, encode(`data-${i}`), 0, 6);
+      FS.close(s);
+    }
+    syncfs(FS, tomefs);
+
+    // Second sync without modifications — should write zero metadata entries
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+
+    const writeOps = backend.operations.filter((o) => o.op === "writeMeta");
+    expect(writeOps.length).toBe(0);
+
+    // All files still readable
+    for (let i = 0; i < 5; i++) {
+      const s = FS.open(`${MOUNT}/f${i}`, O.RDONLY);
+      const buf = new Uint8Array(20);
+      const n = FS.read(s, buf, 0, 20);
+      FS.close(s);
+      expect(decode(buf, n)).toBe(`data-${i}`);
+    }
+
+    FS.unmount(MOUNT);
+  });
+
+  it("only writes metadata for modified files on subsequent sync @fast", async () => {
+    // Create files and sync
+    const { FS, tomefs } = await mountTome(backend);
+    for (let i = 0; i < 5; i++) {
+      const s = FS.open(`${MOUNT}/f${i}`, O.RDWR | O.CREAT, 0o666);
+      FS.write(s, encode(`data-${i}`), 0, 6);
+      FS.close(s);
+    }
+    syncfs(FS, tomefs);
+
+    // Modify only one file
+    const s = FS.open(`${MOUNT}/f2`, O.WRONLY);
+    FS.write(s, encode("CHANGED"), 0, 7);
+    FS.close(s);
+
+    backend.startRecording();
+    syncfs(FS, tomefs);
+    backend.stopRecording();
+
+    // Only the modified file and its parent dir should have metadata written
+    const writeOps = backend.operations.filter((o) => o.op === "writeMeta");
+    const writtenPaths = writeOps.map((o) => o.path);
+    expect(writtenPaths).toContain("/f2");
+    // Unmodified files should NOT be written
+    expect(writtenPaths).not.toContain("/f0");
+    expect(writtenPaths).not.toContain("/f1");
+    expect(writtenPaths).not.toContain("/f3");
+    expect(writtenPaths).not.toContain("/f4");
+
+    // All files still readable with correct content
+    const s2 = FS.open(`${MOUNT}/f2`, O.RDONLY);
+    const buf = new Uint8Array(20);
+    const n = FS.read(s2, buf, 0, 20);
+    FS.close(s2);
+    expect(decode(buf, n)).toBe("CHANGED");
+
+    FS.unmount(MOUNT);
+  });
+
+  it("metadata persists correctly across remount after dirty-skip sync", async () => {
+    // Create files and do initial sync
+    const { FS, tomefs } = await mountTome(backend);
+    for (let i = 0; i < 3; i++) {
+      const s = FS.open(`${MOUNT}/f${i}`, O.RDWR | O.CREAT, 0o666);
+      FS.write(s, encode(`v1-${i}`), 0, 4);
+      FS.close(s);
+    }
+    syncAndUnmount(FS, tomefs);
+
+    // Remount, modify one file, sync (dirty-skip should preserve others)
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+    const s = FS2.open(`${MOUNT}/f1`, O.WRONLY | O.TRUNC);
+    FS2.write(s, encode("v2"), 0, 2);
+    FS2.close(s);
+    syncAndUnmount(FS2, t2);
+
+    // Remount and verify all files
+    const { FS: FS3 } = await mountTome(backend);
+    for (let i = 0; i < 3; i++) {
+      const s = FS3.open(`${MOUNT}/f${i}`, O.RDONLY);
+      const buf = new Uint8Array(20);
+      const n = FS3.read(s, buf, 0, 20);
+      FS3.close(s);
+      if (i === 1) {
+        expect(decode(buf, n)).toBe("v2");
+      } else {
+        expect(decode(buf, n)).toBe(`v1-${i}`);
+      }
+    }
+    FS3.unmount(MOUNT);
   });
 });

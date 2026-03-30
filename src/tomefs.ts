@@ -292,10 +292,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     for (const key of ["mode", "atime", "mtime", "ctime"] as const) {
       if (attr[key] != null) {
         node[key] = attr[key];
+        node._metaDirty = true;
       }
     }
     if (attr.size !== undefined) {
       resizeFileStorage(node, attr.size);
+      node._metaDirty = true;
     }
   }
 
@@ -428,12 +430,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     }
 
     // Rewire the node tree
-    delete old_node.parent.contents[old_node.name];
+    const old_parent = old_node.parent;
+    delete old_parent.contents[old_node.name];
     new_dir.contents[new_name] = old_node;
     old_node.name = new_name;
     const now = Date.now();
-    new_dir.ctime = new_dir.mtime = old_node.parent.ctime =
-      old_node.parent.mtime = now;
+    new_dir.ctime = new_dir.mtime = now;
+    new_dir._metaDirty = true;
+    old_parent.ctime = old_parent.mtime = now;
+    old_parent._metaDirty = true;
   }
 
   function unlink(parent: any, name: string) {
@@ -483,6 +488,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     }
     delete parent.contents[name];
     parent.ctime = parent.mtime = Date.now();
+    parent._metaDirty = true;
   }
 
   function rmdir(parent: any, name: string) {
@@ -496,6 +502,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     backend.deleteMeta(sp);
     delete parent.contents[name];
     parent.ctime = parent.mtime = Date.now();
+    parent._metaDirty = true;
   }
 
   /** Compute a storage path for a node given its parent and name. */
@@ -661,6 +668,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (!length) return 0;
       const node = stream.node;
       node.mtime = node.ctime = Date.now();
+      node._metaDirty = true;
       return writePages(node, buffer, offset, length, position);
     },
 
@@ -784,34 +792,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       visited.add(node);
       if (FS.isFile(node.mode)) {
         currentPaths.add(path);
-        // Page data is already flushed by flushAll() before persistTree() is called.
-        metaBatch.push({
-          path,
-          meta: {
-            size: node.usedBytes,
-            mode: node.mode,
-            ctime: node.ctime,
-            mtime: node.mtime,
-            atime: node.atime,
-          },
-        });
+        // Only write metadata if it changed since last sync (or first sync).
+        // Page data is already flushed by flushAll() before persistTree().
+        if (node._metaDirty) {
+          metaBatch.push({
+            path,
+            meta: {
+              size: node.usedBytes,
+              mode: node.mode,
+              ctime: node.ctime,
+              mtime: node.mtime,
+              atime: node.atime,
+            },
+          });
+        }
       } else if (FS.isLink(node.mode)) {
         currentPaths.add(path);
-        metaBatch.push({
-          path,
-          meta: {
-            size: 0,
-            mode: node.mode,
-            ctime: node.ctime,
-            mtime: node.mtime,
-            atime: node.atime,
-            link: node.link,
-          },
-        });
-      } else if (FS.isDir(node.mode)) {
-        // Persist directory metadata (skip root — it's recreated on mount)
-        if (path !== "/") {
-          currentPaths.add(path);
+        if (node._metaDirty) {
           metaBatch.push({
             path,
             meta: {
@@ -820,8 +817,26 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               ctime: node.ctime,
               mtime: node.mtime,
               atime: node.atime,
+              link: node.link,
             },
           });
+        }
+      } else if (FS.isDir(node.mode)) {
+        // Persist directory metadata (skip root — it's recreated on mount)
+        if (path !== "/") {
+          currentPaths.add(path);
+          if (node._metaDirty) {
+            metaBatch.push({
+              path,
+              meta: {
+                size: 0,
+                mode: node.mode,
+                ctime: node.ctime,
+                mtime: node.mtime,
+                atime: node.atime,
+              },
+            });
+          }
         }
         // Recurse into children
         for (const name of Object.keys(node.contents)) {
@@ -893,6 +908,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.atime = meta.atime ?? meta.mtime;
         node.mtime = meta.mtime;
         node.ctime = meta.ctime;
+        // Metadata already in backend — no need to re-write on next sync.
+        node._metaDirty = false;
+        // Parent was marked dirty by createNode's timestamp update, but
+        // restoreTree processes parents before children (depth-sorted), so
+        // parent._metaDirty will be cleared when its own entry is processed.
       } else if (typeMode === S_IFREG) {
         const storagePath = computeStoragePath(parent, name);
         fileEntries.push({ path, meta, parent, name, storagePath });
@@ -902,6 +922,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.atime = meta.atime ?? meta.mtime;
         node.mtime = meta.mtime;
         node.ctime = meta.ctime;
+        node._metaDirty = false;
       }
     }
 
@@ -963,6 +984,22 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.atime = meta.atime ?? meta.mtime;
         node.mtime = meta.mtime;
         node.ctime = meta.ctime;
+        node._metaDirty = false;
+      }
+    }
+
+    // createNode marks parent directories dirty (timestamp updates), but
+    // all metadata was just restored from the backend — nothing needs
+    // re-writing. Walk the tree and clear all dirty flags.
+    clearMetaDirty(root);
+  }
+
+  /** Recursively clear _metaDirty on all nodes in a subtree. */
+  function clearMetaDirty(node: any): void {
+    node._metaDirty = false;
+    if (node.contents) {
+      for (const name of Object.keys(node.contents)) {
+        clearMetaDirty(node.contents[name]);
       }
     }
   }
@@ -1028,22 +1065,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             if (node.unlinked) continue;
             const path = nodeStoragePath(node, mountPrefix);
             currentPaths.add(path);
-            // Always persist metadata for detached nodes — not just on first
-            // sync. Without this, metadata (size, timestamps, mode) becomes
-            // stale after the first sync if the file is modified between cycles.
             // flushAll() already flushed dirty pages, but detached nodes
             // may not have been flushed if their storagePath differs.
             pageCache.flushFile(node.storagePath);
-            metaBatch.push({
-              path,
-              meta: {
-                size: node.usedBytes,
-                mode: node.mode,
-                ctime: node.ctime,
-                mtime: node.mtime,
-                atime: node.atime,
-              },
-            });
+            // Only persist metadata when dirty — avoids redundant backend
+            // writes for detached nodes that haven't changed since last sync.
+            if (node._metaDirty) {
+              metaBatch.push({
+                path,
+                meta: {
+                  size: node.usedBytes,
+                  mode: node.mode,
+                  ctime: node.ctime,
+                  mtime: node.mtime,
+                  atime: node.atime,
+                },
+              });
+            }
           }
 
           // Also persist parent directories for detached nodes
@@ -1090,7 +1128,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
           // Batch-write all collected metadata in a single backend call.
           // Through the SAB bridge, this reduces O(n) round-trips to O(1).
-          backend.writeMetas(metaBatch);
+          if (metaBatch.length > 0) {
+            backend.writeMetas(metaBatch);
+          }
+
+          // Clear dirty flags on all nodes whose metadata was persisted.
+          // Walk the mount tree (visited nodes) and detached file nodes.
+          clearMetaDirty(mount.root);
+          for (const node of allFileNodes) {
+            node._metaDirty = false;
+          }
 
           // Delete metadata and orphaned page data for paths no longer in the tree.
           // Page data can become orphaned if the process crashes between an unlink
@@ -1157,10 +1204,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       }
 
       node.atime = node.mtime = node.ctime = Date.now();
+      node._metaDirty = true;
 
       if (parent) {
         parent.contents[name] = node;
         parent.atime = parent.mtime = parent.ctime = node.atime;
+        parent._metaDirty = true;
       }
 
       return node;
