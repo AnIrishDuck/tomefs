@@ -68,7 +68,7 @@ jobs:
         run: TOMEFS_BACKEND=tomefs npm test
 
   small-cache-tests:
-    name: Small-cache conformance
+    name: Small-cache stress (4-page cache)
     runs-on: ubuntu-latest
 
     steps:
@@ -86,3 +86,12 @@ jobs:
 
       - name: Workload tests (tomefs, 4-page cache)
         run: TOMEFS_BACKEND=tomefs TOMEFS_MAX_PAGES=4 npx vitest run tests/workload/ tests/scribe-data/
+
+      - name: Adversarial tests (tomefs, 4-page cache)
+        run: TOMEFS_BACKEND=tomefs TOMEFS_MAX_PAGES=4 npx vitest run tests/adversarial/
+
+      - name: Fuzz tests (tomefs, 4-page cache)
+        run: TOMEFS_BACKEND=tomefs TOMEFS_MAX_PAGES=4 npx vitest run tests/fuzz/
+
+      - name: Integration tests (tomefs, 4-page cache)
+        run: TOMEFS_BACKEND=tomefs TOMEFS_MAX_PAGES=4 npx vitest run tests/integration/

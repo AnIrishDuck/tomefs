@@ -649,3 +649,178 @@ describeScenario("Scenario 11: Multi-file Random Access", (h) => {
   FS.close(idxFd);
   FS.close(toastFd);
 });
+
+// ---------------------------------------------------------------------------
+// Scenario 12: VACUUM (Sequential Rewrite + Truncate)
+//
+// PostgreSQL's VACUUM reads every page of a table sequentially, rewrites
+// pages in place to compact dead tuples, then truncates trailing empty
+// pages. Under cache pressure this is demanding:
+//   - The sequential scan rotates the entire cache
+//   - In-place writes dirty pages that may be evicted before the scan
+//     reaches the next page (dirty eviction under forward pressure)
+//   - Truncation removes pages that may be cached, dirty, or already
+//     evicted — all three states must be handled correctly
+//   - After truncation, remaining data must be intact
+// ---------------------------------------------------------------------------
+
+describeScenario("Scenario 12: VACUUM (rewrite + truncate) @fast", (h) => {
+  const { FS } = h;
+  const totalPages = 32;
+  const totalBytes = PAGE_SIZE * totalPages;
+
+  // Phase 1: Populate the "table" with deterministic data
+  writeFileData(FS, "/table", totalBytes);
+
+  // Phase 2: VACUUM scan — read each page, "compact" it by rewriting
+  // with modified data (simulating dead tuple removal / tuple compaction).
+  // The rewritten pages get a different byte pattern so we can verify them.
+  const vacuumFd = FS.open("/table", O.RDWR);
+  const readBuf = new Uint8Array(PAGE_SIZE);
+
+  // Track which pages become "empty" (all dead tuples) — these will be
+  // truncated away. Last 25% of pages are "empty" after vacuum.
+  const survivingPages = Math.floor(totalPages * 0.75); // 24 pages survive
+
+  for (let p = 0; p < totalPages; p++) {
+    // Read the page (sequential scan)
+    FS.llseek(vacuumFd, p * PAGE_SIZE, SEEK_SET);
+    const n = FS.read(vacuumFd, readBuf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+
+    // Verify we read the original data
+    const expected = generatePageData(p);
+    expectBytesEqual(readBuf, expected);
+
+    if (p < survivingPages) {
+      // "Compact" this page: rewrite with modified data.
+      // XOR each byte with the page index to create a distinguishable pattern.
+      const compacted = new Uint8Array(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        compacted[i] = readBuf[i] ^ (p & 0xff);
+      }
+      FS.llseek(vacuumFd, p * PAGE_SIZE, SEEK_SET);
+      FS.write(vacuumFd, compacted, 0, PAGE_SIZE);
+    }
+    // Pages >= survivingPages are "empty" — will be truncated
+  }
+  FS.close(vacuumFd);
+
+  // Phase 3: Truncate trailing empty pages (VACUUM's final step)
+  FS.truncate("/table", survivingPages * PAGE_SIZE);
+
+  // Phase 4: Verify the file is the correct size
+  const stat = FS.stat("/table");
+  expect(stat.size).toBe(survivingPages * PAGE_SIZE);
+
+  // Phase 5: Verify all surviving pages have the compacted data
+  const verifyFd = FS.open("/table", O.RDONLY);
+  const verifyBuf = new Uint8Array(PAGE_SIZE);
+  for (let p = 0; p < survivingPages; p++) {
+    const n = FS.read(verifyFd, verifyBuf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+    const original = generatePageData(p);
+    for (let i = 0; i < PAGE_SIZE; i++) {
+      const expectedByte = original[i] ^ (p & 0xff);
+      if (verifyBuf[i] !== expectedByte) {
+        FS.close(verifyFd);
+        throw new Error(
+          `VACUUM compacted data mismatch at page ${p}, offset ${i}: ` +
+          `expected ${expectedByte}, got ${verifyBuf[i]}`,
+        );
+      }
+    }
+  }
+  FS.close(verifyFd);
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 13: VACUUM + Concurrent Reads
+//
+// While VACUUM rewrites and truncates, other queries continue reading the
+// same table through a separate fd. This simulates the real PGlite pattern
+// where SELECTs run concurrently with VACUUM. The reader fd holds pages
+// in cache that VACUUM wants to rewrite, creating cross-fd cache contention.
+// ---------------------------------------------------------------------------
+
+describeScenario("Scenario 13: VACUUM + concurrent reads", (h) => {
+  const { FS } = h;
+  const totalPages = 24;
+  const totalBytes = PAGE_SIZE * totalPages;
+  const survivingPages = 18; // truncate last 6 pages
+
+  // Populate
+  writeFileData(FS, "/table", totalBytes);
+
+  // Open two fds: VACUUM (read-write) and reader (read-only)
+  const vacuumFd = FS.open("/table", O.RDWR);
+  const readerFd = FS.open("/table", O.RDONLY);
+  const buf = new Uint8Array(PAGE_SIZE);
+
+  // Interleaved: VACUUM processes 2 pages, then reader reads 1 random page
+  for (let step = 0; step < totalPages; step += 2) {
+    // VACUUM: read + rewrite 2 pages
+    for (let i = 0; i < 2 && step + i < totalPages; i++) {
+      const p = step + i;
+      FS.llseek(vacuumFd, p * PAGE_SIZE, SEEK_SET);
+      const n = FS.read(vacuumFd, buf, 0, PAGE_SIZE);
+      expect(n).toBe(PAGE_SIZE);
+
+      if (p < survivingPages) {
+        // Compact: invert all bytes
+        const compacted = new Uint8Array(PAGE_SIZE);
+        for (let j = 0; j < PAGE_SIZE; j++) {
+          compacted[j] = buf[j] ^ 0xff;
+        }
+        FS.llseek(vacuumFd, p * PAGE_SIZE, SEEK_SET);
+        FS.write(vacuumFd, compacted, 0, PAGE_SIZE);
+      }
+    }
+
+    // Reader: read a "random" page from already-vacuumed region
+    if (step > 0) {
+      const readPage = (step * 7 + 3) % step; // page in already-processed region
+      FS.llseek(readerFd, readPage * PAGE_SIZE, SEEK_SET);
+      const n = FS.read(readerFd, buf, 0, PAGE_SIZE);
+      expect(n).toBe(PAGE_SIZE);
+      // Verify we see the compacted (post-VACUUM) data
+      const original = generatePageData(readPage);
+      for (let j = 0; j < PAGE_SIZE; j++) {
+        const expectedByte = original[j] ^ 0xff;
+        if (buf[j] !== expectedByte) {
+          FS.close(vacuumFd);
+          FS.close(readerFd);
+          throw new Error(
+            `Concurrent read mismatch at page ${readPage}, offset ${j}: ` +
+            `expected ${expectedByte}, got ${buf[j]}`,
+          );
+        }
+      }
+    }
+  }
+
+  FS.close(vacuumFd);
+
+  // Truncate trailing empty pages
+  FS.truncate("/table", survivingPages * PAGE_SIZE);
+  expect(FS.stat("/table").size).toBe(survivingPages * PAGE_SIZE);
+
+  // Reader fd should still work for surviving pages
+  FS.llseek(readerFd, 0, SEEK_SET);
+  for (let p = 0; p < survivingPages; p++) {
+    const n = FS.read(readerFd, buf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+    const original = generatePageData(p);
+    for (let j = 0; j < PAGE_SIZE; j++) {
+      const expectedByte = original[j] ^ 0xff;
+      if (buf[j] !== expectedByte) {
+        FS.close(readerFd);
+        throw new Error(
+          `Post-truncate read mismatch at page ${p}, offset ${j}: ` +
+          `expected ${expectedByte}, got ${buf[j]}`,
+        );
+      }
+    }
+  }
+  FS.close(readerFd);
+});
