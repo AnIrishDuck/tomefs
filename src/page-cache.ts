@@ -71,6 +71,18 @@ export class PageCache {
   }
 
   /**
+   * Get a page from cache, or create a zero-filled page on cache miss
+   * without reading from the backend.
+   *
+   * Used for pages beyond the current file extent during writes — we know
+   * these pages don't exist in the backend, so the readPage call would be
+   * a wasted round-trip.
+   */
+  async getPageNoRead(path: string, pageIndex: number): Promise<CachedPage> {
+    return this.getPageInternal(path, pageIndex, false);
+  }
+
+  /**
    * Get or create a page. When readBackend is false, skips the backend read
    * and creates a zero-filled page on cache miss. Used for pages beyond the
    * current file extent during writes — we know these pages don't exist in
