@@ -120,6 +120,9 @@ class ReadCountingBackend implements StorageBackend {
   async countPages(path: string) {
     return this.inner.countPages(path);
   }
+  async countPagesBatch(paths: string[]) {
+    return this.inner.countPagesBatch(paths);
+  }
   async maxPageIndex(path: string) {
     return this.inner.maxPageIndex(path);
   }
