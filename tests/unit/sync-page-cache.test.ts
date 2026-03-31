@@ -1023,4 +1023,79 @@ describe("SyncPageCache", () => {
       }
     });
   });
+
+  describe("getPageNoRead", () => {
+    /**
+     * Counting wrapper (same as above) for verifying backend reads are skipped.
+     */
+    function createCountingBackend() {
+      const inner = new SyncMemoryBackend();
+      let readPageCalls = 0;
+
+      const counting: SyncMemoryBackend & {
+        readPageCalls: number;
+        resetCounts(): void;
+      } = Object.create(inner);
+
+      Object.defineProperty(counting, "readPageCalls", {
+        get: () => readPageCalls,
+      });
+      counting.resetCounts = () => { readPageCalls = 0; };
+      counting.readPage = (path: string, pageIndex: number) => {
+        readPageCalls++;
+        return inner.readPage(path, pageIndex);
+      };
+      counting.readPages = (path: string, pageIndices: number[]) => {
+        readPageCalls += pageIndices.length;
+        return inner.readPages(path, pageIndices);
+      };
+      return counting;
+    }
+
+    it("@fast creates zero-filled page without reading backend", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      cb.resetCounts();
+      const page = cache.getPageNoRead("/file", 0);
+
+      expect(cb.readPageCalls).toBe(0);
+      expect(page.data).toEqual(new Uint8Array(PAGE_SIZE));
+      expect(page.dirty).toBe(false);
+    });
+
+    it("returns cached page if already present (no backend read)", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      // Load page into cache via normal getPage
+      const page1 = cache.getPage("/file", 0);
+      page1.data[0] = 0x42;
+
+      cb.resetCounts();
+      const page2 = cache.getPageNoRead("/file", 0);
+
+      // Should return same cached page, no backend read
+      expect(cb.readPageCalls).toBe(0);
+      expect(page2.data[0]).toBe(0x42);
+    });
+
+    it("page created by getPageNoRead is writable and flushable", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      const page = cache.getPageNoRead("/file", 0);
+      page.data.set(new Uint8Array([1, 2, 3, 4, 5]));
+      page.dirty = true;
+      cache.addDirtyKey("/file", 0);
+
+      cache.flushAll();
+
+      // Verify data made it to backend
+      const stored = cb.readPage("/file", 0);
+      expect(stored).not.toBeNull();
+      expect(stored![0]).toBe(1);
+      expect(stored![4]).toBe(5);
+    });
+  });
 });

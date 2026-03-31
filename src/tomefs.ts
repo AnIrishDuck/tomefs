@@ -169,7 +169,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (pageOffset + length <= PAGE_SIZE) {
       let page = node._mruPage;
       if (!page || page.evicted || page.pageIndex !== firstPage) {
-        page = pageCache.getPage(node.storagePath, firstPage);
+        // Skip backend read for pages beyond the current file extent —
+        // they don't exist in the backend, so readPage would be a wasted
+        // SAB bridge round-trip returning null.
+        const firstNewPage = node.usedBytes > 0
+          ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
+        page = firstPage < firstNewPage
+          ? pageCache.getPage(node.storagePath, firstPage)
+          : pageCache.getPageNoRead(node.storagePath, firstPage);
         node._mruPage = page;
       }
       page.data.set(
