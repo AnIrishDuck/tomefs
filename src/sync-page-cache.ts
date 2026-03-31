@@ -275,11 +275,12 @@ export class SyncPageCache {
 
     // Fast path: entire write fits within a single page
     if (pageOffset + length <= PAGE_SIZE) {
-      const page = this.getPageInternal(
-        path,
-        firstPage,
-        firstPage < firstNewPage,
-      );
+      // Skip backend read when the entire page will be overwritten —
+      // every byte is about to be replaced, so reading old data is wasted.
+      const needsRead =
+        firstPage < firstNewPage &&
+        !(pageOffset === 0 && length >= PAGE_SIZE);
+      const page = this.getPageInternal(path, firstPage, needsRead);
       page.data.set(
         buffer.subarray(offset, offset + length),
         pageOffset,
@@ -295,15 +296,23 @@ export class SyncPageCache {
     // Multi-page path
     const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
 
-    // Separate cache misses into pages that might exist in the backend
-    // (need readPages) vs pages beyond the file extent (skip backend read).
+    // Separate cache misses into pages that need backend reads vs pages
+    // that can skip them (beyond file extent, or fully overwritten).
     const existingMissing: number[] = [];
     let totalMissing = 0;
+    const writeEnd = position + length;
     for (let p = firstPage; p <= lastPage; p++) {
       if (!this.cache.has(pageKeyStr(path, p))) {
         totalMissing++;
         if (p < firstNewPage) {
-          existingMissing.push(p);
+          // Skip preloading pages that will be completely overwritten —
+          // every byte will be replaced, so the backend read is wasted.
+          const fullyOverwritten =
+            position <= p * PAGE_SIZE &&
+            writeEnd >= (p + 1) * PAGE_SIZE;
+          if (!fullyOverwritten) {
+            existingMissing.push(p);
+          }
         }
       }
     }
@@ -349,7 +358,12 @@ export class SyncPageCache {
       const po = pos - pi * PAGE_SIZE;
       const bytesInPage = Math.min(PAGE_SIZE - po, length - bytesWritten);
 
-      const page = this.getPageInternal(path, pi, pi < firstNewPage);
+      // Skip backend read for fully-overwritten pages (po === 0 means
+      // write starts at page boundary; bytesInPage === PAGE_SIZE means
+      // the entire page is covered).
+      const needsRead =
+        pi < firstNewPage && !(po === 0 && bytesInPage === PAGE_SIZE);
+      const page = this.getPageInternal(path, pi, needsRead);
       page.data.set(
         buffer.subarray(
           offset + bytesWritten,
