@@ -425,6 +425,9 @@ function createTrackingBackend(
     countPages(path) {
       return inner.countPages(path);
     },
+    countPagesBatch(paths) {
+      return inner.countPagesBatch(paths);
+    },
     maxPageIndex(path) {
       return inner.maxPageIndex(path);
     },

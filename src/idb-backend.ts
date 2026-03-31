@@ -246,6 +246,30 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async countPagesBatch(paths: string[]): Promise<number[]> {
+    if (paths.length === 0) return [];
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGES_STORE, "readonly");
+      const store = tx.objectStore(PAGES_STORE);
+      const results = new Array<number>(paths.length);
+      let completed = 0;
+
+      for (let i = 0; i < paths.length; i++) {
+        const range = IDBKeyRange.bound([paths[i], 0], [paths[i], ""], false, true);
+        const request = store.count(range);
+        request.onsuccess = () => {
+          results[i] = request.result;
+          completed++;
+          if (completed === paths.length) resolve(results);
+        };
+        request.onerror = () => reject(request.error);
+      }
+
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async maxPageIndex(path: string): Promise<number> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {

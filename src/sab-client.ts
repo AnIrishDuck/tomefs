@@ -238,6 +238,25 @@ export class SabClient implements SyncStorageBackend {
     return (json as { count: number }).count;
   }
 
+  countPagesBatch(paths: string[]): number[] {
+    if (paths.length === 0) return [];
+
+    // Single chunk fast path
+    if (paths.length <= this.maxBatchFiles) {
+      const { json } = this.call(OpCode.COUNT_PAGES_BATCH, { paths });
+      return (json as { counts: number[] }).counts;
+    }
+
+    // Multi-chunk: split paths to avoid SAB buffer overflow
+    const allCounts: number[] = [];
+    for (let i = 0; i < paths.length; i += this.maxBatchFiles) {
+      const chunk = paths.slice(i, i + this.maxBatchFiles);
+      const { json } = this.call(OpCode.COUNT_PAGES_BATCH, { paths: chunk });
+      allCounts.push(...(json as { counts: number[] }).counts);
+    }
+    return allCounts;
+  }
+
   readMeta(path: string): FileMeta | null {
     const { json } = this.call(OpCode.READ_META, { path });
     const result = json as { meta: FileMeta | null };

@@ -87,6 +87,10 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     return this.filePageKeys.get(path)?.size ?? 0;
   }
 
+  countPagesBatch(paths: string[]): number[] {
+    return paths.map((path) => this.filePageKeys.get(path)?.size ?? 0);
+  }
+
   maxPageIndex(path: string): number {
     const keys = this.filePageKeys.get(path);
     if (!keys || keys.size === 0) return -1;

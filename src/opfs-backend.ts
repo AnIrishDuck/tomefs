@@ -213,6 +213,12 @@ export class OpfsBackend implements StorageBackend {
     }
   }
 
+  async countPagesBatch(paths: string[]): Promise<number[]> {
+    if (paths.length === 0) return [];
+    await this.init();
+    return Promise.all(paths.map((path) => this.countPages(path)));
+  }
+
   async maxPageIndex(path: string): Promise<number> {
     await this.init();
     const encoded = encodePath(path);

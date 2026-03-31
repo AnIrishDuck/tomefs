@@ -93,6 +93,10 @@ class CountingBackend implements StorageBackend {
     this.count("countPages");
     return this.inner.countPages(path);
   }
+  async countPagesBatch(paths: string[]) {
+    this.count("countPagesBatch");
+    return this.inner.countPagesBatch(paths);
+  }
   async maxPageIndex(path: string) {
     this.count("maxPageIndex");
     return this.inner.maxPageIndex(path);
@@ -228,6 +232,7 @@ describe("PreloadBackend", () => {
         async deleteMeta() {},
         async deleteMetas() {},
         async countPages() { return 0; },
+        async countPagesBatch(paths: string[]) { return paths.map(() => 0); },
         async deleteFiles() {},
         async maxPageIndex() { return -1; },
       };
@@ -282,6 +287,7 @@ describe("PreloadBackend", () => {
         async deleteMeta(p: string) { return inner.deleteMeta(p); },
         async deleteMetas(paths: string[]) { return inner.deleteMetas(paths); },
         async countPages(p: string) { return inner.countPages(p); },
+        async countPagesBatch(ps: string[]) { return inner.countPagesBatch(ps); },
         async deleteFiles(ps: string[]) { return inner.deleteFiles(ps); },
         async maxPageIndex(p: string) { return inner.maxPageIndex(p); },
       };
@@ -320,6 +326,7 @@ describe("PreloadBackend", () => {
         async deleteMeta() {},
         async deleteMetas() {},
         async countPages() { return 0; },
+        async countPagesBatch(paths: string[]) { return paths.map(() => 0); },
         async deleteFiles() {},
         async maxPageIndex() { return -1; },
       };
@@ -1167,6 +1174,7 @@ describe("PreloadBackend", () => {
       async deleteMeta(path: string) { return this.inner.deleteMeta(path); }
       async deleteMetas(paths: string[]) { return this.inner.deleteMetas(paths); }
       async countPages(path: string) { return this.inner.countPages(path); }
+      async countPagesBatch(paths: string[]) { return this.inner.countPagesBatch(paths); }
       async maxPageIndex(path: string) { return this.inner.maxPageIndex(path); }
       async listFiles() { return this.inner.listFiles(); }
     }

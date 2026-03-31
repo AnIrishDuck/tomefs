@@ -359,6 +359,16 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.COUNT_PAGES_BATCH: {
+        const paths = params.paths as string[];
+        const counts = await this.backend.countPagesBatch(paths);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          counts,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       case OpCode.LIST_FILES_RANGE: {
         const offset = params.offset as number;
         const limit = params.limit as number;

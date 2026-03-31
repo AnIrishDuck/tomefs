@@ -57,6 +57,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     deleteMetas: async (ps) => sync.deleteMetas(ps),
     listFiles: async () => sync.listFiles(),
     countPages: async (p) => sync.countPages(p),
+    countPagesBatch: async (ps) => sync.countPagesBatch(ps),
     maxPageIndex: async (p) => sync.maxPageIndex(p),
   };
 }
@@ -797,6 +798,55 @@ for (const factory of factories) {
 
         expect(await backend.countPages("/file1")).toBe(1);
         expect(await backend.countPages("/file10")).toBe(2);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // countPagesBatch
+    // ---------------------------------------------------------------
+
+    describe("countPagesBatch", () => {
+      it("returns empty array for empty input @fast", async () => {
+        expect(await backend.countPagesBatch([])).toEqual([]);
+      });
+
+      it("returns counts parallel to input paths @fast", async () => {
+        await backend.writePage("/a", 0, filledPage(0x01));
+        await backend.writePage("/b", 0, filledPage(0x02));
+        await backend.writePage("/b", 1, filledPage(0x03));
+        await backend.writePage("/c", 0, filledPage(0x04));
+        await backend.writePage("/c", 1, filledPage(0x05));
+        await backend.writePage("/c", 2, filledPage(0x06));
+
+        const counts = await backend.countPagesBatch(["/a", "/b", "/c"]);
+        expect(counts).toEqual([1, 2, 3]);
+      });
+
+      it("returns 0 for non-existent files in batch", async () => {
+        await backend.writePage("/exists", 0, filledPage(0x01));
+
+        const counts = await backend.countPagesBatch([
+          "/missing1",
+          "/exists",
+          "/missing2",
+        ]);
+        expect(counts).toEqual([0, 1, 0]);
+      });
+
+      it("handles single-element batch", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 1, filledPage(0x02));
+
+        const counts = await backend.countPagesBatch(["/f"]);
+        expect(counts).toEqual([2]);
+      });
+
+      it("handles sparse pages in batch", async () => {
+        await backend.writePage("/sparse", 0, filledPage(0x01));
+        await backend.writePage("/sparse", 5, filledPage(0x02));
+
+        const counts = await backend.countPagesBatch(["/sparse"]);
+        expect(counts).toEqual([2]);
       });
     });
 
