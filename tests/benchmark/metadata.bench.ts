@@ -457,3 +457,105 @@ describe("Mixed Metadata Workload (PGlite-like startup pattern)", async () => {
   bench("MEMFS", () => mixedMeta(memfs));
   bench("tomefs (4096 pages)", () => mixedMeta(tome4096));
 });
+
+// ---------------------------------------------------------------------------
+// RestoreTree: measure mount time (remount from backend) with varying file counts
+// ---------------------------------------------------------------------------
+
+describe("RestoreTree Mount (100 files, 3-level dirs)", async () => {
+  async function benchRemount(fileCount: number, dirDepth: number) {
+    const { default: createModule } = await import(
+      join(__dirname, "../harness/emscripten_fs.mjs")
+    );
+
+    // Phase 1: populate a backend with files via a temporary mount
+    const setupBackend = new SyncMemoryBackend();
+    const setupModule = await createModule();
+    const setupFS = setupModule.FS as EmscriptenFS;
+    const setupTomefs = createTomeFS(setupFS, { backend: setupBackend, maxPages: 4096 });
+    setupFS.mkdir(TOME_MOUNT);
+    setupFS.mount(setupTomefs, {}, TOME_MOUNT);
+
+    // Create nested directory structure with files
+    const dirs: string[] = ["/d"];
+    for (let d = 1; d < dirDepth; d++) {
+      dirs.push(dirs[d - 1] + `/sub${d}`);
+    }
+    for (const dir of dirs) {
+      setupFS.mkdir(TOME_MOUNT + dir);
+    }
+    for (let i = 0; i < fileCount; i++) {
+      const dir = dirs[i % dirs.length];
+      const fd = setupFS.open(
+        `${TOME_MOUNT}${dir}/f${i}`,
+        O.WRONLY | O.CREAT | O.TRUNC,
+        0o666,
+      );
+      setupFS.write(fd, PAGE_DATA, 0, Math.min(PAGE_SIZE, 512));
+      setupFS.close(fd);
+    }
+    // Sync to persist everything to backend
+    setupFS.syncfs(false, (err: Error | null) => { if (err) throw err; });
+
+    // Phase 2: benchmark remount — each iteration creates a fresh Emscripten
+    // module and mounts tomefs against the pre-populated backend
+    return async () => {
+      const m = await createModule();
+      const fs = m.FS as EmscriptenFS;
+      const tome = createTomeFS(fs, { backend: setupBackend, maxPages: 4096 });
+      fs.mkdir(TOME_MOUNT);
+      fs.mount(tome, {}, TOME_MOUNT);
+      // Verify restore worked by stat-ing a file
+      fs.stat(`${TOME_MOUNT}/d/f0`);
+    };
+  }
+
+  const remount100 = await benchRemount(100, 3);
+  bench("100 files, 3-level dirs", remount100);
+});
+
+describe("RestoreTree Mount (500 files, 5-level dirs)", async () => {
+  async function benchRemount(fileCount: number, dirDepth: number) {
+    const { default: createModule } = await import(
+      join(__dirname, "../harness/emscripten_fs.mjs")
+    );
+
+    const setupBackend = new SyncMemoryBackend();
+    const setupModule = await createModule();
+    const setupFS = setupModule.FS as EmscriptenFS;
+    const setupTomefs = createTomeFS(setupFS, { backend: setupBackend, maxPages: 4096 });
+    setupFS.mkdir(TOME_MOUNT);
+    setupFS.mount(setupTomefs, {}, TOME_MOUNT);
+
+    const dirs: string[] = ["/d"];
+    for (let d = 1; d < dirDepth; d++) {
+      dirs.push(dirs[d - 1] + `/sub${d}`);
+    }
+    for (const dir of dirs) {
+      setupFS.mkdir(TOME_MOUNT + dir);
+    }
+    for (let i = 0; i < fileCount; i++) {
+      const dir = dirs[i % dirs.length];
+      const fd = setupFS.open(
+        `${TOME_MOUNT}${dir}/f${i}`,
+        O.WRONLY | O.CREAT | O.TRUNC,
+        0o666,
+      );
+      setupFS.write(fd, PAGE_DATA, 0, Math.min(PAGE_SIZE, 512));
+      setupFS.close(fd);
+    }
+    setupFS.syncfs(false, (err: Error | null) => { if (err) throw err; });
+
+    return async () => {
+      const m = await createModule();
+      const fs = m.FS as EmscriptenFS;
+      const tome = createTomeFS(fs, { backend: setupBackend, maxPages: 4096 });
+      fs.mkdir(TOME_MOUNT);
+      fs.mount(tome, {}, TOME_MOUNT);
+      fs.stat(`${TOME_MOUNT}/d/f0`);
+    };
+  }
+
+  const remount500 = await benchRemount(500, 5);
+  bench("500 files, 5-level dirs", remount500);
+});
