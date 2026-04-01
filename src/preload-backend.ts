@@ -89,75 +89,85 @@ export class PreloadBackend implements SyncStorageBackend {
       }
     }
 
-    // Load all pages for every file in batches
-    for (const path of files) {
-      const m = this.meta.get(path);
-      if (!m) continue;
+    // Load pages for all files in parallel. Each file's page loading is
+    // independent, so we can overlap the I/O across files. For IDB/OPFS
+    // backends, this overlaps transaction/file-read latency; for memory
+    // backends it's equivalent to sequential (no real I/O).
+    await Promise.all(files.map((path) => this.loadFilePages(path)));
 
-      const pageCount = m.size > 0 ? Math.ceil(m.size / PAGE_SIZE) : 0;
+    this.initialized = true;
+  }
 
-      // Load pages accounted for by metadata
-      if (pageCount > 0) {
-        const indices = Array.from({ length: pageCount }, (_, i) => i);
-        const pages = await this.remote.readPages(path, indices);
-        for (let i = 0; i < pages.length; i++) {
-          if (pages[i]) {
-            const key = pageKeyStr(path, i);
-            this.pages.set(key, new Uint8Array(pages[i]!));
-            this.trackPage(path, key);
-          }
-        }
-      }
+  /**
+   * Load all pages for a single file from the remote backend.
+   * Called during init() — loads pages accounted for by metadata, then
+   * probes for crash-recovery pages beyond meta.size.
+   */
+  private async loadFilePages(path: string): Promise<void> {
+    const m = this.meta.get(path);
+    if (!m) return;
 
-      // Probe for pages beyond meta.size that may exist from a prior crash
-      // (pages written through the page cache but metadata not yet synced).
-      // Uses exponential probe + binary search (O(log n) reads) to find the
-      // true extent, then loads any discovered extra pages.
-      const nextPage = await this.remote.readPage(path, pageCount);
-      if (nextPage) {
-        const probeKey = pageKeyStr(path, pageCount);
-        this.pages.set(probeKey, new Uint8Array(nextPage));
-        this.trackPage(path, probeKey);
+    const pageCount = m.size > 0 ? Math.ceil(m.size / PAGE_SIZE) : 0;
 
-        // Exponential probe to find upper bound
-        let lo = pageCount;
-        let hi = pageCount + 1;
-        while (await this.remote.readPage(path, hi)) {
-          lo = hi;
-          hi = Math.min(hi * 2, MAX_PROBE_PAGE);
-          if (hi === lo) break; // hit cap — lo is the last known page
-        }
-
-        // Binary search between lo (exists) and hi (missing)
-        while (hi - lo > 1) {
-          const mid = (lo + hi) >>> 1;
-          if (await this.remote.readPage(path, mid)) {
-            lo = mid;
-          } else {
-            hi = mid;
-          }
-        }
-
-        // Load all extra pages in a batch (pageCount+1 through lo inclusive)
-        const extraStart = pageCount + 1;
-        if (lo >= extraStart) {
-          const extraIndices = Array.from(
-            { length: lo - extraStart + 1 },
-            (_, i) => extraStart + i,
-          );
-          const extraPages = await this.remote.readPages(path, extraIndices);
-          for (let i = 0; i < extraPages.length; i++) {
-            if (extraPages[i]) {
-              const extraKey = pageKeyStr(path, extraIndices[i]);
-              this.pages.set(extraKey, new Uint8Array(extraPages[i]!));
-              this.trackPage(path, extraKey);
-            }
-          }
+    // Load pages accounted for by metadata
+    if (pageCount > 0) {
+      const indices = Array.from({ length: pageCount }, (_, i) => i);
+      const pages = await this.remote.readPages(path, indices);
+      for (let i = 0; i < pages.length; i++) {
+        if (pages[i]) {
+          const key = pageKeyStr(path, i);
+          this.pages.set(key, new Uint8Array(pages[i]!));
+          this.trackPage(path, key);
         }
       }
     }
 
-    this.initialized = true;
+    // Probe for pages beyond meta.size that may exist from a prior crash
+    // (pages written through the page cache but metadata not yet synced).
+    // Uses exponential probe + binary search (O(log n) reads) to find the
+    // true extent, then loads any discovered extra pages.
+    const nextPage = await this.remote.readPage(path, pageCount);
+    if (nextPage) {
+      const probeKey = pageKeyStr(path, pageCount);
+      this.pages.set(probeKey, new Uint8Array(nextPage));
+      this.trackPage(path, probeKey);
+
+      // Exponential probe to find upper bound
+      let lo = pageCount;
+      let hi = pageCount + 1;
+      while (await this.remote.readPage(path, hi)) {
+        lo = hi;
+        hi = Math.min(hi * 2, MAX_PROBE_PAGE);
+        if (hi === lo) break; // hit cap — lo is the last known page
+      }
+
+      // Binary search between lo (exists) and hi (missing)
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >>> 1;
+        if (await this.remote.readPage(path, mid)) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+
+      // Load all extra pages in a batch (pageCount+1 through lo inclusive)
+      const extraStart = pageCount + 1;
+      if (lo >= extraStart) {
+        const extraIndices = Array.from(
+          { length: lo - extraStart + 1 },
+          (_, i) => extraStart + i,
+        );
+        const extraPages = await this.remote.readPages(path, extraIndices);
+        for (let i = 0; i < extraPages.length; i++) {
+          if (extraPages[i]) {
+            const extraKey = pageKeyStr(path, extraIndices[i]);
+            this.pages.set(extraKey, new Uint8Array(extraPages[i]!));
+            this.trackPage(path, extraKey);
+          }
+        }
+      }
+    }
   }
 
   /** Add a page key to the filePageKeys index. */
