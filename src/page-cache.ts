@@ -187,6 +187,21 @@ export class PageCache {
 
       if (missingIndices.length > 1) {
         batchLoadedRead = missingIndices.length;
+
+        // Protect already-cached pages of this file from eviction.
+        // Without this, batchEvict may evict our own pages if they happen
+        // to be at the LRU end, causing unnecessary backend round-trips.
+        if (this.cache.size >= this.maxPages) {
+          for (let p = firstPage; p <= lastPage; p++) {
+            const k = pageKeyStr(path, p);
+            const cached = this.cache.get(k);
+            if (cached) {
+              this.cache.delete(k);
+              this.cache.set(k, cached);
+            }
+          }
+        }
+
         // Batch-evict space before pre-loading
         await this.batchEvict(missingIndices.length);
 
@@ -309,6 +324,20 @@ export class PageCache {
       }
 
       if (totalMissing > 0) {
+        // Protect already-cached pages of this file from eviction.
+        // Same rationale as in read(): prevents batchEvict from evicting
+        // our own pages when they sit at the LRU end.
+        if (this.cache.size >= this.maxPages) {
+          for (let p = firstPage; p <= lastPage; p++) {
+            const k = pageKeyStr(path, p);
+            const cached = this.cache.get(k);
+            if (cached) {
+              this.cache.delete(k);
+              this.cache.set(k, cached);
+            }
+          }
+        }
+
         // Batch-evict space for all missing pages at once
         await this.batchEvict(totalMissing);
 
