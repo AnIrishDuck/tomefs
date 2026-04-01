@@ -667,12 +667,12 @@ describe("PageCache", () => {
         return origReadPages(path, indices);
       };
 
-      // Write spanning 3 pages
+      // Write spanning 3 pages (page-aligned, fully overwrites all pages)
       const buf = new Uint8Array(PAGE_SIZE * 3);
       buf.fill(0xff);
       await cache.write("/test", buf, 0, PAGE_SIZE * 3, 0, PAGE_SIZE * 3);
-      // Should batch-load 3 missing pages
-      expect(readPagesCalls).toBe(1);
+      // All 3 pages fully overwritten → no batch reads needed
+      expect(readPagesCalls).toBe(0);
     });
   });
 
@@ -968,9 +968,10 @@ describe("PageCache", () => {
       for (let i = 0; i < data.length; i++) data[i] = (i * 7) & 0xff;
       await cache.write("/file", data, 0, data.length, 0, PAGE_SIZE);
 
-      // Only page 0 should be read from backend (it exists).
-      // Pages 1-3 are beyond file extent → skip backend read.
-      expect(readPageCalls).toBe(1);
+      // Page 0 exists but is fully overwritten (page-aligned write covers
+      // entire page) → read skipped. Pages 1-3 beyond file extent → also
+      // no read.
+      expect(readPageCalls).toBe(0);
       expect(readPagesIndicesTotal).toBe(0);
 
       // Verify data integrity
@@ -1023,6 +1024,156 @@ describe("PageCache", () => {
       const buf = new Uint8Array(data.length);
       await cache.read("/new", buf, 0, data.length, 0, PAGE_SIZE * 3);
       expect(buf).toEqual(data);
+    });
+  });
+
+  describe("full-page overwrite skip", () => {
+    function createCountingBackend() {
+      const inner = new MemoryBackend();
+      let readPageCalls = 0;
+
+      return {
+        backend: inner,
+        get readPageCalls() { return readPageCalls; },
+        resetCounts() { readPageCalls = 0; },
+        wrap(): MemoryBackend {
+          const wrapped = Object.create(inner) as MemoryBackend;
+          wrapped.readPage = async (path: string, pageIndex: number) => {
+            readPageCalls++;
+            return inner.readPage(path, pageIndex);
+          };
+          wrapped.readPages = async (path: string, pageIndices: number[]) => {
+            readPageCalls += pageIndices.length;
+            return inner.readPages(path, pageIndices);
+          };
+          return wrapped;
+        },
+      };
+    }
+
+    it("@fast single-page full overwrite skips backend read", async () => {
+      const cb = createCountingBackend();
+      const wrapped = cb.wrap();
+      const cache = new PageCache(wrapped, 8);
+
+      // Write initial data
+      const initial = new Uint8Array(PAGE_SIZE);
+      initial.fill(0xaa);
+      await cache.write("/file", initial, 0, PAGE_SIZE, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/file");
+      cb.resetCounts();
+
+      // Full-page overwrite
+      const overwrite = new Uint8Array(PAGE_SIZE);
+      overwrite.fill(0xbb);
+      await cache.write("/file", overwrite, 0, PAGE_SIZE, 0, PAGE_SIZE);
+
+      expect(cb.readPageCalls).toBe(0);
+
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xbb);
+      expect(buf[PAGE_SIZE - 1]).toBe(0xbb);
+    });
+
+    it("partial write within existing page still reads from backend", async () => {
+      const cb = createCountingBackend();
+      const wrapped = cb.wrap();
+      const cache = new PageCache(wrapped, 8);
+
+      const initial = new Uint8Array(PAGE_SIZE);
+      initial.fill(0xaa);
+      await cache.write("/file", initial, 0, PAGE_SIZE, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/file");
+      cb.resetCounts();
+
+      const partial = new Uint8Array(100);
+      partial.fill(0xcc);
+      await cache.write("/file", partial, 0, 100, 0, PAGE_SIZE);
+
+      expect(cb.readPageCalls).toBe(1);
+
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xcc);
+      expect(buf[99]).toBe(0xcc);
+      expect(buf[100]).toBe(0xaa);
+    });
+
+    it("multi-page write skips reads for fully-overwritten middle pages", async () => {
+      const cb = createCountingBackend();
+      const wrapped = cb.wrap();
+      const cache = new PageCache(wrapped, 16);
+
+      const initial = new Uint8Array(PAGE_SIZE * 4);
+      initial.fill(0xaa);
+      await cache.write("/file", initial, 0, initial.length, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/file");
+      cb.resetCounts();
+
+      // Write spanning pages 0-3, offset 10 in page 0
+      // Page 0: partial — needs read
+      // Pages 1-2: fully overwritten — skip read
+      // Page 3: partial — needs read
+      const writeSize = PAGE_SIZE * 4 - 20;
+      const overwrite = new Uint8Array(writeSize);
+      overwrite.fill(0xdd);
+      await cache.write("/file", overwrite, 0, writeSize, 10, PAGE_SIZE * 4);
+
+      expect(cb.readPageCalls).toBe(2);
+    });
+
+    it("@fast page-aligned multi-page write skips all backend reads", async () => {
+      const cb = createCountingBackend();
+      const wrapped = cb.wrap();
+      const cache = new PageCache(wrapped, 16);
+
+      const initial = new Uint8Array(PAGE_SIZE * 3);
+      initial.fill(0xaa);
+      await cache.write("/file", initial, 0, initial.length, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/file");
+      cb.resetCounts();
+
+      const overwrite = new Uint8Array(PAGE_SIZE * 3);
+      overwrite.fill(0xee);
+      await cache.write("/file", overwrite, 0, overwrite.length, 0, PAGE_SIZE * 3);
+
+      expect(cb.readPageCalls).toBe(0);
+
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      await cache.read("/file", buf, 0, buf.length, 0, PAGE_SIZE * 3);
+      for (let i = 0; i < buf.length; i++) {
+        expect(buf[i]).toBe(0xee);
+      }
+    });
+
+    it("full-page overwrite data persists through flush and re-read", async () => {
+      const cb = createCountingBackend();
+      const wrapped = cb.wrap();
+      const cache = new PageCache(wrapped, 8);
+
+      const initial = new Uint8Array(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) initial[i] = i & 0xff;
+      await cache.write("/file", initial, 0, PAGE_SIZE, 0, 0);
+      await cache.flushAll();
+      await cache.evictFile("/file");
+
+      const overwrite = new Uint8Array(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) overwrite[i] = (i * 3) & 0xff;
+      await cache.write("/file", overwrite, 0, PAGE_SIZE, 0, PAGE_SIZE);
+
+      await cache.flushAll();
+      await cache.evictFile("/file");
+
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        expect(buf[i]).toBe((i * 3) & 0xff);
+      }
     });
   });
 });

@@ -174,7 +174,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // SAB bridge round-trip returning null.
         const firstNewPage = node.usedBytes > 0
           ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
-        page = firstPage < firstNewPage
+        // Skip backend read when the entire page will be overwritten —
+        // every byte is about to be replaced, so reading the old data
+        // is a wasted SAB bridge round-trip.
+        const needsRead = firstPage < firstNewPage
+          && !(pageOffset === 0 && length >= PAGE_SIZE);
+        page = needsRead
           ? pageCache.getPage(node.storagePath, firstPage)
           : pageCache.getPageNoRead(node.storagePath, firstPage);
         node._mruPage = page;

@@ -105,7 +105,7 @@ describe("tomefs single-page write: skip backend reads for new pages", () => {
     FS.close(readStream);
   });
 
-  it("@fast overwrite of existing page still reads from backend", async () => {
+  it("@fast full-page overwrite of existing page skips backend read", async () => {
     const cb = createCountingBackend();
     const { FS, tomefs } = await mountTome(cb, 64);
 
@@ -120,14 +120,40 @@ describe("tomefs single-page write: skip backend reads for new pages", () => {
     tomefs.pageCache.flushAll();
     tomefs.pageCache.evictFile("/existing");
 
-    // Now overwrite page 0 (which exists in backend)
+    // Now overwrite page 0 (which exists in backend) with a full-page write
     cb.resetCounts();
     const stream2 = FS.open(`${MOUNT}/existing`, O.WRONLY, 0o666);
     pageData.fill(0xbb);
     FS.write(stream2, pageData, 0, PAGE_SIZE);
     FS.close(stream2);
 
-    // Page 0 is within existing extent → backend read is required
+    // Full-page overwrite → read skipped (every byte is replaced)
+    expect(cb.readPageCalls).toBe(0);
+  });
+
+  it("@fast partial overwrite of existing page reads from backend", async () => {
+    const cb = createCountingBackend();
+    const { FS, tomefs } = await mountTome(cb, 64);
+
+    // Write a full page and flush to backend
+    const stream = FS.open(`${MOUNT}/partial`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    const pageData = new Uint8Array(PAGE_SIZE);
+    pageData.fill(0xaa);
+    FS.write(stream, pageData, 0, PAGE_SIZE);
+    FS.close(stream);
+
+    tomefs.pageCache.flushAll();
+    tomefs.pageCache.evictFile("/partial");
+
+    // Partial overwrite: only 100 bytes (need to preserve remaining data)
+    cb.resetCounts();
+    const stream2 = FS.open(`${MOUNT}/partial`, O.WRONLY, 0o666);
+    const partial = new Uint8Array(100);
+    partial.fill(0xcc);
+    FS.write(stream2, partial, 0, 100);
+    FS.close(stream2);
+
+    // Partial write → backend read IS required
     expect(cb.readPageCalls).toBe(1);
   });
 

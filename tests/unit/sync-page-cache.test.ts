@@ -893,10 +893,10 @@ describe("SyncPageCache", () => {
       cb.resetCounts();
       cache.write("/file", data, 0, data.length, 0, PAGE_SIZE);
 
-      // Only page 0 should be read from backend (it exists).
-      // Pages 1-3 are beyond file extent and should be skipped.
-      // The single existing miss goes through getPageInternal(readBackend=true).
-      expect(cb.readPageCalls).toBe(1);
+      // Page 0 exists but is fully overwritten (page-aligned write covers
+      // entire page) → read skipped. Pages 1-3 beyond file extent → also
+      // no read.
+      expect(cb.readPageCalls).toBe(0);
       expect(cb.readPagesCalls).toBe(0);
 
       // Verify data integrity
@@ -923,9 +923,10 @@ describe("SyncPageCache", () => {
       cb.resetCounts();
       cache.write("/file", data, 0, data.length, PAGE_SIZE, PAGE_SIZE * 3);
 
-      // Pages 1-2 exist in backend → batch read of 2 pages.
-      // Pages 3-5 are beyond file extent → no backend read.
-      expect(cb.readPagesIndicesTotal).toBe(2);
+      // Pages 1-2 exist in backend but are fully overwritten (page-aligned
+      // write covers entire pages) → reads skipped by full-page-overwrite
+      // optimization. Pages 3-5 are beyond file extent → also no read.
+      expect(cb.readPagesIndicesTotal).toBe(0);
 
       // Verify data integrity: page 0 still has original data
       const fullBuf = new Uint8Array(PAGE_SIZE * 6);
@@ -976,15 +977,16 @@ describe("SyncPageCache", () => {
       cache.flushAll();
       cache.evictFile("/file");
 
-      // Overwrite page 0 (within existing extent)
+      // Overwrite page 0 (full-page write within existing extent)
       const overwrite = new Uint8Array(PAGE_SIZE);
       overwrite.fill(0xff);
 
       cb.resetCounts();
       cache.write("/file", overwrite, 0, PAGE_SIZE, 0, PAGE_SIZE * 2);
 
-      // Page 0 exists in backend → should be read
-      expect(cb.readPageCalls).toBe(1);
+      // Page 0 exists in backend, but the write covers the entire page
+      // → read skipped by full-page-overwrite optimization
+      expect(cb.readPageCalls).toBe(0);
     });
 
     it("extending write preserves data integrity under cache pressure", () => {
@@ -1096,6 +1098,172 @@ describe("SyncPageCache", () => {
       expect(stored).not.toBeNull();
       expect(stored![0]).toBe(1);
       expect(stored![4]).toBe(5);
+    });
+  });
+
+  describe("full-page overwrite skip", () => {
+    /**
+     * Counting wrapper for verifying backend reads are skipped on
+     * full-page overwrites.
+     */
+    function createCountingBackend() {
+      const inner = new SyncMemoryBackend();
+      let readPageCalls = 0;
+
+      const counting: SyncMemoryBackend & {
+        readPageCalls: number;
+        resetCounts(): void;
+      } = Object.create(inner);
+
+      Object.defineProperty(counting, "readPageCalls", {
+        get: () => readPageCalls,
+      });
+      counting.resetCounts = () => { readPageCalls = 0; };
+      counting.readPage = (path: string, pageIndex: number) => {
+        readPageCalls++;
+        return inner.readPage(path, pageIndex);
+      };
+      counting.readPages = (path: string, pageIndices: number[]) => {
+        readPageCalls += pageIndices.length;
+        return inner.readPages(path, pageIndices);
+      };
+      return counting;
+    }
+
+    it("@fast single-page full overwrite skips backend read", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      // Write initial data to establish a page in the backend
+      const initial = new Uint8Array(PAGE_SIZE);
+      initial.fill(0xaa);
+      cache.write("/file", initial, 0, PAGE_SIZE, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+      cb.resetCounts();
+
+      // Full-page overwrite: position 0, length PAGE_SIZE
+      const overwrite = new Uint8Array(PAGE_SIZE);
+      overwrite.fill(0xbb);
+      cache.write("/file", overwrite, 0, PAGE_SIZE, 0, PAGE_SIZE);
+
+      // Should NOT have read from backend — entire page is overwritten
+      expect(cb.readPageCalls).toBe(0);
+
+      // Verify correct data
+      const buf = new Uint8Array(PAGE_SIZE);
+      cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xbb);
+      expect(buf[PAGE_SIZE - 1]).toBe(0xbb);
+    });
+
+    it("partial write within existing page still reads from backend", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      // Write initial data
+      const initial = new Uint8Array(PAGE_SIZE);
+      initial.fill(0xaa);
+      cache.write("/file", initial, 0, PAGE_SIZE, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+      cb.resetCounts();
+
+      // Partial write: only 100 bytes at offset 0
+      const partial = new Uint8Array(100);
+      partial.fill(0xcc);
+      cache.write("/file", partial, 0, 100, 0, PAGE_SIZE);
+
+      // SHOULD have read from backend — partial overwrite needs existing data
+      expect(cb.readPageCalls).toBe(1);
+
+      // Verify: first 100 bytes overwritten, rest preserved
+      const buf = new Uint8Array(PAGE_SIZE);
+      cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xcc);
+      expect(buf[99]).toBe(0xcc);
+      expect(buf[100]).toBe(0xaa);
+    });
+
+    it("multi-page write skips reads for fully-overwritten middle pages", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 16);
+
+      // Write 4 pages of initial data
+      const initial = new Uint8Array(PAGE_SIZE * 4);
+      initial.fill(0xaa);
+      cache.write("/file", initial, 0, initial.length, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+      cb.resetCounts();
+
+      // Write spanning pages 0-3, starting at offset 10 in page 0
+      // Page 0: partial (starts at offset 10) — needs read
+      // Pages 1-2: fully overwritten (middle pages) — skip read
+      // Page 3: partial (doesn't fill to end) — needs read
+      const writeSize = PAGE_SIZE * 4 - 20; // 10 bytes short on each end
+      const overwrite = new Uint8Array(writeSize);
+      overwrite.fill(0xdd);
+      cache.write("/file", overwrite, 0, writeSize, 10, PAGE_SIZE * 4);
+
+      // Only pages 0 and 3 should be read (partial overwrites)
+      expect(cb.readPageCalls).toBe(2);
+    });
+
+    it("@fast page-aligned multi-page write skips all backend reads", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 16);
+
+      // Write 3 pages of initial data
+      const initial = new Uint8Array(PAGE_SIZE * 3);
+      initial.fill(0xaa);
+      cache.write("/file", initial, 0, initial.length, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+      cb.resetCounts();
+
+      // Page-aligned overwrite of all 3 pages
+      const overwrite = new Uint8Array(PAGE_SIZE * 3);
+      overwrite.fill(0xee);
+      cache.write("/file", overwrite, 0, overwrite.length, 0, PAGE_SIZE * 3);
+
+      // No backend reads needed — all pages fully overwritten
+      expect(cb.readPageCalls).toBe(0);
+
+      // Verify data integrity
+      const buf = new Uint8Array(PAGE_SIZE * 3);
+      cache.read("/file", buf, 0, buf.length, 0, PAGE_SIZE * 3);
+      for (let i = 0; i < buf.length; i++) {
+        expect(buf[i]).toBe(0xee);
+      }
+    });
+
+    it("full-page overwrite data persists through flush and re-read", () => {
+      const cb = createCountingBackend();
+      const cache = new SyncPageCache(cb, 8);
+
+      // Establish a file with known data
+      const initial = new Uint8Array(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) initial[i] = i & 0xff;
+      cache.write("/file", initial, 0, PAGE_SIZE, 0, 0);
+      cache.flushAll();
+      cache.evictFile("/file");
+
+      // Full-page overwrite (skips read)
+      const overwrite = new Uint8Array(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) overwrite[i] = (i * 3) & 0xff;
+      cache.write("/file", overwrite, 0, PAGE_SIZE, 0, PAGE_SIZE);
+
+      // Flush and evict to force round-trip through backend
+      cache.flushAll();
+      cache.evictFile("/file");
+
+      // Re-read and verify
+      const buf = new Uint8Array(PAGE_SIZE);
+      cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        expect(buf[i]).toBe((i * 3) & 0xff);
+      }
     });
   });
 });
