@@ -347,6 +347,118 @@ describe("PreloadBackend", () => {
       await expect(backend.init()).rejects.toThrow("always fails");
       expect(callCount).toBe(2);
     });
+
+    it("@fast loads pages from many files in parallel", async () => {
+      // Seed remote with multiple files to exercise parallel page loading
+      const fileCount = 20;
+      for (let f = 0; f < fileCount; f++) {
+        const path = `/file${f}`;
+        const pageData = new Uint8Array(PAGE_SIZE);
+        pageData[0] = f;
+        pageData[1] = f + 100;
+        await remote.writePage(path, 0, pageData);
+        await remote.writeMeta(path, {
+          size: PAGE_SIZE,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      // Verify all files were loaded correctly
+      for (let f = 0; f < fileCount; f++) {
+        const read = backend.readPage(`/file${f}`, 0);
+        expect(read).not.toBeNull();
+        expect(read![0]).toBe(f);
+        expect(read![1]).toBe(f + 100);
+
+        const meta = backend.readMeta(`/file${f}`);
+        expect(meta).not.toBeNull();
+        expect(meta!.size).toBe(PAGE_SIZE);
+      }
+
+      expect(backend.listFiles()).toHaveLength(fileCount);
+    });
+
+    it("loads multi-page files from many files in parallel", async () => {
+      // Mix of file sizes: some single-page, some multi-page
+      const files = [
+        { path: "/small1", pages: 1 },
+        { path: "/big1", pages: 5 },
+        { path: "/small2", pages: 1 },
+        { path: "/big2", pages: 3 },
+        { path: "/tiny", pages: 1 },
+        { path: "/large", pages: 8 },
+      ];
+
+      for (const { path, pages } of files) {
+        for (let p = 0; p < pages; p++) {
+          const data = new Uint8Array(PAGE_SIZE);
+          data[0] = pages; // tag with page count
+          data[1] = p;     // tag with page index
+          await remote.writePage(path, p, data);
+        }
+        await remote.writeMeta(path, {
+          size: PAGE_SIZE * pages,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      // Verify each file has all its pages with correct data
+      for (const { path, pages } of files) {
+        for (let p = 0; p < pages; p++) {
+          const read = backend.readPage(path, p);
+          expect(read).not.toBeNull();
+          expect(read![0]).toBe(pages);
+          expect(read![1]).toBe(p);
+        }
+        expect(backend.readMeta(path)!.size).toBe(PAGE_SIZE * pages);
+      }
+    });
+
+    it("parallel init with concurrent readPages uses batch calls", async () => {
+      const inner = new MemoryBackend();
+      const counting = new CountingBackend(inner);
+
+      // Seed 10 files with 2 pages each
+      for (let f = 0; f < 10; f++) {
+        const path = `/f${f}`;
+        for (let p = 0; p < 2; p++) {
+          const data = new Uint8Array(PAGE_SIZE);
+          data[0] = f;
+          await inner.writePage(path, p, data);
+        }
+        await inner.writeMeta(path, {
+          size: PAGE_SIZE * 2,
+          mode: 0o100644,
+          ctime: 1000,
+          mtime: 1000,
+        });
+      }
+
+      const backend = new PreloadBackend(counting);
+      await backend.init();
+
+      // Should use readPages (batch) for each file, not individual readPage
+      // calls for each page. With 10 files, expect 10 readPages calls (one
+      // per file) plus 10 readPage calls (one probe per file).
+      expect(counting.calls["readPages"]).toBe(10);
+      expect(counting.calls["readPage"]).toBe(10); // one probe per file
+
+      // Verify data integrity
+      for (let f = 0; f < 10; f++) {
+        expect(backend.readPage(`/f${f}`, 0)![0]).toBe(f);
+        expect(backend.readPage(`/f${f}`, 1)![0]).toBe(f);
+      }
+    });
   });
 
   describe("sync operations after init", () => {
