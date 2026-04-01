@@ -114,7 +114,9 @@ export class SabClient implements SyncStorageBackend {
     const { json, binary } = this.call(OpCode.READ_PAGE, { path, pageIndex });
     const result = json as { found: boolean };
     if (!result.found) return null;
-    return new Uint8Array(binary);
+    // binary is already an owned copy (decodeMessage uses slice()),
+    // so no need to copy again.
+    return binary;
   }
 
   readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
@@ -162,7 +164,9 @@ export class SabClient implements SyncStorageBackend {
             `SAB bridge readPages: binary data underflow at offset ${offset} + size ${size} > ${binary.length}`,
           );
         }
-        pages.push(new Uint8Array(binary.slice(offset, offset + size)));
+        // binary.slice() already returns an owned Uint8Array copy,
+        // so no need to wrap in new Uint8Array().
+        pages.push(binary.slice(offset, offset + size));
         offset += size;
       }
     }

@@ -120,11 +120,13 @@ export class PageCache {
     const data = readBackend
       ? await this.backend.readPage(path, pageIndex)
       : null;
+    // Backend readPage() returns an owned buffer (fresh copy), so we can
+    // use it directly without copying. Only allocate a new page on miss.
     const page: CachedPage = {
       key,
       path,
       pageIndex,
-      data: data ? new Uint8Array(data) : new Uint8Array(PAGE_SIZE),
+      data: data ?? new Uint8Array(PAGE_SIZE),
       dirty: false,
       evicted: false,
     };
@@ -197,13 +199,12 @@ export class PageCache {
           const pageIndex = missingIndices[i];
           const key = pageKeyStr(path, pageIndex);
           if (this.cache.has(key)) continue; // may appear via eviction cascade
+          // Backend readPages() returns owned buffers, use directly.
           const page: CachedPage = {
             key,
             path,
             pageIndex,
-            data: results[i]
-              ? new Uint8Array(results[i]!)
-              : new Uint8Array(PAGE_SIZE),
+            data: results[i] ?? new Uint8Array(PAGE_SIZE),
             dirty: false,
             evicted: false,
           };
@@ -334,13 +335,12 @@ export class PageCache {
             const pageIndex = existingMissing[i];
             const key = pageKeyStr(path, pageIndex);
             if (this.cache.has(key)) continue;
+            // Backend readPages() returns owned buffers, use directly.
             const page: CachedPage = {
               key,
               path,
               pageIndex,
-              data: results[i]
-                ? new Uint8Array(results[i]!)
-                : new Uint8Array(PAGE_SIZE),
+              data: results[i] ?? new Uint8Array(PAGE_SIZE),
               dirty: false,
               evicted: false,
             };
