@@ -13,6 +13,8 @@ export const MAX_PROBE_PAGE = 1_048_576;
 
 /** A single cached page. */
 export interface CachedPage {
+  /** Cache key for this page (avoids redundant pageKeyStr on hot paths). */
+  key: string;
   /** File path this page belongs to. */
   path: string;
   /** Zero-based page index within the file. */
@@ -24,11 +26,11 @@ export interface CachedPage {
   /**
    * Set to true when this page is evicted from the cache.
    *
-   * Enables external code (e.g., tomefs node-level MRU) to hold references
-   * to CachedPage objects and detect when the reference is stale. After
-   * eviction, the page data reflects the last flushed state but may not
-   * match the current cache contents if the same page was later re-loaded
-   * and modified.
+   * Enables external code (e.g., tomefs per-node page table) to hold
+   * references to CachedPage objects and detect when the reference is
+   * stale. After eviction, the page data reflects the last flushed state
+   * but may not match the current cache contents if the same page was
+   * later re-loaded and modified.
    */
   evicted: boolean;
 }

@@ -1089,7 +1089,7 @@ describe("SyncPageCache", () => {
       const page = cache.getPageNoRead("/file", 0);
       page.data.set(new Uint8Array([1, 2, 3, 4, 5]));
       page.dirty = true;
-      cache.addDirtyKey("/file", 0);
+      cache.addDirtyKey(page.key);
 
       cache.flushAll();
 

@@ -103,11 +103,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   /**
    * Read bytes from a node's file data via the page cache.
    *
-   * Includes a node-level MRU optimization: each file node caches a
-   * reference to its most recently accessed page. For the common case of
-   * page-aligned sequential reads (Postgres 8 KB I/O), this avoids the
-   * string key construction and Map lookup in SyncPageCache on every call.
-   * The CachedPage.evicted flag ensures stale references are detected.
+   * Includes a per-node page table optimization: each file node maintains
+   * a sparse array of CachedPage references indexed by page number. For
+   * pages already in the table, this provides O(1) direct access — no
+   * string key construction, no Map lookup, no LRU reordering. The
+   * CachedPage.evicted flag ensures stale references are lazily detected
+   * and cleaned up.
    */
   function readPages(
     node: any,
@@ -121,14 +122,19 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const toRead = Math.min(length, size - position);
     if (toRead === 0) return 0;
 
-    // Single-page fast path with node-level MRU (avoids pageCache overhead)
+    // Single-page fast path with per-node page table (avoids pageCache overhead)
     const firstPage = (position / PAGE_SIZE) | 0;
     const pageOffset = position - firstPage * PAGE_SIZE;
     if (pageOffset + toRead <= PAGE_SIZE) {
-      let page = node._mruPage;
-      if (!page || page.evicted || page.pageIndex !== firstPage) {
+      let page = node._pages?.[firstPage];
+      if (page && page.evicted) {
+        node._pages[firstPage] = undefined;
+        page = undefined;
+      }
+      if (!page) {
         page = pageCache.getPage(node.storagePath, firstPage);
-        node._mruPage = page;
+        if (!node._pages) node._pages = [];
+        node._pages[firstPage] = page;
       }
       buffer.set(
         page.data.subarray(pageOffset, pageOffset + toRead),
@@ -151,8 +157,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   /**
    * Write bytes to a node's file data via the page cache.
    *
-   * Single-page writes use a node-level MRU shortcut to avoid redundant
-   * page cache lookups, while maintaining dirty tracking through the cache.
+   * Single-page writes use a per-node page table for O(1) page lookup,
+   * while maintaining dirty tracking through the cache's dirtyKeys index.
    */
   function writePages(
     node: any,
@@ -163,12 +169,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   ): number {
     if (length === 0) return 0;
 
-    // Single-page fast path with node-level MRU
+    // Single-page fast path with per-node page table
     const firstPage = (position / PAGE_SIZE) | 0;
     const pageOffset = position - firstPage * PAGE_SIZE;
     if (pageOffset + length <= PAGE_SIZE) {
-      let page = node._mruPage;
-      if (!page || page.evicted || page.pageIndex !== firstPage) {
+      let page = node._pages?.[firstPage];
+      if (page && page.evicted) {
+        node._pages[firstPage] = undefined;
+        page = undefined;
+      }
+      if (!page) {
         // Skip backend read for pages beyond the current file extent —
         // they don't exist in the backend, so readPage would be a wasted
         // SAB bridge round-trip returning null.
@@ -182,7 +192,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         page = needsRead
           ? pageCache.getPage(node.storagePath, firstPage)
           : pageCache.getPageNoRead(node.storagePath, firstPage);
-        node._mruPage = page;
+        if (!node._pages) node._pages = [];
+        node._pages[firstPage] = page;
       }
       page.data.set(
         buffer.subarray(offset, offset + length),
@@ -190,15 +201,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       );
       if (!page.dirty) {
         page.dirty = true;
-        pageCache.addDirtyKey(node.storagePath, firstPage);
+        pageCache.addDirtyKey(page.key);
       }
       node.usedBytes = Math.max(node.usedBytes, position + length);
       return length;
     }
 
-    // Multi-page writes: delegate to page cache (invalidate node MRU
-    // since the cache may evict and re-create pages during multi-page ops)
-    node._mruPage = null;
+    // Multi-page writes: delegate to page cache
     const result = pageCache.write(
       node.storagePath,
       buffer,
@@ -216,9 +225,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   function resizeFileStorage(node: any, newSize: number): void {
     if (node.usedBytes === newSize) return;
 
-    // Invalidate node-level MRU — truncation/extension may invalidate
+    // Reset per-node page table — truncation/extension may invalidate
     // or replace cached pages.
-    node._mruPage = null;
+    node._pages = undefined;
     const path = node.storagePath;
 
     if (newSize === 0) {
@@ -354,7 +363,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           });
           pageCache.renameFile(targetStoragePath, tempPath);
           new_node.storagePath = tempPath;
-          new_node._mruPage = null;
+          new_node._pages = undefined;
           new_node.unlinked = true;
         } else {
           pageCache.deleteFile(targetStoragePath);
@@ -379,7 +388,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const newStoragePath = computeStoragePath(new_dir, new_name);
       pageCache.renameFile(oldStoragePath, newStoragePath);
       old_node.storagePath = newStoragePath;
-      old_node._mruPage = null;
+      old_node._pages = undefined;
       // Move metadata to new path. Construct from node state (no backend
       // read needed) — the node tree is the source of truth. This also
       // provides crash safety for files not yet synced (metadata gets
@@ -469,7 +478,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         });
         pageCache.renameFile(originalPath, tempPath);
         node.storagePath = tempPath;
-        node._mruPage = null;
+        node._pages = undefined;
         backend.deleteMeta(originalPath);
       }
       // Only remove from tracking if no open fds — syncfs needs to
@@ -540,7 +549,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           const newPath = newBase + oldPath.substring(oldBase.length);
           pageCache.renameFile(oldPath, newPath);
           child.storagePath = newPath;
-          child._mruPage = null;
+          child._pages = undefined;
           metaWrites.push({
             path: newPath,
             meta: {
@@ -1141,10 +1150,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.usedBytes = 0;
         node.openCount = 0;
         node.unlinked = false;
-        // Node-level MRU: caches the most recently accessed CachedPage
-        // to avoid string key construction + Map lookup in the page cache
-        // for the common case of repeated access to the same page.
-        node._mruPage = null;
+        // Per-node page table: sparse array of CachedPage references
+        // indexed by page number. Provides O(1) direct page access,
+        // bypassing string key construction and Map lookup in the cache.
+        // Stale entries (evicted pages) are detected via CachedPage.evicted.
+        node._pages = undefined;
         // Assign a unique storage path for page cache keying
         node.storagePath = parent
           ? computeStoragePath(parent, name)

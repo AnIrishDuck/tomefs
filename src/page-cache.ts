@@ -121,6 +121,7 @@ export class PageCache {
       ? await this.backend.readPage(path, pageIndex)
       : null;
     const page: CachedPage = {
+      key,
       path,
       pageIndex,
       data: data ? new Uint8Array(data) : new Uint8Array(PAGE_SIZE),
@@ -197,6 +198,7 @@ export class PageCache {
           const key = pageKeyStr(path, pageIndex);
           if (this.cache.has(key)) continue; // may appear via eviction cascade
           const page: CachedPage = {
+            key,
             path,
             pageIndex,
             data: results[i]
@@ -285,7 +287,7 @@ export class PageCache {
       );
       if (!page.dirty) {
         page.dirty = true;
-        this.dirtyKeys.add(pageKeyStr(path, firstPage));
+        this.dirtyKeys.add(page.key);
       }
       const newFileSize = Math.max(currentFileSize, position + length);
       return { bytesWritten: length, newFileSize };
@@ -333,6 +335,7 @@ export class PageCache {
             const key = pageKeyStr(path, pageIndex);
             if (this.cache.has(key)) continue;
             const page: CachedPage = {
+              key,
               path,
               pageIndex,
               data: results[i]
@@ -381,7 +384,7 @@ export class PageCache {
       );
       if (!page.dirty) {
         page.dirty = true;
-        this.dirtyKeys.add(pageKeyStr(path, pageIndex));
+        this.dirtyKeys.add(page.key);
       }
 
       bytesWritten += bytesInPage;
@@ -530,9 +533,8 @@ export class PageCache {
     const page = await this.getPageInternal(path, lastPageIndex, true);
     page.data.fill(0, tailOffset);
     if (!page.dirty) {
-      const key = pageKeyStr(path, lastPageIndex);
       page.dirty = true;
-      this.dirtyKeys.add(key);
+      this.dirtyKeys.add(page.key);
     }
   }
 
@@ -601,6 +603,7 @@ export class PageCache {
     for (const page of toMove) {
       page.path = newPath;
       const newKey = pageKeyStr(newPath, page.pageIndex);
+      page.key = newKey;
       await this.ensureCapacity();
       this.cache.set(newKey, page);
       this.trackPage(newPath, newKey);
@@ -619,19 +622,19 @@ export class PageCache {
     const page = await this.getPage(path, pageIndex);
     if (!page.dirty) {
       page.dirty = true;
-      this.dirtyKeys.add(pageKeyStr(path, pageIndex));
+      this.dirtyKeys.add(page.key);
     }
   }
 
   /**
-   * Register a page as dirty by key alone (no page lookup).
+   * Register a page as dirty by its cache key (no page lookup or key construction).
    *
    * Used when the caller already holds a valid CachedPage reference and
    * has set page.dirty = true — this adds the key to the dirtyKeys index
-   * without the overhead of getPage().
+   * without the overhead of getPage() or pageKeyStr().
    */
-  addDirtyKey(path: string, pageIndex: number): void {
-    this.dirtyKeys.add(pageKeyStr(path, pageIndex));
+  addDirtyKey(key: string): void {
+    this.dirtyKeys.add(key);
   }
 
   /** Check if a specific page is in the cache. */
