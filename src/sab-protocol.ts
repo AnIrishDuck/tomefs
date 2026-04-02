@@ -78,10 +78,24 @@ export function encodeMessage(
   binaryChunks?: Uint8Array[],
 ): number {
   const jsonStr = JSON.stringify(json);
-  const jsonBytes = encoder.encode(jsonStr);
-  const jsonLen = jsonBytes.length;
 
-  // Calculate total size needed before writing anything
+  // Write JSON directly into the SAB data region using encodeInto(),
+  // skipping the intermediate Uint8Array allocation that encode() makes.
+  // Leave 4 bytes at the start for the JSON length prefix.
+  const jsonWriteStart = JSON_REGION_OFFSET + 4;
+  const jsonTarget = uint8View.subarray(jsonWriteStart);
+  const { read, written: jsonLen } = encoder.encodeInto(jsonStr, jsonTarget);
+
+  // If encodeInto couldn't write all characters, the buffer is too small
+  if (read !== jsonStr.length) {
+    const bufferSize = uint8View.byteLength;
+    throw new Error(
+      `SAB buffer overflow: JSON requires more than ${bufferSize - jsonWriteStart} bytes but buffer is ${bufferSize} bytes. ` +
+        `Increase buffer size or reduce batch size.`,
+    );
+  }
+
+  // Check total size including binary chunks
   let totalNeeded = JSON_REGION_OFFSET + 4 + jsonLen;
   if (binaryChunks) {
     for (const chunk of binaryChunks) {
@@ -99,8 +113,6 @@ export function encodeMessage(
 
   // Write JSON length prefix (4 bytes LE)
   dataView.setUint32(JSON_REGION_OFFSET, jsonLen, true);
-  // Write JSON bytes
-  uint8View.set(jsonBytes, JSON_REGION_OFFSET + 4);
 
   let offset = JSON_REGION_OFFSET + 4 + jsonLen;
 
@@ -143,7 +155,9 @@ export function decodeMessage(
     );
   }
 
-  const jsonBytes = uint8View.slice(
+  // Use subarray() instead of slice() — avoids copying the JSON bytes.
+  // The view is consumed immediately by TextDecoder and not retained.
+  const jsonBytes = uint8View.subarray(
     JSON_REGION_OFFSET + 4,
     JSON_REGION_OFFSET + 4 + jsonLen,
   );
