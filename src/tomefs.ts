@@ -201,7 +201,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       );
       if (!page.dirty) {
         page.dirty = true;
-        pageCache.addDirtyKey(page.key);
+        pageCache.addDirtyKey(page.key, node.storagePath);
       }
       node.usedBytes = Math.max(node.usedBytes, position + length);
       return length;

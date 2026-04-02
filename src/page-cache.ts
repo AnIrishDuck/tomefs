@@ -32,6 +32,17 @@ export class PageCache {
   /** Secondary index: set of cache keys for dirty pages. */
   private dirtyKeys = new Set<string>();
 
+  /** Secondary index: set of file paths that have at least one dirty page. */
+  private dirtyFiles = new Set<string>();
+
+  /**
+   * Pool of reusable PAGE_SIZE buffers. When pages are evicted or deleted,
+   * their Uint8Array buffers are returned here instead of being GC'd.
+   * New pages grab from the pool (with a zero-fill) instead of allocating.
+   */
+  private bufferPool: Uint8Array[] = [];
+  private static readonly MAX_POOL_SIZE = 128;
+
   /** Performance counters. */
   private _hits = 0;
   private _misses = 0;
@@ -120,11 +131,19 @@ export class PageCache {
     const data = readBackend
       ? await this.backend.readPage(path, pageIndex)
       : null;
+    let buf: Uint8Array;
+    if (data) {
+      buf = this.bufferPool.pop() ?? new Uint8Array(PAGE_SIZE);
+      buf.set(new Uint8Array(data));
+      if (data.byteLength < PAGE_SIZE) buf.fill(0, data.byteLength);
+    } else {
+      buf = this.acquireBuffer();
+    }
     const page: CachedPage = {
       key,
       path,
       pageIndex,
-      data: data ? new Uint8Array(data) : new Uint8Array(PAGE_SIZE),
+      data: buf,
       dirty: false,
       evicted: false,
     };
@@ -197,13 +216,19 @@ export class PageCache {
           const pageIndex = missingIndices[i];
           const key = pageKeyStr(path, pageIndex);
           if (this.cache.has(key)) continue; // may appear via eviction cascade
+          let buf: Uint8Array;
+          if (results[i]) {
+            buf = this.bufferPool.pop() ?? new Uint8Array(PAGE_SIZE);
+            buf.set(new Uint8Array(results[i]!));
+            if (results[i]!.byteLength < PAGE_SIZE) buf.fill(0, results[i]!.byteLength);
+          } else {
+            buf = this.acquireBuffer();
+          }
           const page: CachedPage = {
             key,
             path,
             pageIndex,
-            data: results[i]
-              ? new Uint8Array(results[i]!)
-              : new Uint8Array(PAGE_SIZE),
+            data: buf,
             dirty: false,
             evicted: false,
           };
@@ -288,6 +313,7 @@ export class PageCache {
       if (!page.dirty) {
         page.dirty = true;
         this.dirtyKeys.add(page.key);
+        this.dirtyFiles.add(path);
       }
       const newFileSize = Math.max(currentFileSize, position + length);
       return { bytesWritten: length, newFileSize };
@@ -334,13 +360,19 @@ export class PageCache {
             const pageIndex = existingMissing[i];
             const key = pageKeyStr(path, pageIndex);
             if (this.cache.has(key)) continue;
+            let buf: Uint8Array;
+            if (results[i]) {
+              buf = this.bufferPool.pop() ?? new Uint8Array(PAGE_SIZE);
+              buf.set(new Uint8Array(results[i]!));
+              if (results[i]!.byteLength < PAGE_SIZE) buf.fill(0, results[i]!.byteLength);
+            } else {
+              buf = this.acquireBuffer();
+            }
             const page: CachedPage = {
               key,
               path,
               pageIndex,
-              data: results[i]
-                ? new Uint8Array(results[i]!)
-                : new Uint8Array(PAGE_SIZE),
+              data: buf,
               dirty: false,
               evicted: false,
             };
@@ -385,6 +417,7 @@ export class PageCache {
       if (!page.dirty) {
         page.dirty = true;
         this.dirtyKeys.add(page.key);
+        this.dirtyFiles.add(path);
       }
 
       bytesWritten += bytesInPage;
@@ -407,6 +440,7 @@ export class PageCache {
    * O(pages-for-file) via filePages index instead of O(cache-size).
    */
   async flushFile(path: string): Promise<number> {
+    if (!this.dirtyFiles.has(path)) return 0;
     const keys = this.filePages.get(path);
     if (!keys || keys.size === 0) return 0;
 
@@ -438,6 +472,7 @@ export class PageCache {
       }
     }
 
+    this.dirtyFiles.delete(path);
     return dirtyPages.length;
   }
 
@@ -469,6 +504,7 @@ export class PageCache {
       this.cache.get(key)!.dirty = false;
     }
     this.dirtyKeys.clear();
+    this.dirtyFiles.clear();
 
     return dirtyPages.length;
   }
@@ -484,6 +520,7 @@ export class PageCache {
     for (const key of keys) {
       const page = this.cache.get(key)!;
       page.evicted = true;
+      this.releaseBuffer(page.data);
       this.cache.delete(key);
       if (page === this.mruPage) this.mruPage = null;
     }
@@ -503,6 +540,7 @@ export class PageCache {
       const page = this.cache.get(key)!;
       if (page.pageIndex >= fromPageIndex) {
         page.evicted = true;
+        this.releaseBuffer(page.data);
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
@@ -535,6 +573,7 @@ export class PageCache {
     if (!page.dirty) {
       page.dirty = true;
       this.dirtyKeys.add(page.key);
+      this.dirtyFiles.add(path);
     }
   }
 
@@ -549,12 +588,14 @@ export class PageCache {
       for (const key of keys) {
         const page = this.cache.get(key)!;
         page.evicted = true;
+        this.releaseBuffer(page.data);
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
       this.filePages.delete(path);
     }
+    this.dirtyFiles.delete(path);
     await this.backend.deleteFile(path);
   }
 
@@ -577,11 +618,13 @@ export class PageCache {
       for (const key of destKeys) {
         const page = this.cache.get(key)!;
         page.evicted = true;
+        this.releaseBuffer(page.data);
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
       this.filePages.delete(newPath);
+      this.dirtyFiles.delete(newPath);
     }
 
     // Re-key all pages in the backend
@@ -623,6 +666,7 @@ export class PageCache {
     if (!page.dirty) {
       page.dirty = true;
       this.dirtyKeys.add(page.key);
+      this.dirtyFiles.add(path);
     }
   }
 
@@ -633,8 +677,9 @@ export class PageCache {
    * has set page.dirty = true — this adds the key to the dirtyKeys index
    * without the overhead of getPage() or pageKeyStr().
    */
-  addDirtyKey(key: string): void {
+  addDirtyKey(key: string, path: string): void {
     this.dirtyKeys.add(key);
+    this.dirtyFiles.add(path);
   }
 
   /** Check if a specific page is in the cache. */
@@ -668,6 +713,23 @@ export class PageCache {
     this._misses = 0;
     this._evictions = 0;
     this._flushes = 0;
+  }
+
+  /** Acquire a zero-filled PAGE_SIZE buffer from the pool, or allocate a new one. */
+  private acquireBuffer(): Uint8Array {
+    const buf = this.bufferPool.pop();
+    if (buf) {
+      buf.fill(0);
+      return buf;
+    }
+    return new Uint8Array(PAGE_SIZE);
+  }
+
+  /** Return a PAGE_SIZE buffer to the pool for reuse. */
+  private releaseBuffer(buf: Uint8Array): void {
+    if (this.bufferPool.length < PageCache.MAX_POOL_SIZE) {
+      this.bufferPool.push(buf);
+    }
   }
 
   /**
@@ -712,6 +774,7 @@ export class PageCache {
     }
 
     victim.evicted = true;
+    this.releaseBuffer(victim.data);
     this._evictions++;
     this.cache.delete(firstKey);
     if (victim === this.mruPage) this.mruPage = null;
@@ -779,6 +842,7 @@ export class PageCache {
       const victim = victims[i];
 
       victim.evicted = true;
+      this.releaseBuffer(victim.data);
       this.cache.delete(key);
       if (victim === this.mruPage) this.mruPage = null;
 
