@@ -896,6 +896,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     }
     const fileEntries: FileEntry[] = [];
 
+    // Build a path-to-node map during restoration so parent lookups are O(1)
+    // instead of O(depth). Since paths are sorted by depth, parents are always
+    // created before children.
+    const nodeByPath = new Map<string, any>();
+    nodeByPath.set("/", root);
+
     for (let i = 0; i < livePaths.length; i++) {
       const path = livePaths[i];
       const meta = allMeta[i];
@@ -907,8 +913,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const name = path.substring(lastSlash + 1);
       if (!name) continue; // skip root
 
-      // Find parent node by walking from root
-      const parent = lookupByPath(root, parentPath);
+      // O(1) parent lookup via map instead of O(depth) tree walk
+      const parent = nodeByPath.get(parentPath);
       if (!parent) continue;
 
       const typeMode = meta.mode & S_IFMT;
@@ -922,6 +928,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // Parent was marked dirty by createNode's timestamp update, but
         // restoreTree processes parents before children (depth-sorted), so
         // parent._metaDirty will be cleared when its own entry is processed.
+        // Register directory in map so children can find it in O(1)
+        nodeByPath.set(path, node);
       } else if (typeMode === S_IFREG) {
         const storagePath = computeStoragePath(parent, name);
         fileEntries.push({ path, meta, parent, name, storagePath });
@@ -1011,18 +1019,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         clearMetaDirty(node.contents[name]);
       }
     }
-  }
-
-  /** Walk from root to find a node at the given internal path. */
-  function lookupByPath(root: any, path: string): any {
-    if (path === "/" || path === "") return root;
-    const parts = path.split("/").filter(Boolean);
-    let node = root;
-    for (const part of parts) {
-      if (!node.contents || !(part in node.contents)) return null;
-      node = node.contents[part];
-    }
-    return node;
   }
 
   // ---------------------------------------------------------------
