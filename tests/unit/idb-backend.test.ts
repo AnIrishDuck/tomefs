@@ -646,4 +646,62 @@ describe("IdbBackend", () => {
       }
     });
   });
+
+  describe("connection lifecycle", () => {
+    it("onversionchange closes connection to unblock deleteDatabase", async () => {
+      const dbName = `tomefs-versionchange-${dbCounter++}`;
+      const b = new IdbBackend({ dbName, dbVersion: 1 });
+
+      // Force open the connection
+      await b.writePage("/f", 0, filledPage(1));
+
+      // Another tab requests deleteDatabase. Without onversionchange,
+      // this would block indefinitely waiting for the connection to close.
+      const deletePromise = new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+        req.onblocked = () => reject(new Error("delete blocked"));
+      });
+
+      await deletePromise;
+
+      // The backend's cached connection was cleared by onversionchange.
+      // Next use lazily reconnects and recreates the DB from scratch.
+      await b.writePage("/f2", 0, filledPage(2));
+      const page = await b.readPage("/f2", 0);
+      expect(page).toEqual(filledPage(2));
+
+      // Original data is gone (DB was deleted and recreated)
+      expect(await b.readPage("/f", 0)).toBeNull();
+
+      await b.destroy();
+    });
+
+    it("reconnects after onversionchange clears cached connection", async () => {
+      const dbName = `tomefs-reconnect-${dbCounter++}`;
+      const b = new IdbBackend({ dbName, dbVersion: 1 });
+
+      // Write data and force connection open
+      await b.writeMeta("/a", { size: 100, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      // deleteDatabase triggers onversionchange, clearing the connection
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+
+      // After reconnect, a fresh DB is created — old data is gone
+      const meta = await b.readMeta("/a");
+      expect(meta).toBeNull();
+
+      // New writes work on the fresh DB
+      await b.writeMeta("/b", { size: 200, mode: 0o100644, ctime: 3, mtime: 4 });
+      const newMeta = await b.readMeta("/b");
+      expect(newMeta).toEqual({ size: 200, mode: 0o100644, ctime: 3, mtime: 4 });
+
+      await b.destroy();
+    });
+  });
 });
