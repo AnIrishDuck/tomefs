@@ -178,10 +178,38 @@ export class OpfsBackend implements StorageBackend {
       await this.writePage(pages[0].path, pages[0].pageIndex, pages[0].data);
       return;
     }
+
+    // Group pages by file path so each file's directory handle is resolved
+    // once rather than per-page. During flush, writePages receives dirty
+    // pages across many files — without grouping, getFileDir is called
+    // redundantly for every page in the same file.
+    const byPath = new Map<string, Array<{ pageIndex: number; data: Uint8Array }>>();
+    for (const { path, pageIndex, data } of pages) {
+      let group = byPath.get(path);
+      if (!group) {
+        group = [];
+        byPath.set(path, group);
+      }
+      group.push({ pageIndex, data });
+    }
+
     await Promise.all(
-      pages.map(({ path, pageIndex, data }) =>
-        this.writePage(path, pageIndex, data),
-      ),
+      [...byPath.entries()].map(async ([path, group]) => {
+        const fileDir = await this.getFileDir(path, true);
+        await Promise.all(
+          group.map(async ({ pageIndex, data }) => {
+            const handle = await fileDir!.getFileHandle(String(pageIndex), {
+              create: true,
+            });
+            const writable = await handle.createWritable();
+            try {
+              await writable.write(new Uint8Array(data));
+            } finally {
+              await writable.close();
+            }
+          }),
+        );
+      }),
     );
   }
 
