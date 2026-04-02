@@ -14,9 +14,11 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { MemoryBackend } from "../../src/memory-backend.js";
 import { IdbBackend } from "../../src/idb-backend.js";
+import { OpfsBackend } from "../../src/opfs-backend.js";
 import { PreloadBackend } from "../../src/preload-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
+import { createFakeOpfsRoot } from "../harness/fake-opfs.js";
 import "fake-indexeddb/auto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -309,6 +311,236 @@ describe("tomefs + PreloadBackend (no SAB)", () => {
         const content = readFile(FS2, `/data/p${i}.txt`);
         expect(content).toBe(`pressured-${i}`);
       }
+    });
+  });
+
+  describe("with OpfsBackend remote", () => {
+    it("@fast full OPFS roundtrip: write → flush → re-init → read", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      // Session 1: write data
+      const backend1 = new PreloadBackend(opfs);
+      await backend1.init();
+      const { FS: FS1 } = await mountTomeFS(backend1);
+
+      writeFile(FS1, "/data/opfs-test.txt", "persisted to OPFS");
+      FS1.mkdir("/data/opfs-dir");
+      writeFile(FS1, "/data/opfs-dir/inner.txt", "nested OPFS");
+
+      // Persist via syncfs + flush
+      await new Promise<void>((resolve, reject) => {
+        FS1.syncfs(false, (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      await backend1.flush();
+
+      // Session 2: fresh PreloadBackend on same OPFS root
+      const opfs2 = new OpfsBackend({ root: root as any });
+      const backend2 = new PreloadBackend(opfs2);
+      await backend2.init();
+      const { FS: FS2 } = await mountTomeFS(backend2);
+
+      const content = readFile(FS2, "/data/opfs-test.txt");
+      expect(content).toBe("persisted to OPFS");
+
+      const nested = readFile(FS2, "/data/opfs-dir/inner.txt");
+      expect(nested).toBe("nested OPFS");
+    });
+
+    it("OPFS roundtrip with multi-page file", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      const backend1 = new PreloadBackend(opfs);
+      await backend1.init();
+      const { FS: FS1 } = await mountTomeFS(backend1);
+
+      // Write a 3-page file
+      const totalSize = PAGE_SIZE * 3;
+      const data = new Uint8Array(totalSize);
+      for (let i = 0; i < totalSize; i++) data[i] = (i * 7) & 0xff;
+
+      const stream = FS1.open("/data/multi.dat", 64 | 1 | 512, 0o666);
+      FS1.write(stream, data, 0, totalSize, 0);
+      FS1.close(stream);
+
+      await new Promise<void>((resolve, reject) => {
+        FS1.syncfs(false, (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      await backend1.flush();
+
+      // Re-init from same OPFS root
+      const opfs2 = new OpfsBackend({ root: root as any });
+      const backend2 = new PreloadBackend(opfs2);
+      await backend2.init();
+      const { FS: FS2 } = await mountTomeFS(backend2);
+
+      const readStream = FS2.open("/data/multi.dat", 0, 0);
+      const buf = new Uint8Array(totalSize);
+      FS2.read(readStream, buf, 0, totalSize, 0);
+      FS2.close(readStream);
+
+      for (let i = 0; i < totalSize; i++) {
+        expect(buf[i]).toBe((i * 7) & 0xff);
+      }
+    });
+
+    it("OPFS roundtrip with cache pressure", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      const backend1 = new PreloadBackend(opfs);
+      await backend1.init();
+      const { FS: FS1 } = await mountTomeFS(backend1, 4); // tiny cache
+
+      // Write 10 files under tiny cache
+      for (let i = 0; i < 10; i++) {
+        writeFile(FS1, `/data/p${i}.txt`, `opfs-pressured-${i}`);
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        FS1.syncfs(false, (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      await backend1.flush();
+
+      // Re-init
+      const opfs2 = new OpfsBackend({ root: root as any });
+      const backend2 = new PreloadBackend(opfs2);
+      await backend2.init();
+      const { FS: FS2 } = await mountTomeFS(backend2, 4);
+
+      for (let i = 0; i < 10; i++) {
+        const content = readFile(FS2, `/data/p${i}.txt`);
+        expect(content).toBe(`opfs-pressured-${i}`);
+      }
+    });
+
+    it("OPFS roundtrip with rename and unlink", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      const backend1 = new PreloadBackend(opfs);
+      await backend1.init();
+      const { FS: FS1 } = await mountTomeFS(backend1);
+
+      // Create files, rename one, delete another
+      writeFile(FS1, "/data/original.txt", "will be renamed");
+      writeFile(FS1, "/data/doomed.txt", "will be deleted");
+      writeFile(FS1, "/data/survivor.txt", "stays put");
+      FS1.rename("/data/original.txt", "/data/renamed.txt");
+      FS1.unlink("/data/doomed.txt");
+
+      await new Promise<void>((resolve, reject) => {
+        FS1.syncfs(false, (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      await backend1.flush();
+
+      // Re-init and verify
+      const opfs2 = new OpfsBackend({ root: root as any });
+      const backend2 = new PreloadBackend(opfs2);
+      await backend2.init();
+      const { FS: FS2 } = await mountTomeFS(backend2);
+
+      const renamed = readFile(FS2, "/data/renamed.txt");
+      expect(renamed).toBe("will be renamed");
+
+      const survivor = readFile(FS2, "/data/survivor.txt");
+      expect(survivor).toBe("stays put");
+
+      // original and doomed should not exist
+      expect(() => FS2.stat("/data/original.txt")).toThrow();
+      expect(() => FS2.stat("/data/doomed.txt")).toThrow();
+    });
+
+    it("OPFS roundtrip with truncate", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      const backend1 = new PreloadBackend(opfs);
+      await backend1.init();
+      const { FS: FS1 } = await mountTomeFS(backend1);
+
+      // Write a multi-page file, then truncate to 1 page
+      const totalSize = PAGE_SIZE * 3;
+      const data = new Uint8Array(totalSize);
+      for (let i = 0; i < totalSize; i++) data[i] = (i * 11) & 0xff;
+
+      const stream = FS1.open("/data/trunc.dat", 64 | 1 | 512, 0o666);
+      FS1.write(stream, data, 0, totalSize, 0);
+      FS1.close(stream);
+
+      FS1.truncate("/data/trunc.dat", PAGE_SIZE);
+
+      await new Promise<void>((resolve, reject) => {
+        FS1.syncfs(false, (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      await backend1.flush();
+
+      // Re-init and verify truncated size
+      const opfs2 = new OpfsBackend({ root: root as any });
+      const backend2 = new PreloadBackend(opfs2);
+      await backend2.init();
+      const { FS: FS2 } = await mountTomeFS(backend2);
+
+      const stat = FS2.stat("/data/trunc.dat");
+      expect(stat.size).toBe(PAGE_SIZE);
+
+      // First page should have correct data
+      const readStream = FS2.open("/data/trunc.dat", 0, 0);
+      const buf = new Uint8Array(PAGE_SIZE);
+      FS2.read(readStream, buf, 0, PAGE_SIZE, 0);
+      FS2.close(readStream);
+
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        expect(buf[i]).toBe((i * 11) & 0xff);
+      }
+    });
+
+    it("OPFS roundtrip with symlinks", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      const backend1 = new PreloadBackend(opfs);
+      await backend1.init();
+      const { FS: FS1 } = await mountTomeFS(backend1);
+
+      writeFile(FS1, "/data/target.txt", "symlink target");
+      FS1.symlink("/data/target.txt", "/data/link.txt");
+
+      await new Promise<void>((resolve, reject) => {
+        FS1.syncfs(false, (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      await backend1.flush();
+
+      // Re-init and verify symlink survives
+      const opfs2 = new OpfsBackend({ root: root as any });
+      const backend2 = new PreloadBackend(opfs2);
+      await backend2.init();
+      const { FS: FS2 } = await mountTomeFS(backend2);
+
+      const linkTarget = FS2.readlink("/data/link.txt");
+      expect(linkTarget).toBe("/data/target.txt");
+
+      const content = readFile(FS2, "/data/target.txt");
+      expect(content).toBe("symlink target");
     });
   });
 });
