@@ -42,9 +42,6 @@ export interface TomeFSOptions {
   maxPages?: number;
 }
 
-/** Monotonically increasing path counter for unique file identifiers. */
-let nextPathId = 0;
-
 /**
  * Compute a unique storage path for a node by walking up to the mount root.
  */
@@ -71,6 +68,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   const backend = options?.backend ?? new SyncMemoryBackend();
   const maxPages = options?.maxPages ?? 4096;
   const pageCache = new SyncPageCache(backend, maxPages);
+
+  /** Per-mount path counter — avoids collisions across concurrent mounts. */
+  let nextPathId = 0;
 
   /**
    * Registry of all live tomefs file nodes.
