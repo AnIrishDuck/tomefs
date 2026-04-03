@@ -274,6 +274,22 @@ describe("SAB+Atomics Bridge", () => {
     });
   });
 
+  describe("maxPageIndexBatch", () => {
+    it("@fast returns empty array for empty input", async () => {
+      const result = await callClient(clientWorker, "maxPageIndexBatch", [[]]);
+      expect(result).toEqual([]);
+    });
+
+    it("returns max indices parallel to input paths", async () => {
+      await callClient(clientWorker, "writePage", ["/a", 0, new Uint8Array(PAGE_SIZE)]);
+      await callClient(clientWorker, "writePage", ["/b", 0, new Uint8Array(PAGE_SIZE)]);
+      await callClient(clientWorker, "writePage", ["/b", 5, new Uint8Array(PAGE_SIZE)]);
+
+      const result = await callClient(clientWorker, "maxPageIndexBatch", [["/a", "/b", "/missing"]]);
+      expect(result).toEqual([0, 5, -1]);
+    });
+  });
+
   describe("metadata operations", () => {
     it("@fast readMeta returns null for non-existent file", async () => {
       const result = await callClient(clientWorker, "readMeta", ["/test"]);

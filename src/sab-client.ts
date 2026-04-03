@@ -336,7 +336,7 @@ export class SabClient implements SyncStorageBackend {
     // Single chunk fast path
     if (paths.length <= this.maxBatchFiles) {
       const { json } = this.call(OpCode.MAX_PAGE_INDEX_BATCH, { paths });
-      return (json as { indices: number[] }).indices;
+      return (json as { maxIndices: number[] }).maxIndices;
     }
 
     // Multi-chunk: split paths to avoid SAB buffer overflow
@@ -344,7 +344,7 @@ export class SabClient implements SyncStorageBackend {
     for (let i = 0; i < paths.length; i += this.maxBatchFiles) {
       const chunk = paths.slice(i, i + this.maxBatchFiles);
       const { json } = this.call(OpCode.MAX_PAGE_INDEX_BATCH, { paths: chunk });
-      allIndices.push(...(json as { indices: number[] }).indices);
+      allIndices.push(...(json as { maxIndices: number[] }).maxIndices);
     }
     return allIndices;
   }

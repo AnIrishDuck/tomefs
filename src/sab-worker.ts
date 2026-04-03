@@ -371,9 +371,9 @@ export class SabWorker {
 
       case OpCode.MAX_PAGE_INDEX_BATCH: {
         const paths = params.paths as string[];
-        const indices = await this.backend.maxPageIndexBatch(paths);
+        const maxIndices = await this.backend.maxPageIndexBatch(paths);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
-          indices,
+          maxIndices,
         });
         Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
         break;
