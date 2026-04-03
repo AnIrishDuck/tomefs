@@ -117,6 +117,9 @@ class CrashAfterNOpsSyncBackend implements SyncStorageBackend {
   maxPageIndex(path: string): number {
     return this.inner.maxPageIndex(path);
   }
+  maxPageIndexBatch(paths: string[]): number[] {
+    return this.inner.maxPageIndexBatch(paths);
+  }
   listFiles(): string[] {
     return this.inner.listFiles();
   }

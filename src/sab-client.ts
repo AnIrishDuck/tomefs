@@ -330,6 +330,25 @@ export class SabClient implements SyncStorageBackend {
     return (json as { maxIdx: number }).maxIdx;
   }
 
+  maxPageIndexBatch(paths: string[]): number[] {
+    if (paths.length === 0) return [];
+
+    // Single chunk fast path
+    if (paths.length <= this.maxBatchFiles) {
+      const { json } = this.call(OpCode.MAX_PAGE_INDEX_BATCH, { paths });
+      return (json as { indices: number[] }).indices;
+    }
+
+    // Multi-chunk: split paths to avoid SAB buffer overflow
+    const allIndices: number[] = [];
+    for (let i = 0; i < paths.length; i += this.maxBatchFiles) {
+      const chunk = paths.slice(i, i + this.maxBatchFiles);
+      const { json } = this.call(OpCode.MAX_PAGE_INDEX_BATCH, { paths: chunk });
+      allIndices.push(...(json as { indices: number[] }).indices);
+    }
+    return allIndices;
+  }
+
   listFiles(): string[] {
     // Use paginated LIST_FILES_RANGE to prevent SAB buffer overflow when
     // the backend has many files (e.g., Postgres databases with thousands

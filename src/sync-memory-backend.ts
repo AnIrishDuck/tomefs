@@ -103,6 +103,10 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     return max;
   }
 
+  maxPageIndexBatch(paths: string[]): number[] {
+    return paths.map((path) => this.maxPageIndex(path));
+  }
+
   renameFile(oldPath: string, newPath: string): void {
     if (oldPath === newPath) return;
     // Clear destination pages first to avoid orphans when source has fewer

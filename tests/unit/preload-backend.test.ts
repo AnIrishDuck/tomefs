@@ -101,6 +101,10 @@ class CountingBackend implements StorageBackend {
     this.count("maxPageIndex");
     return this.inner.maxPageIndex(path);
   }
+  async maxPageIndexBatch(paths: string[]) {
+    this.count("maxPageIndexBatch");
+    return this.inner.maxPageIndexBatch(paths);
+  }
   async listFiles() {
     this.count("listFiles");
     return this.inner.listFiles();
@@ -235,6 +239,7 @@ describe("PreloadBackend", () => {
         async countPagesBatch(paths: string[]) { return paths.map(() => 0); },
         async deleteFiles() {},
         async maxPageIndex() { return -1; },
+        async maxPageIndexBatch(paths: string[]) { return paths.map(() => -1); },
       };
 
       const backend = new PreloadBackend(failOnce);
@@ -290,6 +295,7 @@ describe("PreloadBackend", () => {
         async countPagesBatch(ps: string[]) { return inner.countPagesBatch(ps); },
         async deleteFiles(ps: string[]) { return inner.deleteFiles(ps); },
         async maxPageIndex(p: string) { return inner.maxPageIndex(p); },
+        async maxPageIndexBatch(ps: string[]) { return inner.maxPageIndexBatch(ps); },
       };
 
       const backend = new PreloadBackend(failFirstReadMetas);
@@ -329,6 +335,7 @@ describe("PreloadBackend", () => {
         async countPagesBatch(paths: string[]) { return paths.map(() => 0); },
         async deleteFiles() {},
         async maxPageIndex() { return -1; },
+        async maxPageIndexBatch(paths: string[]) { return paths.map(() => -1); },
       };
 
       const backend = new PreloadBackend(alwaysFails);
@@ -1288,6 +1295,7 @@ describe("PreloadBackend", () => {
       async countPages(path: string) { return this.inner.countPages(path); }
       async countPagesBatch(paths: string[]) { return this.inner.countPagesBatch(paths); }
       async maxPageIndex(path: string) { return this.inner.maxPageIndex(path); }
+      async maxPageIndexBatch(paths: string[]) { return this.inner.maxPageIndexBatch(paths); }
       async listFiles() { return this.inner.listFiles(); }
     }
 

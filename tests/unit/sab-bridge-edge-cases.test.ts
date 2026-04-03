@@ -182,6 +182,11 @@ class FailingBackend implements StorageBackend {
     return this.inner.maxPageIndex(path);
   }
 
+  async maxPageIndexBatch(paths: string[]): Promise<number[]> {
+    this.maybeThrow("maxPageIndexBatch");
+    return this.inner.maxPageIndexBatch(paths);
+  }
+
   async listFiles(): Promise<string[]> {
     this.maybeThrow("listFiles");
     return this.inner.listFiles();
@@ -268,6 +273,10 @@ class SlowBackend implements StorageBackend {
 
   async maxPageIndex(path: string): Promise<number> {
     return this.inner.maxPageIndex(path);
+  }
+
+  async maxPageIndexBatch(paths: string[]): Promise<number[]> {
+    return this.inner.maxPageIndexBatch(paths);
   }
 
   async listFiles(): Promise<string[]> {

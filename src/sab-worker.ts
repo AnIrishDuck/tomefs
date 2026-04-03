@@ -369,6 +369,16 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.MAX_PAGE_INDEX_BATCH: {
+        const paths = params.paths as string[];
+        const indices = await this.backend.maxPageIndexBatch(paths);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          indices,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       case OpCode.LIST_FILES_RANGE: {
         const offset = params.offset as number;
         const limit = params.limit as number;

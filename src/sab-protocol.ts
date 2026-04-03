@@ -39,6 +39,7 @@ export const OpCode = {
   MAX_PAGE_INDEX: 17,
   LIST_FILES_RANGE: 18,
   COUNT_PAGES_BATCH: 19,
+  MAX_PAGE_INDEX_BATCH: 20,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];

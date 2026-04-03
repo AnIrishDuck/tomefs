@@ -67,6 +67,9 @@ export interface SyncStorageBackend {
   /** Return the highest page index stored for a file, or -1 if no pages exist. */
   maxPageIndex(path: string): number;
 
+  /** Return the highest page index for multiple files in a single batch. Returns an array parallel to paths. */
+  maxPageIndexBatch(paths: string[]): number[];
+
   /** List all paths that have metadata stored. */
   listFiles(): string[];
 }
