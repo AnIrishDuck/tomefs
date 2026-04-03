@@ -184,14 +184,19 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // SAB bridge round-trip returning null.
         const firstNewPage = node.usedBytes > 0
           ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
-        // Skip backend read when the entire page will be overwritten —
-        // every byte is about to be replaced, so reading the old data
-        // is a wasted SAB bridge round-trip.
-        const needsRead = firstPage < firstNewPage
-          && !(pageOffset === 0 && length >= PAGE_SIZE);
-        page = needsRead
-          ? pageCache.getPage(node.storagePath, firstPage)
-          : pageCache.getPageNoRead(node.storagePath, firstPage);
+        const isFullPageOverwrite = pageOffset === 0 && length >= PAGE_SIZE;
+        if (firstPage < firstNewPage && !isFullPageOverwrite) {
+          // Partial write to existing page: read current data from backend
+          page = pageCache.getPage(node.storagePath, firstPage);
+        } else if (isFullPageOverwrite) {
+          // Full-page overwrite: skip both backend read AND zero-fill —
+          // the caller will set all PAGE_SIZE bytes, so allocating a
+          // zero-filled buffer is wasted work (saves ~8KB memset per page).
+          page = pageCache.getPageForOverwrite(node.storagePath, firstPage);
+        } else {
+          // New page with partial write: need zero-filled buffer
+          page = pageCache.getPageNoRead(node.storagePath, firstPage);
+        }
         if (!node._pages) node._pages = [];
         node._pages[firstPage] = page;
       }

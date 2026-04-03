@@ -37,6 +37,12 @@ export class SyncPageCache {
   /** Secondary index: set of cache keys for dirty pages. */
   private dirtyKeys = new Set<string>();
 
+  /** Pool of reusable page buffers to avoid allocation + GC pressure.
+   *  Evicted pages donate their buffers here; new pages take from here
+   *  instead of calling `new Uint8Array(PAGE_SIZE)` (which both allocates
+   *  and zero-fills).  Capped at maxPages to bound memory. */
+  private freeBuffers: Uint8Array[] = [];
+
   /** Performance counters. */
   private _hits = 0;
   private _misses = 0;
@@ -122,14 +128,24 @@ export class SyncPageCache {
 
     this._misses++;
     // Cache miss — load from backend (or create zero-filled if beyond file extent)
-    const data = readBackend
-      ? this.backend.readPage(path, pageIndex)
-      : null;
+    let pageData: Uint8Array;
+    if (readBackend) {
+      const backendData = this.backend.readPage(path, pageIndex);
+      if (backendData) {
+        // Reuse a pooled buffer and copy backend data into it
+        pageData = this.allocBufferRaw();
+        pageData.set(backendData);
+      } else {
+        pageData = this.allocBuffer();
+      }
+    } else {
+      pageData = this.allocBuffer();
+    }
     const page: CachedPage = {
       key,
       path,
       pageIndex,
-      data: data ? new Uint8Array(data) : new Uint8Array(PAGE_SIZE),
+      data: pageData,
       dirty: false,
       evicted: false,
     };
@@ -198,13 +214,18 @@ export class SyncPageCache {
         const pi = missingIndices[i];
         const pkey = pageKeyStr(path, pi);
         if (this.cache.has(pkey)) continue; // may appear via eviction cascade
+        let pageData: Uint8Array;
+        if (results[i]) {
+          pageData = this.allocBufferRaw();
+          pageData.set(results[i]!);
+        } else {
+          pageData = this.allocBuffer();
+        }
         const page: CachedPage = {
           key: pkey,
           path,
           pageIndex: pi,
-          data: results[i]
-            ? new Uint8Array(results[i]!)
-            : new Uint8Array(PAGE_SIZE),
+          data: pageData,
           dirty: false,
           evicted: false,
         };
@@ -331,13 +352,18 @@ export class SyncPageCache {
           const pi = existingMissing[i];
           const pkey = pageKeyStr(path, pi);
           if (this.cache.has(pkey)) continue;
+          let pageData: Uint8Array;
+          if (results[i]) {
+            pageData = this.allocBufferRaw();
+            pageData.set(results[i]!);
+          } else {
+            pageData = this.allocBuffer();
+          }
           const page: CachedPage = {
             key: pkey,
             path,
             pageIndex: pi,
-            data: results[i]
-              ? new Uint8Array(results[i]!)
-              : new Uint8Array(PAGE_SIZE),
+            data: pageData,
             dirty: false,
             evicted: false,
           };
@@ -364,9 +390,10 @@ export class SyncPageCache {
       // Skip backend read for fully-overwritten pages (po === 0 means
       // write starts at page boundary; bytesInPage === PAGE_SIZE means
       // the entire page is covered).
-      const needsRead =
-        pi < firstNewPage && !(po === 0 && bytesInPage === PAGE_SIZE);
-      const page = this.getPageInternal(path, pi, needsRead);
+      const isFullOverwrite = po === 0 && bytesInPage === PAGE_SIZE;
+      const page = isFullOverwrite
+        ? this.getPageForOverwrite(path, pi)
+        : this.getPageInternal(path, pi, pi < firstNewPage);
       page.data.set(
         buffer.subarray(
           offset + bytesWritten,
@@ -475,6 +502,7 @@ export class SyncPageCache {
     if (!keys) return;
     for (const key of keys) {
       const page = this.cache.get(key)!;
+      this.recycleBuffer(page.data);
       page.evicted = true;
       this.cache.delete(key);
       if (page === this.mruPage) this.mruPage = null;
@@ -494,6 +522,7 @@ export class SyncPageCache {
     for (const key of keys) {
       const page = this.cache.get(key)!;
       if (page.pageIndex >= fromPageIndex) {
+        this.recycleBuffer(page.data);
         page.evicted = true;
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
@@ -540,6 +569,7 @@ export class SyncPageCache {
     if (keys) {
       for (const key of keys) {
         const page = this.cache.get(key)!;
+        this.recycleBuffer(page.data);
         page.evicted = true;
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
@@ -570,6 +600,7 @@ export class SyncPageCache {
     if (destKeys) {
       for (const key of destKeys) {
         const page = this.cache.get(key)!;
+        this.recycleBuffer(page.data);
         page.evicted = true;
         this.cache.delete(key);
         if (page === this.mruPage) this.mruPage = null;
@@ -633,6 +664,53 @@ export class SyncPageCache {
     this.dirtyKeys.add(key);
   }
 
+  /**
+   * Get a page for a full-page overwrite (cache miss creates an uninitialized
+   * buffer). On cache hit, returns the existing page. On cache miss, allocates
+   * a buffer without zero-filling — the caller MUST write all PAGE_SIZE bytes.
+   *
+   * This avoids the wasted zero-fill + overwrite that getPageNoRead incurs
+   * when the caller is about to replace every byte anyway. For the sequential
+   * write benchmark (64 full-page writes to a new file), this eliminates
+   * 512 KB of unnecessary zero-fills per iteration.
+   */
+  getPageForOverwrite(path: string, pageIndex: number): CachedPage {
+    // Fast path: exact same page as last access
+    const mru = this.mruPage;
+    if (mru !== null && mru.path === path && mru.pageIndex === pageIndex) {
+      this._hits++;
+      return mru;
+    }
+
+    const key = pageKeyStr(path, pageIndex);
+    const existing = this.cache.get(key);
+    if (existing) {
+      this._hits++;
+      if (this.cache.size >= this.maxPages) {
+        this.cache.delete(key);
+        this.cache.set(key, existing);
+      }
+      this.mruPage = existing;
+      return existing;
+    }
+
+    this._misses++;
+    const page: CachedPage = {
+      key,
+      path,
+      pageIndex,
+      data: this.allocBufferRaw(),
+      dirty: false,
+      evicted: false,
+    };
+
+    this.ensureCapacity();
+    this.cache.set(key, page);
+    this.mruPage = page;
+    this.trackPage(path, key);
+    return page;
+  }
+
   /** Check if a specific page is in the cache. */
   has(path: string, pageIndex: number): boolean {
     return this.cache.has(pageKeyStr(path, pageIndex));
@@ -664,6 +742,44 @@ export class SyncPageCache {
     this._misses = 0;
     this._evictions = 0;
     this._flushes = 0;
+  }
+
+  // ---------------------------------------------------------------
+  // Buffer pool: recycle Uint8Array buffers to avoid allocation + GC
+  // ---------------------------------------------------------------
+
+  /**
+   * Allocate a zero-filled page buffer. Reuses a pooled buffer (+ memset)
+   * when available, otherwise allocates fresh. Pooled reuse avoids the
+   * malloc overhead; `new Uint8Array(PAGE_SIZE)` still needs both malloc
+   * and zero-fill.
+   */
+  private allocBuffer(): Uint8Array {
+    const buf = this.freeBuffers.pop();
+    if (buf) {
+      buf.fill(0);
+      return buf;
+    }
+    return new Uint8Array(PAGE_SIZE);
+  }
+
+  /**
+   * Allocate a page buffer WITHOUT zero-filling. Only safe when the caller
+   * will immediately overwrite all PAGE_SIZE bytes (full-page overwrites).
+   * Reuses a pooled buffer when available, otherwise allocates fresh.
+   */
+  private allocBufferRaw(): Uint8Array {
+    return this.freeBuffers.pop() || new Uint8Array(PAGE_SIZE);
+  }
+
+  /**
+   * Return a page buffer to the pool for reuse. Capped at maxPages to
+   * bound pool memory.
+   */
+  private recycleBuffer(buf: Uint8Array): void {
+    if (this.freeBuffers.length < this.maxPages) {
+      this.freeBuffers.push(buf);
+    }
   }
 
   /**
@@ -703,6 +819,7 @@ export class SyncPageCache {
       this._flushes++;
     }
 
+    this.recycleBuffer(victim.data);
     victim.evicted = true;
     this._evictions++;
     this.cache.delete(firstKey);
@@ -772,6 +889,7 @@ export class SyncPageCache {
       const key = victimKeys[i];
       const victim = victims[i];
 
+      this.recycleBuffer(victim.data);
       victim.evicted = true;
       this.cache.delete(key);
       if (victim === this.mruPage) this.mruPage = null;
