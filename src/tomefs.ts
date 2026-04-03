@@ -976,8 +976,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           const lastPageIndex = pagesFromMeta - 1;
           const lastPage = backend.readPage(storagePath, lastPageIndex);
           if (lastPage !== null) {
-            // Last page exists — sparse file with gaps, trust metadata
-            fileSize = meta.size;
+            // Last page exists — sparse file with gaps. Check if pages
+            // extend beyond the expected range (file extended after last
+            // metadata sync, then crashed before syncfs). Without this,
+            // extension pages are silently lost.
+            const highIdx = backend.maxPageIndex(storagePath);
+            if (highIdx > lastPageIndex) {
+              // Pages beyond expected range — file was extended after sync
+              fileSize = (highIdx + 1) * PAGE_SIZE;
+            } else {
+              // No extension — trust metadata for sub-page precision
+              fileSize = meta.size;
+            }
           } else {
             // Last page missing — crash recovery. Use maxPageIndex to
             // find the true highest page index rather than assuming
