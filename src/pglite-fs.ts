@@ -92,12 +92,20 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
   // Override syncToFs to flush tomefs
   adapter.syncToFs = async (_relaxedDurability?: boolean) => {
     if (!moduleFS) return;
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       moduleFS.syncfs(false, (err: Error | null) => {
         if (err) reject(err);
         else resolve();
       });
     });
+    // If the backend supports async flushing (e.g., PreloadBackend wrapping
+    // an async remote like IDB), flush dirty data to the underlying storage.
+    // Without this, syncToFs only persists to the backend's in-memory store,
+    // requiring users to manually call backend.flush() — error-prone and
+    // inconsistent with the "syncToFs = data is durable" contract.
+    if (typeof (backend as any).flush === "function") {
+      await (backend as any).flush();
+    }
   };
 
   // Override closeFs to persist all state before shutdown.
@@ -112,6 +120,10 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
           else resolve();
         });
       });
+      // Flush to remote storage (same rationale as syncToFs above).
+      if (typeof (backend as any).flush === "function") {
+        await (backend as any).flush();
+      }
     }
     return originalCloseFs();
   };

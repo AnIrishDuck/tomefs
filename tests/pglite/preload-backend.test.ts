@@ -5,10 +5,10 @@
  * PreloadBackend (no SharedArrayBuffer required). This is the production
  * deployment path for environments without COOP/COEP headers (ethos §10).
  *
- * Unlike the SyncMemoryBackend tests, PreloadBackend has two-phase
- * persistence: syncToFs flushes dirty pages to PreloadBackend's in-memory
- * store, then flush() persists to the async remote (MemoryBackend/IDB).
- * These tests verify the complete round-trip at the SQL level.
+ * The PGlite adapter auto-flushes PreloadBackend during syncToFs and
+ * closeFs, so users don't need to manually call backend.flush(). These
+ * tests verify the complete round-trip at the SQL level, including
+ * auto-flush behavior and persistence through close/remount cycles.
  */
 
 import { describe, it, expect, afterEach } from "vitest";
@@ -118,11 +118,85 @@ describe("PGlite + PreloadBackend (no SAB) @fast", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Auto-flush: syncToFs automatically flushes PreloadBackend to remote
+// ---------------------------------------------------------------------------
+
+describe("PGlite + PreloadBackend auto-flush (ethos §10)", () => {
+  it("syncToFs auto-flushes to remote — no manual flush needed", async () => {
+    const remote = new MemoryBackend();
+
+    // Session 1: create data, only call syncToFs (no manual flush)
+    const h1 = await createPreloadHarness(remote);
+    await h1.pg.query(
+      `CREATE TABLE notes (id SERIAL PRIMARY KEY, title TEXT)`,
+    );
+    await h1.pg.query(
+      `INSERT INTO notes (title) VALUES ('first'), ('second'), ('third')`,
+    );
+    await h1.syncToFs(); // auto-flushes to remote
+    await h1.destroy();
+
+    // Session 2: verify data reached the remote
+    const h2 = await createPreloadHarness(remote);
+    const result = await h2.pg.query(`SELECT title FROM notes ORDER BY id`);
+    expect(result.rows).toEqual([
+      { title: "first" },
+      { title: "second" },
+      { title: "third" },
+    ]);
+  });
+
+  it("close auto-flushes to remote — data survives without explicit sync", async () => {
+    const remote = new MemoryBackend();
+
+    // Session 1: create data, just close (no syncToFs or flush)
+    const h1 = await createPreloadHarness(remote);
+    await h1.pg.query(
+      `CREATE TABLE items (id SERIAL PRIMARY KEY, name TEXT)`,
+    );
+    await h1.pg.query(`INSERT INTO items (name) VALUES ('widget')`);
+    await h1.destroy(); // closeFs calls syncfs + auto-flush
+
+    // Session 2: verify data survived
+    const h2 = await createPreloadHarness(remote);
+    const result = await h2.pg.query(`SELECT name FROM items`);
+    expect(result.rows).toEqual([{ name: "widget" }]);
+  });
+
+  it("multiple sync cycles without manual flush", async () => {
+    const remote = new MemoryBackend();
+
+    // Cycle 1
+    const h1 = await createPreloadHarness(remote);
+    await h1.pg.query(`CREATE TABLE log (id SERIAL PRIMARY KEY, msg TEXT)`);
+    await h1.pg.query(`INSERT INTO log (msg) VALUES ('one')`);
+    await h1.syncToFs();
+    await h1.destroy();
+
+    // Cycle 2
+    const h2 = await createPreloadHarness(remote);
+    await h2.pg.query(`INSERT INTO log (msg) VALUES ('two')`);
+    await h2.syncToFs();
+    await h2.destroy();
+
+    // Cycle 3: verify all
+    const h3 = await createPreloadHarness(remote);
+    const result = await h3.pg.query(`SELECT msg FROM log ORDER BY id`);
+    expect(result.rows).toEqual([{ msg: "one" }, { msg: "two" }]);
+
+    // Sequence continues
+    await h3.pg.query(`INSERT INTO log (msg) VALUES ('three')`);
+    const all = await h3.pg.query(`SELECT msg FROM log ORDER BY id`);
+    expect(all.rows.map((r: any) => r.msg)).toEqual(["one", "two", "three"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Persistence round-trip through PreloadBackend + MemoryBackend
 // ---------------------------------------------------------------------------
 
 describe("PGlite + PreloadBackend persistence (MemoryBackend remote)", () => {
-  it("data survives syncToFs + flush + remount", async () => {
+  it("data survives syncToFs + remount", async () => {
     const remote = new MemoryBackend();
 
     // Session 1: create data
@@ -134,7 +208,6 @@ describe("PGlite + PreloadBackend persistence (MemoryBackend remote)", () => {
       `INSERT INTO notes (title) VALUES ('first'), ('second'), ('third')`,
     );
     await h1.syncToFs();
-    await h1.flush();
     await h1.destroy();
 
     // Session 2: verify data survived
@@ -165,7 +238,6 @@ describe("PGlite + PreloadBackend persistence (MemoryBackend remote)", () => {
         ('b@test.com', 'Bob')
     `);
     await h1.syncToFs();
-    await h1.flush();
     await h1.destroy();
 
     const h2 = await createPreloadHarness(remote);
@@ -185,35 +257,6 @@ describe("PGlite + PreloadBackend persistence (MemoryBackend remote)", () => {
     ).rejects.toThrow();
   });
 
-  it("multiple sync cycles through PreloadBackend", async () => {
-    const remote = new MemoryBackend();
-
-    // Cycle 1
-    const h1 = await createPreloadHarness(remote);
-    await h1.pg.query(`CREATE TABLE log (id SERIAL PRIMARY KEY, msg TEXT)`);
-    await h1.pg.query(`INSERT INTO log (msg) VALUES ('one')`);
-    await h1.syncToFs();
-    await h1.flush();
-    await h1.destroy();
-
-    // Cycle 2
-    const h2 = await createPreloadHarness(remote);
-    await h2.pg.query(`INSERT INTO log (msg) VALUES ('two')`);
-    await h2.syncToFs();
-    await h2.flush();
-    await h2.destroy();
-
-    // Cycle 3: verify all
-    const h3 = await createPreloadHarness(remote);
-    const result = await h3.pg.query(`SELECT msg FROM log ORDER BY id`);
-    expect(result.rows).toEqual([{ msg: "one" }, { msg: "two" }]);
-
-    // Sequence continues (IDs increase but may not be consecutive across remounts)
-    await h3.pg.query(`INSERT INTO log (msg) VALUES ('three')`);
-    const all = await h3.pg.query(`SELECT msg FROM log ORDER BY id`);
-    expect(all.rows.map((r: any) => r.msg)).toEqual(["one", "two", "three"]);
-  });
-
   it("JSONB and TOAST data persists through PreloadBackend", async () => {
     const remote = new MemoryBackend();
 
@@ -231,7 +274,6 @@ describe("PGlite + PreloadBackend persistence (MemoryBackend remote)", () => {
       "x".repeat(16000),
     ]);
     await h1.syncToFs();
-    await h1.flush();
     await h1.destroy();
 
     const h2 = await createPreloadHarness(remote);
@@ -282,8 +324,7 @@ describe("PGlite + PreloadBackend under cache pressure", () => {
         `item-${i}-${"y".repeat(200)}`,
       ]);
     }
-    await h1.syncToFs();
-    await h1.flush();
+    await h1.syncToFs(); // auto-flushes to remote
     await h1.destroy();
 
     // Re-read under pressure
@@ -305,7 +346,7 @@ describe("PGlite + PreloadBackend under cache pressure", () => {
 // ---------------------------------------------------------------------------
 
 describe("PGlite + PreloadBackend + IdbBackend", () => {
-  it("@fast SQL data persists through IDB round-trip", async () => {
+  it("@fast SQL data persists through IDB round-trip (auto-flush)", async () => {
     const dbName = `pglite-preload-idb-${Date.now()}`;
 
     // Session 1: write through IDB-backed PreloadBackend
@@ -320,8 +361,7 @@ describe("PGlite + PreloadBackend + IdbBackend", () => {
         ('Gadget', 24.50),
         ('Doohickey', 4.25)
     `);
-    await h1.syncToFs();
-    await h1.flush();
+    await h1.syncToFs(); // auto-flushes to IDB
     await h1.destroy();
 
     // Session 2: fresh PGlite on same IDB
