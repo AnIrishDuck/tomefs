@@ -305,8 +305,8 @@ describe("sab-protocol", () => {
   });
 
   describe("protocol constants", () => {
-    it("CONTROL_BYTES is 12 (3 x Int32)", () => {
-      expect(CONTROL_BYTES).toBe(12);
+    it("CONTROL_BYTES is 16 (4 x Int32)", () => {
+      expect(CONTROL_BYTES).toBe(16);
     });
 
     it("JSON_REGION_OFFSET equals CONTROL_BYTES", () => {

@@ -453,13 +453,15 @@ describe("SAB bridge: timeout", () => {
 
   it("bridge recovers after timeout — subsequent fast calls succeed", async () => {
     // First call: slow, times out
-    slowBackend.readDelay = 2000;
+    slowBackend.readDelay = 400;
     await expect(
       callClient(clientWorker, "readPage", ["/slow", 0]),
     ).rejects.toThrow(/SAB bridge timeout/);
 
-    // Wait for the slow backend operation to complete so the worker settles
-    await new Promise((r) => setTimeout(r, 2500));
+    // The epoch mechanism lets the worker discard its stale response, so
+    // no long sleep is needed — just wait for the slow operation to finish
+    // so the worker can pick up the next request.
+    await new Promise((r) => setTimeout(r, 300));
 
     // Now make it fast again
     slowBackend.readDelay = 0;
@@ -471,6 +473,36 @@ describe("SAB bridge: timeout", () => {
     const result = await callClient(clientWorker, "readPage", ["/recovery", 0]);
     const buf = toUint8Array(result);
     expect(buf[0]).toBe(0x42);
+  }, 10000);
+
+  it("stale response from timed-out request does not corrupt subsequent call", async () => {
+    // Pre-seed data while backend is fast
+    slowBackend.readDelay = 0;
+    const seedData = new Uint8Array(PAGE_SIZE);
+    seedData[0] = 0xaa;
+    seedData[1] = 0xbb;
+    await callClient(clientWorker, "writePage", ["/stale-test", 0, seedData]);
+
+    // Now make reads slow — triggers a timeout on the first read
+    slowBackend.readDelay = 400;
+    await expect(
+      callClient(clientWorker, "readPage", ["/stale-test", 0]),
+    ).rejects.toThrow(/SAB bridge timeout/);
+
+    // Make reads fast again and immediately issue a new read.
+    // Without epoch protection, the worker's stale response from the
+    // timed-out read could overwrite the buffer while the client is
+    // waiting for this new read, returning corrupted data.
+    slowBackend.readDelay = 0;
+
+    // Wait just long enough for the stale slow read to complete in the
+    // worker, so it can process the next request.
+    await new Promise((r) => setTimeout(r, 300));
+
+    const result = await callClient(clientWorker, "readPage", ["/stale-test", 0]);
+    const buf = toUint8Array(result);
+    expect(buf[0]).toBe(0xaa);
+    expect(buf[1]).toBe(0xbb);
   }, 10000);
 
   it("fast operations succeed within timeout", async () => {

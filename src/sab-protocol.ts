@@ -6,6 +6,9 @@
  *   [0] status   — 0 = idle, 1 = request pending, 2 = response ready, -1 = error
  *   [1] opcode   — which StorageBackend method to call
  *   [2] dataLen  — length of serialized request/response data in the data region
+ *   [3] epoch    — monotonic counter incremented by the client on each call;
+ *                  used by the worker to detect and discard stale responses
+ *                  after a client timeout
  *
  * The data region follows the control region and carries serialized JSON
  * for request parameters and response payloads. Page data (Uint8Array) is
@@ -44,11 +47,11 @@ export const OpCode = {
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];
 
 /** Byte offsets in the SharedArrayBuffer. */
-export const CONTROL_BYTES = 12; // 3 x Int32
+export const CONTROL_BYTES = 16; // 4 x Int32
 export const JSON_REGION_OFFSET = CONTROL_BYTES;
 
 /**
- * Default buffer size: 12 bytes control + 1MB data region.
+ * Default buffer size: 16 bytes control + 1MB data region.
  * The data region must be large enough for the largest page batch operation.
  * A single page is 8KB; a batch of 128 pages is ~1MB.
  */
@@ -58,6 +61,7 @@ export const DEFAULT_BUFFER_SIZE = CONTROL_BYTES + 1024 * 1024;
 export const SLOT_STATUS = 0;
 export const SLOT_OPCODE = 1;
 export const SLOT_DATA_LEN = 2;
+export const SLOT_EPOCH = 3;
 
 /** Reusable encoder/decoder to avoid allocation on every SAB call. */
 const encoder = new TextEncoder();

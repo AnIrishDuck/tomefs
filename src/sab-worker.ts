@@ -13,7 +13,6 @@
 import type { StorageBackend } from "./storage-backend.js";
 import type { FileMeta } from "./types.js";
 import {
-  STATUS_IDLE,
   STATUS_REQUEST,
   STATUS_RESPONSE,
   STATUS_ERROR,
@@ -21,6 +20,7 @@ import {
   SLOT_STATUS,
   SLOT_OPCODE,
   SLOT_DATA_LEN,
+  SLOT_EPOCH,
   encodeMessage,
   decodeMessage,
 } from "./sab-protocol.js";
@@ -36,7 +36,7 @@ export class SabWorker {
   constructor(sab: SharedArrayBuffer, backend: StorageBackend) {
     this.sab = sab;
     this.backend = backend;
-    this.controlView = new Int32Array(sab, 0, 3);
+    this.controlView = new Int32Array(sab, 0, 4);
     this.dataView = new DataView(sab);
     this.uint8View = new Uint8Array(sab);
   }
@@ -104,6 +104,7 @@ export class SabWorker {
       SLOT_OPCODE,
     ) as unknown as OpCode;
     const dataLen = Atomics.load(this.controlView, SLOT_DATA_LEN);
+    const requestEpoch = Atomics.load(this.controlView, SLOT_EPOCH);
 
     try {
       const { json: params, binary } = decodeMessage(
@@ -114,10 +115,22 @@ export class SabWorker {
 
       await this.dispatch(opcode, params as Record<string, unknown>, binary);
 
+      // Check if the client has moved on (e.g., after a timeout).
+      // If the epoch changed, a new request is in flight or pending,
+      // so we must not overwrite the shared buffer with our stale response.
+      if (Atomics.load(this.controlView, SLOT_EPOCH) !== requestEpoch) {
+        return;
+      }
+
       // Signal response ready
       Atomics.store(this.controlView, SLOT_STATUS, STATUS_RESPONSE);
       Atomics.notify(this.controlView, SLOT_STATUS);
     } catch (err: unknown) {
+      // Also check epoch before writing error response
+      if (Atomics.load(this.controlView, SLOT_EPOCH) !== requestEpoch) {
+        return;
+      }
+
       const errMsg =
         err instanceof Error ? err.message : "Unknown bridge error";
       const errLen = encodeMessage(this.dataView, this.uint8View, {

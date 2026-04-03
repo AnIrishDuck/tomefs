@@ -21,6 +21,7 @@ import {
   SLOT_STATUS,
   SLOT_OPCODE,
   SLOT_DATA_LEN,
+  SLOT_EPOCH,
   CONTROL_BYTES,
   DEFAULT_BUFFER_SIZE,
   encodeMessage,
@@ -47,6 +48,7 @@ export class SabClient implements SyncStorageBackend {
   private readonly dataView: DataView;
   private readonly uint8View: Uint8Array;
   private readonly timeout: number;
+  private epoch = 0;
 
   /**
    * Maximum pages per batch call. Computed from buffer size to prevent
@@ -85,7 +87,7 @@ export class SabClient implements SyncStorageBackend {
 
   constructor(sab: SharedArrayBuffer, options?: SabClientOptions) {
     this.sab = sab;
-    this.controlView = new Int32Array(sab, 0, 3);
+    this.controlView = new Int32Array(sab, 0, 4);
     this.dataView = new DataView(sab);
     this.uint8View = new Uint8Array(sab);
     this.timeout = options?.timeout ?? 0;
@@ -369,6 +371,13 @@ export class SabClient implements SyncStorageBackend {
     params: unknown,
     binaryChunks?: Uint8Array[],
   ): { json: unknown; binary: Uint8Array } {
+    // Increment epoch so the worker can detect stale responses after timeout.
+    // The epoch is stored before encoding the request so that if the worker
+    // is still finishing a timed-out request, it will see the epoch change
+    // before either side writes to the data region.
+    this.epoch = (this.epoch + 1) | 0;
+    Atomics.store(this.controlView, SLOT_EPOCH, this.epoch);
+
     // Encode request into the data region
     const dataLen = encodeMessage(
       this.dataView,
