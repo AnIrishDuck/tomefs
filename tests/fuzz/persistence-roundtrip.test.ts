@@ -24,6 +24,7 @@
 import { describe, it, expect } from "vitest";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { Rng } from "../harness/rng.js";
 import { createTomeFS } from "../../src/tomefs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
@@ -32,53 +33,7 @@ import { O, SEEK_SET } from "../harness/emscripten-fs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ---------------------------------------------------------------
-// Seeded PRNG (xorshift128+) — same as differential.test.ts
-// ---------------------------------------------------------------
-
-class Rng {
-  private s0: number;
-  private s1: number;
-
-  constructor(seed: number) {
-    this.s0 = this.splitmix32(seed);
-    this.s1 = this.splitmix32(this.s0);
-    if (this.s0 === 0 && this.s1 === 0) this.s1 = 1;
-  }
-
-  private splitmix32(x: number): number {
-    x = (x + 0x9e3779b9) | 0;
-    x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
-    x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
-    return (x ^ (x >>> 16)) >>> 0;
-  }
-
-  next(): number {
-    let s0 = this.s0;
-    let s1 = this.s1;
-    const result = (s0 + s1) >>> 0;
-    s1 ^= s0;
-    this.s0 = ((s0 << 26) | (s0 >>> 6)) ^ s1 ^ (s1 << 9);
-    this.s1 = (s1 << 13) | (s1 >>> 19);
-    return result;
-  }
-
-  int(max: number): number {
-    return this.next() % max;
-  }
-
-  pick<T>(arr: T[]): T {
-    return arr[this.int(arr.length)];
-  }
-
-  bytes(length: number): Uint8Array {
-    const buf = new Uint8Array(length);
-    for (let i = 0; i < length; i++) {
-      buf[i] = this.next() & 0xff;
-    }
-    return buf;
-  }
-}
+// Rng imported from ../harness/rng.js
 
 // ---------------------------------------------------------------
 // Model: tracks expected filesystem state for verification
@@ -89,6 +44,10 @@ interface FileState {
   data: Uint8Array;
   /** File mode. */
   mode: number;
+  /** Explicit atime set by utime (null = not explicitly set, don't verify). */
+  atime: number | null;
+  /** Explicit mtime set by utime (null = not explicitly set, don't verify). */
+  mtime: number | null;
 }
 
 interface DirState {
@@ -130,7 +89,8 @@ type Op =
   | { type: "unlinkSymlink"; path: string }
   | { type: "renameDir"; oldPath: string; newPath: string }
   | { type: "appendWrite"; path: string; data: Uint8Array }
-  | { type: "chmod"; path: string; mode: number };
+  | { type: "chmod"; path: string; mode: number }
+  | { type: "utime"; path: string; atime: number; mtime: number };
 
 const DIR_NAMES = ["alpha", "beta", "gamma"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"];
@@ -187,6 +147,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["unlink", allFiles.length > 0 ? 8 : 0],
     ["appendWrite", allFiles.length > 0 ? 10 : 0],
     ["chmod", allFiles.length > 0 ? 5 : 0],
+    ["utime", allFiles.length > 0 ? 6 : 0],
     ["symlink", allFiles.length > 0 ? 8 : 0],
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
     ["rmdir", allDirs.filter((d) => isDirEmpty(model, d)).length > 0 ? 5 : 0],
@@ -274,6 +235,15 @@ function generateOp(rng: Rng, model: FSModel): Op {
       const path = rng.pick(allFiles);
       const modeChoices = [0o444, 0o555, 0o644, 0o666, 0o755, 0o777];
       return { type: "chmod", path, mode: rng.pick(modeChoices) };
+    }
+
+    case "utime": {
+      const path = rng.pick(allFiles);
+      // Use fixed timestamps for deterministic verification
+      const baseTime = 1000000000000; // ~2001
+      const atime = baseTime + rng.int(1000000000);
+      const mtime = baseTime + rng.int(1000000000);
+      return { type: "utime", path, atime, mtime };
     }
 
     case "symlink": {
@@ -395,6 +365,11 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
         return true;
       }
 
+      case "utime": {
+        FS.utime(rw(op.path), op.atime, op.mtime);
+        return true;
+      }
+
       default:
         return true;
     }
@@ -409,7 +384,7 @@ function updateModel(model: FSModel, op: Op): void {
       const existing = model.files.get(op.path);
       // O_CREAT | O_TRUNC on an existing file preserves its mode
       const mode = existing ? existing.mode : 0o100666;
-      model.files.set(op.path, { data: new Uint8Array(op.data), mode });
+      model.files.set(op.path, { data: new Uint8Array(op.data), mode, atime: null, mtime: null });
       break;
     }
 
@@ -421,6 +396,9 @@ function updateModel(model: FSModel, op: Op): void {
       newData.set(file.data);
       newData.set(op.data, op.offset);
       file.data = newData;
+      // Write implicitly updates mtime; clear explicit timestamps
+      file.atime = null;
+      file.mtime = null;
       break;
     }
 
@@ -434,6 +412,9 @@ function updateModel(model: FSModel, op: Op): void {
         newData.set(file.data);
         file.data = newData;
       }
+      // Truncate implicitly updates mtime; clear explicit timestamps
+      file.atime = null;
+      file.mtime = null;
       break;
     }
 
@@ -441,6 +422,9 @@ function updateModel(model: FSModel, op: Op): void {
       const file = model.files.get(op.path);
       if (!file) break;
       file.data = new Uint8Array(op.data);
+      // Overwrite implicitly updates mtime; clear explicit timestamps
+      file.atime = null;
+      file.mtime = null;
       break;
     }
 
@@ -514,6 +498,9 @@ function updateModel(model: FSModel, op: Op): void {
       newData.set(file.data);
       newData.set(op.data, file.data.length);
       file.data = newData;
+      // Append implicitly updates mtime; clear explicit timestamps
+      file.atime = null;
+      file.mtime = null;
       break;
     }
 
@@ -522,6 +509,14 @@ function updateModel(model: FSModel, op: Op): void {
       if (!file) break;
       // Emscripten preserves the file type bits; chmod only changes permission bits
       file.mode = (file.mode & 0o170000) | (op.mode & 0o7777);
+      break;
+    }
+
+    case "utime": {
+      const file = model.files.get(op.path);
+      if (!file) break;
+      file.atime = op.atime;
+      file.mtime = op.mtime;
       break;
     }
   }
@@ -555,6 +550,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
     case "chmod":
       return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
+    case "utime":
+      return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
   }
 }
 
@@ -635,6 +632,25 @@ function verifyAfterRemount(
     const expectedPerms = fileState.mode & 0o7777;
     const actualPerms = stat.mode & 0o7777;
     expect(actualPerms, `${context}: mode mismatch for ${path}`).toBe(expectedPerms);
+
+    // Verify timestamps if explicitly set via utime (not implicitly by writes).
+    // Emscripten stores timestamps as Date objects internally; tomefs persists
+    // them as millisecond numbers in FileMeta. Only check when utime was the
+    // last timestamp-modifying operation — writes/truncates reset the tracking.
+    if (fileState.mtime !== null) {
+      const actualMtime = stat.mtime instanceof Date ? stat.mtime.getTime() : stat.mtime;
+      expect(
+        actualMtime,
+        `${context}: mtime mismatch for ${path} (expected ${fileState.mtime})`,
+      ).toBe(fileState.mtime);
+    }
+    if (fileState.atime !== null) {
+      const actualAtime = stat.atime instanceof Date ? stat.atime.getTime() : stat.atime;
+      expect(
+        actualAtime,
+        `${context}: atime mismatch for ${path} (expected ${fileState.atime})`,
+      ).toBe(fileState.atime);
+    }
   }
 
   // Verify all directories exist
