@@ -32,6 +32,9 @@ export class PageCache {
   /** Secondary index: set of cache keys for dirty pages. */
   private dirtyKeys = new Set<string>();
 
+  /** Reusable buffer pool to reduce Uint8Array allocation pressure. */
+  private bufferPool: Uint8Array[] = [];
+
   /** Performance counters. */
   private _hits = 0;
   private _misses = 0;
@@ -116,7 +119,8 @@ export class PageCache {
     }
 
     this._misses++;
-    // Cache miss — load from backend (or create zero-filled if beyond file extent)
+    // Cache miss — load from backend (or create zero-filled if beyond file extent).
+    // Backend.readPage returns a defensive copy, so we use it directly.
     const data = readBackend
       ? await this.backend.readPage(path, pageIndex)
       : null;
@@ -124,7 +128,7 @@ export class PageCache {
       key,
       path,
       pageIndex,
-      data: data ? new Uint8Array(data) : new Uint8Array(PAGE_SIZE),
+      data: data ?? this.acquireBuffer(),
       dirty: false,
       evicted: false,
     };
@@ -201,9 +205,7 @@ export class PageCache {
             key,
             path,
             pageIndex,
-            data: results[i]
-              ? new Uint8Array(results[i]!)
-              : new Uint8Array(PAGE_SIZE),
+            data: results[i] ?? this.acquireBuffer(),
             dirty: false,
             evicted: false,
           };
@@ -338,9 +340,7 @@ export class PageCache {
               key,
               path,
               pageIndex,
-              data: results[i]
-                ? new Uint8Array(results[i]!)
-                : new Uint8Array(PAGE_SIZE),
+              data: results[i] ?? this.acquireBuffer(),
               dirty: false,
               evicted: false,
             };
@@ -485,6 +485,7 @@ export class PageCache {
       const page = this.cache.get(key)!;
       page.evicted = true;
       this.cache.delete(key);
+      this.releaseBuffer(page.data);
       if (page === this.mruPage) this.mruPage = null;
     }
     this.filePages.delete(path);
@@ -504,6 +505,7 @@ export class PageCache {
       if (page.pageIndex >= fromPageIndex) {
         page.evicted = true;
         this.cache.delete(key);
+        this.releaseBuffer(page.data);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
         keys.delete(key);
@@ -550,6 +552,7 @@ export class PageCache {
         const page = this.cache.get(key)!;
         page.evicted = true;
         this.cache.delete(key);
+        this.releaseBuffer(page.data);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
@@ -578,6 +581,7 @@ export class PageCache {
         const page = this.cache.get(key)!;
         page.evicted = true;
         this.cache.delete(key);
+        this.releaseBuffer(page.data);
         if (page === this.mruPage) this.mruPage = null;
         this.dirtyKeys.delete(key);
       }
@@ -714,6 +718,7 @@ export class PageCache {
     victim.evicted = true;
     this._evictions++;
     this.cache.delete(firstKey);
+    this.releaseBuffer(victim.data);
     if (victim === this.mruPage) this.mruPage = null;
 
     const fileKeys = this.filePages.get(victim.path);
@@ -780,6 +785,7 @@ export class PageCache {
 
       victim.evicted = true;
       this.cache.delete(key);
+      this.releaseBuffer(victim.data);
       if (victim === this.mruPage) this.mruPage = null;
 
       if (victim.dirty) {
@@ -792,6 +798,23 @@ export class PageCache {
         fileKeys.delete(key);
         if (fileKeys.size === 0) this.filePages.delete(victim.path);
       }
+    }
+  }
+
+  /** Acquire a zeroed PAGE_SIZE buffer from the pool, or allocate a new one. */
+  private acquireBuffer(): Uint8Array {
+    const buf = this.bufferPool.pop();
+    if (buf) {
+      buf.fill(0);
+      return buf;
+    }
+    return new Uint8Array(PAGE_SIZE);
+  }
+
+  /** Return a buffer to the pool for reuse (max 64 buffers pooled). */
+  private releaseBuffer(buf: Uint8Array): void {
+    if (this.bufferPool.length < 64) {
+      this.bufferPool.push(buf);
     }
   }
 }
