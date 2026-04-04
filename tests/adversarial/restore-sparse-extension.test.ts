@@ -192,6 +192,38 @@ describe("restoreTree crash recovery: sparse file extended beyond metadata", () 
     expect(FS.stat(`${MOUNT}/burst`).size).toBe(PAGE_SIZE * 6);
   });
 
+  it("extension beyond missing last-expected page uses maxPageIndex", async () => {
+    // Key case: highIdx > lastPageIndex AND the page at lastPageIndex
+    // does NOT exist. The file extent is determined by maxPageIndex
+    // regardless of whether the last expected page is present.
+    //
+    // meta.size = PAGE_SIZE * 4 → pagesFromMeta = 4, lastPageIndex = 3
+    // Stored: pages 0, 5 only → countPages = 2 < 4
+    // Page 3 (last expected) is MISSING, page 5 is extension
+    // maxPageIndex = 5 > lastPageIndex = 3 → fileSize = 6 * PAGE_SIZE
+    backend.writeMeta("/gap-ext", {
+      size: PAGE_SIZE * 4,
+      mode: 0o100666,
+      ctime: Date.now(),
+      mtime: Date.now(),
+      atime: Date.now(),
+    });
+    backend.writePage("/gap-ext", 0, new Uint8Array(PAGE_SIZE).fill(0xaa));
+    // Note: pages 1, 2, 3 are all missing — page 3 is the last expected
+    backend.writePage("/gap-ext", 5, new Uint8Array(PAGE_SIZE).fill(0xee));
+
+    const { FS } = await mountTome(backend);
+    // maxPageIndex=5 > lastPageIndex=3 → extent is (5+1)*PAGE_SIZE
+    expect(FS.stat(`${MOUNT}/gap-ext`).size).toBe(PAGE_SIZE * 6);
+
+    // Verify extension page data is accessible
+    const buf = new Uint8Array(PAGE_SIZE);
+    const fd = FS.open(`${MOUNT}/gap-ext`, O.RDONLY);
+    FS.read(fd, buf, 0, PAGE_SIZE, 5 * PAGE_SIZE);
+    FS.close(fd);
+    expect(buf).toEqual(new Uint8Array(PAGE_SIZE).fill(0xee));
+  });
+
   it("recovered sparse+extension file can be written and re-synced", async () => {
     // Use pagesFromMeta > countPages to trigger the sparse branch.
     // meta.size = PAGE_SIZE * 5 → pagesFromMeta = 5

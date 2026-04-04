@@ -993,34 +993,28 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // Page count matches metadata — trust meta.size for sub-page precision
           fileSize = meta.size;
         } else if (actualPageCount < pagesFromMeta) {
-          // Fewer pages than expected. Two possible causes:
-          // (a) Sparse file with zero-filled gaps — the last page exists but
-          //     intermediate pages were never written. Trust meta.size.
-          // (b) Crash after truncation deleted tail pages but before metadata
-          //     was updated. The last expected page is missing. Fall back to
-          //     probing for the true extent.
-          // Distinguish by probing the last page implied by meta.size.
+          // Fewer pages than expected. Use maxPageIndex (already batched)
+          // to distinguish sparse files from crash-truncated files without
+          // individual readPage round-trips.
           const lastPageIndex = pagesFromMeta - 1;
           const highIdx = maxIdxByEntry.get(i)!;
-          const lastPage = backend.readPage(storagePath, lastPageIndex);
-          if (lastPage !== null) {
-            // Last page exists — sparse file with gaps. Check if pages
-            // extend beyond the expected range (file extended after last
-            // metadata sync, then crashed before syncfs). Without this,
-            // extension pages are silently lost.
-            if (highIdx > lastPageIndex) {
-              // Pages beyond expected range — file was extended after sync
-              fileSize = (highIdx + 1) * PAGE_SIZE;
-            } else {
-              // No extension — trust metadata for sub-page precision
-              fileSize = meta.size;
-            }
+          if (highIdx === lastPageIndex) {
+            // Last expected page is the highest — it exists. This is a
+            // sparse file with zero-filled gaps. Trust meta.size for
+            // sub-page precision.
+            fileSize = meta.size;
+          } else if (highIdx > lastPageIndex) {
+            // Pages extend beyond metadata — file was extended after
+            // last sync, then crashed before syncfs. Whether the page
+            // at lastPageIndex exists or not, the file extent is
+            // determined by the highest page.
+            fileSize = (highIdx + 1) * PAGE_SIZE;
           } else {
-            // Last page missing — crash recovery. Use maxPageIndex to
-            // find the true highest page index rather than assuming
-            // pages are contiguous from index 0 (countPages only counts
-            // stored pages, not their maximum index — non-contiguous
-            // pages from allocate + crash would be lost otherwise).
+            // highIdx < lastPageIndex — crash recovery. Last expected
+            // page is missing (truncation deleted tail pages before
+            // metadata was updated). Use maxPageIndex to find the true
+            // highest page index rather than assuming pages are
+            // contiguous from index 0.
             fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
           }
         } else {
