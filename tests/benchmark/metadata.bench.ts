@@ -66,37 +66,33 @@ async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
   rawFS.mkdir(TOME_MOUNT);
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
-  const methodCache = new Map<string, Function>();
-  const pathMethods = new Set([
+  // Uses a plain object with pre-bound methods instead of a Proxy to avoid
+  // unfairly penalizing tomefs benchmarks — Proxy get traps prevent V8's
+  // inline cache optimization, adding overhead that doesn't exist in the
+  // MEMFS baseline.
+  const wrappedFS = Object.create(rawFS);
+  const pathMethods = [
     "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
     "readdir", "unlink", "writeFile", "readFile", "mknod",
     "chmod", "utime", "syncfs",
-  ]);
+  ];
+  for (const method of pathMethods) {
+    const fn = (rawFS as any)[method];
+    if (typeof fn === "function") {
+      (wrappedFS as any)[method] = (path: string, ...args: any[]) =>
+        fn.call(rawFS, rewritePath(path), ...args);
+    }
+  }
+  (wrappedFS as any).rename = (oldPath: string, newPath: string) =>
+    (rawFS as any).rename.call(rawFS, rewritePath(oldPath), rewritePath(newPath));
+  for (const method of ["read", "write", "close", "llseek"] as const) {
+    const fn = (rawFS as any)[method];
+    if (typeof fn === "function") {
+      (wrappedFS as any)[method] = fn.bind(rawFS);
+    }
+  }
 
-  const wrappedFS = new Proxy(rawFS, {
-    get(target: any, prop: string) {
-      const cached = methodCache.get(prop);
-      if (cached) return cached;
-
-      const val = target[prop];
-      if (typeof val !== "function") return val;
-
-      let wrapped: Function;
-      if (pathMethods.has(prop)) {
-        wrapped = (path: string, ...args: any[]) =>
-          val.call(target, rewritePath(path), ...args);
-      } else if (prop === "rename") {
-        wrapped = (oldPath: string, newPath: string) =>
-          val.call(target, rewritePath(oldPath), rewritePath(newPath));
-      } else {
-        wrapped = val.bind(target);
-      }
-      methodCache.set(prop, wrapped);
-      return wrapped;
-    },
-  }) as unknown as EmscriptenFS;
-
-  return { FS: wrappedFS, rawFS, label: `tomefs-${maxPages}` };
+  return { FS: wrappedFS as unknown as EmscriptenFS, rawFS, label: `tomefs-${maxPages}` };
 }
 
 // Reusable data buffer

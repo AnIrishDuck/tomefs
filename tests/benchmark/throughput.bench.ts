@@ -65,40 +65,34 @@ async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
   // Wrap FS with path rewriting so benchmarks use clean paths.
-  // Pre-bind methods to avoid Proxy overhead on the hot path —
-  // a Proxy get-trap calling val.bind(target) on every access creates
-  // a new Function object per call, unfairly penalizing tomefs benchmarks.
-  const methodCache = new Map<string, Function>();
-  const pathMethods = new Set([
+  // Uses a plain object with pre-bound methods instead of a Proxy to avoid
+  // unfairly penalizing tomefs benchmarks — Proxy get traps prevent V8's
+  // inline cache optimization, adding ~200-500ns overhead per method access
+  // that doesn't exist in the MEMFS baseline.
+  const wrappedFS = Object.create(rawFS);
+  const pathMethods = [
     "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
     "readdir", "unlink", "writeFile", "readFile", "mknod",
     "chmod", "utime",
-  ]);
+  ];
+  for (const method of pathMethods) {
+    const fn = rawFS[method];
+    if (typeof fn === "function") {
+      wrappedFS[method] = (path: string, ...args: any[]) =>
+        fn.call(rawFS, rewritePath(path), ...args);
+    }
+  }
+  wrappedFS.rename = (oldPath: string, newPath: string) =>
+    rawFS.rename.call(rawFS, rewritePath(oldPath), rewritePath(newPath));
+  // Bind non-path methods directly (read, write, close, llseek)
+  for (const method of ["read", "write", "close", "llseek"] as const) {
+    const fn = rawFS[method];
+    if (typeof fn === "function") {
+      wrappedFS[method] = fn.bind(rawFS);
+    }
+  }
 
-  const wrappedFS = new Proxy(rawFS, {
-    get(target: any, prop: string) {
-      const cached = methodCache.get(prop);
-      if (cached) return cached;
-
-      const val = target[prop];
-      if (typeof val !== "function") return val;
-
-      let wrapped: Function;
-      if (pathMethods.has(prop)) {
-        wrapped = (path: string, ...args: any[]) =>
-          val.call(target, rewritePath(path), ...args);
-      } else if (prop === "rename") {
-        wrapped = (oldPath: string, newPath: string) =>
-          val.call(target, rewritePath(oldPath), rewritePath(newPath));
-      } else {
-        wrapped = val.bind(target);
-      }
-      methodCache.set(prop, wrapped);
-      return wrapped;
-    },
-  }) as unknown as EmscriptenFS;
-
-  return { FS: wrappedFS, label: `tomefs-${maxPages}` };
+  return { FS: wrappedFS as unknown as EmscriptenFS, label: `tomefs-${maxPages}` };
 }
 
 // Reusable data buffers

@@ -126,14 +126,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const firstPage = (position / PAGE_SIZE) | 0;
     const pageOffset = position - firstPage * PAGE_SIZE;
     if (pageOffset + toRead <= PAGE_SIZE) {
-      let page = node._pages?.[firstPage];
+      let page = node._pages[firstPage];
       if (page && page.evicted) {
         node._pages[firstPage] = undefined;
         page = undefined;
       }
       if (!page) {
         page = pageCache.getPage(node.storagePath, firstPage);
-        if (!node._pages) node._pages = [];
         node._pages[firstPage] = page;
       }
       buffer.set(
@@ -173,7 +172,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const firstPage = (position / PAGE_SIZE) | 0;
     const pageOffset = position - firstPage * PAGE_SIZE;
     if (pageOffset + length <= PAGE_SIZE) {
-      let page = node._pages?.[firstPage];
+      let page = node._pages[firstPage];
       if (page && page.evicted) {
         node._pages[firstPage] = undefined;
         page = undefined;
@@ -192,7 +191,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         page = needsRead
           ? pageCache.getPage(node.storagePath, firstPage)
           : pageCache.getPageNoRead(node.storagePath, firstPage);
-        if (!node._pages) node._pages = [];
         node._pages[firstPage] = page;
       }
       page.data.set(
@@ -227,7 +225,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
     // Reset per-node page table — truncation/extension may invalidate
     // or replace cached pages.
-    node._pages = undefined;
+    node._pages = [];
     const path = node.storagePath;
 
     if (newSize === 0) {
@@ -365,7 +363,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           });
           pageCache.renameFile(targetStoragePath, tempPath);
           new_node.storagePath = tempPath;
-          new_node._pages = undefined;
+          new_node._pages = [];
           new_node.unlinked = true;
         } else {
           pageCache.deleteFile(targetStoragePath);
@@ -390,7 +388,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const newStoragePath = computeStoragePath(new_dir, new_name);
       pageCache.renameFile(oldStoragePath, newStoragePath);
       old_node.storagePath = newStoragePath;
-      old_node._pages = undefined;
+      old_node._pages = [];
       // Move metadata to new path. Construct from node state (no backend
       // read needed) — the node tree is the source of truth. This also
       // provides crash safety for files not yet synced (metadata gets
@@ -483,7 +481,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         });
         pageCache.renameFile(originalPath, tempPath);
         node.storagePath = tempPath;
-        node._pages = undefined;
+        node._pages = [];
         backend.deleteMeta(originalPath);
       }
       // Only remove from tracking if no open fds — syncfs needs to
@@ -556,7 +554,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           const newPath = newBase + oldPath.substring(oldBase.length);
           pageCache.renameFile(oldPath, newPath);
           child.storagePath = newPath;
-          child._pages = undefined;
+          child._pages = [];
           metaWrites.push({
             path: newPath,
             meta: {
@@ -663,7 +661,27 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       length: number,
       position: number,
     ): number {
-      return readPages(stream.node, buffer, offset, length, position);
+      // Inlined single-page fast path: avoids readPages function call overhead
+      // (~10-15ns per call) on the hot path. Falls through to readPages for
+      // multi-page reads and cache misses.
+      const node = stream.node;
+      const size: number = node.usedBytes;
+      if (position >= size) return 0;
+      const toRead = Math.min(length, size - position);
+      if (toRead === 0) return 0;
+      const firstPage = (position / PAGE_SIZE) | 0;
+      const pageOffset = position - firstPage * PAGE_SIZE;
+      if (pageOffset + toRead <= PAGE_SIZE) {
+        const page = node._pages[firstPage];
+        if (page && !page.evicted) {
+          buffer.set(
+            page.data.subarray(pageOffset, pageOffset + toRead),
+            offset,
+          );
+          return toRead;
+        }
+      }
+      return readPages(node, buffer, offset, length, position);
     },
 
     write(
@@ -678,6 +696,27 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const node = stream.node;
       node.mtime = node.ctime = Date.now();
       node._metaDirty = true;
+      // Inlined single-page fast path: avoids writePages function call overhead
+      // on the hot path. Falls through to writePages for multi-page writes,
+      // cache misses, and evicted pages.
+      const firstPage = (position / PAGE_SIZE) | 0;
+      const pageOffset = position - firstPage * PAGE_SIZE;
+      if (pageOffset + length <= PAGE_SIZE) {
+        const page = node._pages[firstPage];
+        if (page && !page.evicted) {
+          page.data.set(
+            buffer.subarray(offset, offset + length),
+            pageOffset,
+          );
+          if (!page.dirty) {
+            page.dirty = true;
+            pageCache.addDirtyKey(page.key);
+          }
+          const end = position + length;
+          if (end > node.usedBytes) node.usedBytes = end;
+          return length;
+        }
+      }
       return writePages(node, buffer, offset, length, position);
     },
 
@@ -1207,7 +1246,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // indexed by page number. Provides O(1) direct page access,
         // bypassing string key construction and Map lookup in the cache.
         // Stale entries (evicted pages) are detected via CachedPage.evicted.
-        node._pages = undefined;
+        node._pages = [];
         // Assign a unique storage path for page cache keying
         node.storagePath = parent
           ? computeStoragePath(parent, name)
