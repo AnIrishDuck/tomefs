@@ -456,9 +456,10 @@ describe("PreloadBackend", () => {
 
       // Should use readPages (batch) for each file, not individual readPage
       // calls for each page. With 10 files, expect 10 readPages calls (one
-      // per file) plus 10 readPage calls (one probe per file).
+      // per file). No individual readPage calls — extent discovery uses
+      // maxPageIndexBatch instead of per-file probes.
       expect(counting.calls["readPages"]).toBe(10);
-      expect(counting.calls["readPage"]).toBe(10); // one probe per file
+      expect(counting.calls["readPage"]).toBeUndefined();
 
       // Verify data integrity
       for (let f = 0; f < 10; f++) {

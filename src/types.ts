@@ -4,13 +4,6 @@ export const PAGE_SIZE = 8192;
 /** Default maximum number of pages in the LRU cache (4096 * 8KB = 32MB). */
 export const DEFAULT_MAX_PAGES = 4096;
 
-/**
- * Maximum page index to probe during exponential extent discovery.
- * Caps the `hi *= 2` loop to avoid integer overflow on extremely large files.
- * 1M pages * 8KB = 8 GB — well beyond any practical Emscripten/PGlite file.
- */
-export const MAX_PROBE_PAGE = 1_048_576;
-
 /** A single cached page. */
 export interface CachedPage {
   /** Cache key for this page (avoids redundant pageKeyStr on hot paths). */
