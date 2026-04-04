@@ -323,7 +323,7 @@ describe("PageCache", () => {
       // Simulate external mutation: mark dirty on the page object,
       // then register via addDirtyKey
       page.dirty = true;
-      cache.addDirtyKey(page.key);
+      cache.addDirtyKey(page.key, "/test");
       expect(cache.isDirty("/test", 0)).toBe(true);
       expect(cache.dirtyCount).toBe(1);
 
