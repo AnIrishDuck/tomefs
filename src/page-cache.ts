@@ -232,7 +232,7 @@ export class PageCache {
 
     while (bytesRead < toRead) {
       const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
+      const pageOffset = pos - pageIndex * PAGE_SIZE;
       const bytesInPage = Math.min(PAGE_SIZE - pageOffset, toRead - bytesRead);
 
       const page = await this.getPage(path, pageIndex);
@@ -371,7 +371,7 @@ export class PageCache {
 
     while (bytesWritten < length) {
       const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
+      const pageOffset = pos - pageIndex * PAGE_SIZE;
       const bytesInPage = Math.min(
         PAGE_SIZE - pageOffset,
         length - bytesWritten,

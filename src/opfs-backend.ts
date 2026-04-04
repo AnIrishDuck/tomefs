@@ -19,23 +19,42 @@ function isNotFoundError(err: unknown): boolean {
 const PAGES_DIR = "pages";
 const META_DIR = "meta";
 
+/** Pre-computed hex lookup table: index → two-char hex string. */
+const HEX_TABLE: string[] = new Array(256);
+for (let i = 0; i < 256; i++) {
+  HEX_TABLE[i] = i.toString(16).padStart(2, "0");
+}
+
+/** Pre-computed reverse hex lookup: hex char code → nibble value. */
+const HEX_VAL = new Uint8Array(128);
+for (let i = 0; i < 10; i++) HEX_VAL[0x30 + i] = i; // '0'-'9'
+for (let i = 0; i < 6; i++) {
+  HEX_VAL[0x61 + i] = 10 + i; // 'a'-'f'
+  HEX_VAL[0x41 + i] = 10 + i; // 'A'-'F'
+}
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 /** Encode a virtual file path as a hex string safe for use as an OPFS name. */
 function encodePath(path: string): string {
-  const bytes = new TextEncoder().encode(path);
+  const bytes = textEncoder.encode(path);
   let hex = "";
-  for (const b of bytes) {
-    hex += b.toString(16).padStart(2, "0");
+  for (let i = 0; i < bytes.length; i++) {
+    hex += HEX_TABLE[bytes[i]];
   }
   return hex;
 }
 
 /** Decode a hex-encoded OPFS name back to the original virtual file path. */
 function decodePath(hex: string): string {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  const len = hex.length >> 1;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    const j = i << 1;
+    bytes[i] = (HEX_VAL[hex.charCodeAt(j)] << 4) | HEX_VAL[hex.charCodeAt(j + 1)];
   }
-  return new TextDecoder().decode(bytes);
+  return textDecoder.decode(bytes);
 }
 
 /** Options for creating an OpfsBackend. */
@@ -178,10 +197,39 @@ export class OpfsBackend implements StorageBackend {
       await this.writePage(pages[0].path, pages[0].pageIndex, pages[0].data);
       return;
     }
+
+    // Group pages by path so we look up each directory handle only once.
+    // During flush, many dirty pages often belong to the same file.
+    const byPath = new Map<
+      string,
+      Array<{ pageIndex: number; data: Uint8Array }>
+    >();
+    for (const { path, pageIndex, data } of pages) {
+      let group = byPath.get(path);
+      if (!group) {
+        group = [];
+        byPath.set(path, group);
+      }
+      group.push({ pageIndex, data });
+    }
+
     await Promise.all(
-      pages.map(({ path, pageIndex, data }) =>
-        this.writePage(path, pageIndex, data),
-      ),
+      Array.from(byPath.entries()).map(async ([path, group]) => {
+        const fileDir = await this.getFileDir(path, true);
+        await Promise.all(
+          group.map(async ({ pageIndex, data }) => {
+            const handle = await fileDir!.getFileHandle(String(pageIndex), {
+              create: true,
+            });
+            const writable = await handle.createWritable();
+            try {
+              await writable.write(new Uint8Array(data));
+            } finally {
+              await writable.close();
+            }
+          }),
+        );
+      }),
     );
   }
 
