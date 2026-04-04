@@ -305,6 +305,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (attr.size !== undefined) {
       resizeFileStorage(node, attr.size);
       node._metaDirty = true;
+      node._dataDirty = true;
     }
   }
 
@@ -696,6 +697,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const node = stream.node;
       node.mtime = node.ctime = Date.now();
       node._metaDirty = true;
+      node._dataDirty = true;
       // Inlined single-page fast path: avoids writePages function call overhead
       // on the hot path. Falls through to writePages for multi-page writes,
       // cache misses, and evicted pages.
@@ -758,13 +760,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
-        } else {
+        } else if (node._dataDirty) {
+          // Only flush when the file has been written to. Read-only opens
+          // never dirty pages, so flushFile would iterate all cached pages
+          // for this file just to find nothing — wasted O(pages) work.
           pageCache.flushFile(node.storagePath);
+          node._dataDirty = false;
         }
       }
     },
 
     allocate(stream: any, offset: number, length: number) {
+      stream.node._dataDirty = true;
       resizeFileStorage(
         stream.node,
         Math.max(stream.node.usedBytes, offset + length),
@@ -794,6 +801,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       _mmapFlags: number,
     ) {
       // offset is the file position (matching MEMFS: write(stream, buffer, 0, length, offset))
+      stream.node._dataDirty = true;
       writePages(stream.node, buffer, 0, length, offset);
       return 0;
     },
@@ -1242,6 +1250,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.usedBytes = 0;
         node.openCount = 0;
         node.unlinked = false;
+        // Tracks whether any page data has been written since the last flush.
+        // Allows close() to skip flushFile for read-only opens — avoiding an
+        // O(pages-for-file) iteration when no pages are dirty.
+        node._dataDirty = false;
         // Per-node page table: sparse array of CachedPage references
         // indexed by page number. Provides O(1) direct page access,
         // bypassing string key construction and Map lookup in the cache.

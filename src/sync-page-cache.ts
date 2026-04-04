@@ -409,6 +409,9 @@ export class SyncPageCache {
       pageIndex: number;
       data: Uint8Array;
     }> = [];
+    // Collect dirty pages and their cache entries in a single pass
+    // (previously used two separate iterations over `keys`).
+    const dirtyEntries: CachedPage[] = [];
 
     for (const key of keys) {
       if (this.dirtyKeys.has(key)) {
@@ -418,17 +421,16 @@ export class SyncPageCache {
           pageIndex: page.pageIndex,
           data: page.data,
         });
+        dirtyEntries.push(page);
       }
     }
 
     if (dirtyPages.length > 0) {
       this.backend.writePages(dirtyPages);
       this._flushes += dirtyPages.length;
-      for (const key of keys) {
-        if (this.dirtyKeys.has(key)) {
-          this.cache.get(key)!.dirty = false;
-          this.dirtyKeys.delete(key);
-        }
+      for (const entry of dirtyEntries) {
+        entry.dirty = false;
+        this.dirtyKeys.delete(entry.key);
       }
     }
 
@@ -447,6 +449,8 @@ export class SyncPageCache {
       pageIndex: number;
       data: Uint8Array;
     }> = [];
+    // Collect pages and clear dirty flags in a single pass over dirtyKeys.
+    const entries: CachedPage[] = [];
 
     for (const key of this.dirtyKeys) {
       const page = this.cache.get(key)!;
@@ -455,12 +459,13 @@ export class SyncPageCache {
         pageIndex: page.pageIndex,
         data: page.data,
       });
+      entries.push(page);
     }
 
     this.backend.writePages(dirtyPages);
     this._flushes += dirtyPages.length;
-    for (const key of this.dirtyKeys) {
-      this.cache.get(key)!.dirty = false;
+    for (const entry of entries) {
+      entry.dirty = false;
     }
     this.dirtyKeys.clear();
 

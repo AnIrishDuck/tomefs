@@ -415,6 +415,7 @@ export class PageCache {
       pageIndex: number;
       data: Uint8Array;
     }> = [];
+    const dirtyEntries: CachedPage[] = [];
 
     for (const key of keys) {
       if (this.dirtyKeys.has(key)) {
@@ -424,17 +425,16 @@ export class PageCache {
           pageIndex: page.pageIndex,
           data: page.data,
         });
+        dirtyEntries.push(page);
       }
     }
 
     if (dirtyPages.length > 0) {
       await this.backend.writePages(dirtyPages);
       this._flushes += dirtyPages.length;
-      for (const key of keys) {
-        if (this.dirtyKeys.has(key)) {
-          this.cache.get(key)!.dirty = false;
-          this.dirtyKeys.delete(key);
-        }
+      for (const entry of dirtyEntries) {
+        entry.dirty = false;
+        this.dirtyKeys.delete(entry.key);
       }
     }
 
@@ -453,6 +453,7 @@ export class PageCache {
       pageIndex: number;
       data: Uint8Array;
     }> = [];
+    const entries: CachedPage[] = [];
 
     for (const key of this.dirtyKeys) {
       const page = this.cache.get(key)!;
@@ -461,12 +462,13 @@ export class PageCache {
         pageIndex: page.pageIndex,
         data: page.data,
       });
+      entries.push(page);
     }
 
     await this.backend.writePages(dirtyPages);
     this._flushes += dirtyPages.length;
-    for (const key of this.dirtyKeys) {
-      this.cache.get(key)!.dirty = false;
+    for (const entry of entries) {
+      entry.dirty = false;
     }
     this.dirtyKeys.clear();
 
