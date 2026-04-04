@@ -238,6 +238,12 @@ export class OpfsBackend implements StorageBackend {
     }
   }
 
+  async maxPageIndexBatch(paths: string[]): Promise<number[]> {
+    if (paths.length === 0) return [];
+    await this.init();
+    return Promise.all(paths.map((path) => this.maxPageIndex(path)));
+  }
+
   async deleteFiles(paths: string[]): Promise<void> {
     if (paths.length === 0) return;
     if (paths.length === 1) {

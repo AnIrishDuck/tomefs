@@ -949,6 +949,33 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const storagePaths = fileEntries.map((e) => e.storagePath);
       const allPageCounts = backend.countPagesBatch(storagePaths);
 
+      // Identify files needing crash recovery (page count mismatch).
+      // All such files need maxPageIndex; batch into a single call to
+      // reduce O(n) SAB bridge round-trips to O(1) during mount.
+      const recoveryIndices: number[] = [];
+      for (let i = 0; i < fileEntries.length; i++) {
+        const actualPageCount = allPageCounts[i];
+        const pagesFromMeta = fileEntries[i].meta.size > 0
+          ? Math.ceil(fileEntries[i].meta.size / PAGE_SIZE)
+          : 0;
+        if (actualPageCount !== 0 && actualPageCount !== pagesFromMeta) {
+          recoveryIndices.push(i);
+        }
+      }
+
+      // Batch maxPageIndex for all recovery files in a single call.
+      let recoveryMaxIndices: number[] = [];
+      if (recoveryIndices.length > 0) {
+        const recoveryPaths = recoveryIndices.map((i) => fileEntries[i].storagePath);
+        recoveryMaxIndices = backend.maxPageIndexBatch(recoveryPaths);
+      }
+
+      // Map from fileEntries index → maxPageIndex result
+      const maxIdxByEntry = new Map<number, number>();
+      for (let j = 0; j < recoveryIndices.length; j++) {
+        maxIdxByEntry.set(recoveryIndices[j], recoveryMaxIndices[j]);
+      }
+
       for (let i = 0; i < fileEntries.length; i++) {
         const { meta, parent, name, storagePath } = fileEntries[i];
         const node = TOMEFS.createNode(parent, name, meta.mode, 0);
@@ -974,13 +1001,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           //     probing for the true extent.
           // Distinguish by probing the last page implied by meta.size.
           const lastPageIndex = pagesFromMeta - 1;
+          const highIdx = maxIdxByEntry.get(i)!;
           const lastPage = backend.readPage(storagePath, lastPageIndex);
           if (lastPage !== null) {
             // Last page exists — sparse file with gaps. Check if pages
             // extend beyond the expected range (file extended after last
             // metadata sync, then crashed before syncfs). Without this,
             // extension pages are silently lost.
-            const highIdx = backend.maxPageIndex(storagePath);
             if (highIdx > lastPageIndex) {
               // Pages beyond expected range — file was extended after sync
               fileSize = (highIdx + 1) * PAGE_SIZE;
@@ -994,7 +1021,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             // pages are contiguous from index 0 (countPages only counts
             // stored pages, not their maximum index — non-contiguous
             // pages from allocate + crash would be lost otherwise).
-            const highIdx = backend.maxPageIndex(storagePath);
             fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
           }
         } else {
@@ -1004,7 +1030,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           // allocate/seek-past-end created sparse pages that were evicted
           // before the crash. countPages only counts stored pages, not
           // their maximum index.
-          const highIdx = backend.maxPageIndex(storagePath);
+          const highIdx = maxIdxByEntry.get(i)!;
           fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
         }
         node.usedBytes = fileSize;

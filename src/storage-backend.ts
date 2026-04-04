@@ -46,6 +46,9 @@ export interface StorageBackend {
   /** Return the highest page index stored for a file, or -1 if no pages exist. */
   maxPageIndex(path: string): Promise<number>;
 
+  /** Return the highest page index for multiple files in a single batch. Returns an array parallel to paths. */
+  maxPageIndexBatch(paths: string[]): Promise<number[]>;
+
   /** Read file metadata. Returns null if the file doesn't exist. */
   readMeta(path: string): Promise<FileMeta | null>;
 

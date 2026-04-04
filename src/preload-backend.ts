@@ -258,6 +258,11 @@ export class PreloadBackend implements SyncStorageBackend {
     return max;
   }
 
+  maxPageIndexBatch(paths: string[]): number[] {
+    this.assertInitialized();
+    return paths.map((path) => this.maxPageIndex(path));
+  }
+
   deleteFiles(paths: string[]): void {
     this.assertInitialized();
     for (const path of paths) {

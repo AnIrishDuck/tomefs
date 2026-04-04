@@ -431,6 +431,9 @@ function createTrackingBackend(
     maxPageIndex(path) {
       return inner.maxPageIndex(path);
     },
+    maxPageIndexBatch(paths) {
+      return inner.maxPageIndexBatch(paths);
+    },
     listFiles() {
       return inner.listFiles();
     },

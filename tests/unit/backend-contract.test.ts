@@ -59,6 +59,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     countPages: async (p) => sync.countPages(p),
     countPagesBatch: async (ps) => sync.countPagesBatch(ps),
     maxPageIndex: async (p) => sync.maxPageIndex(p),
+    maxPageIndexBatch: async (ps) => sync.maxPageIndexBatch(ps),
   };
 }
 
@@ -916,6 +917,55 @@ for (const factory of factories) {
       it("returns 0 for a single page at index 0", async () => {
         await backend.writePage("/f", 0, filledPage(0x01));
         expect(await backend.maxPageIndex("/f")).toBe(0);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // maxPageIndexBatch
+    // ---------------------------------------------------------------
+
+    describe("maxPageIndexBatch", () => {
+      it("returns empty array for empty input @fast", async () => {
+        expect(await backend.maxPageIndexBatch([])).toEqual([]);
+      });
+
+      it("returns indices parallel to input paths @fast", async () => {
+        await backend.writePage("/a", 0, filledPage(0x01));
+        await backend.writePage("/a", 3, filledPage(0x03));
+        await backend.writePage("/b", 0, filledPage(0x02));
+        await backend.writePage("/c", 0, filledPage(0x04));
+        await backend.writePage("/c", 10, filledPage(0x05));
+
+        const indices = await backend.maxPageIndexBatch(["/a", "/b", "/c"]);
+        expect(indices).toEqual([3, 0, 10]);
+      });
+
+      it("returns -1 for non-existent files in batch", async () => {
+        await backend.writePage("/exists", 0, filledPage(0x01));
+
+        const indices = await backend.maxPageIndexBatch([
+          "/missing1",
+          "/exists",
+          "/missing2",
+        ]);
+        expect(indices).toEqual([-1, 0, -1]);
+      });
+
+      it("handles single-element batch", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 7, filledPage(0x02));
+
+        const indices = await backend.maxPageIndexBatch(["/f"]);
+        expect(indices).toEqual([7]);
+      });
+
+      it("handles sparse pages in batch", async () => {
+        await backend.writePage("/s1", 0, filledPage(0x01));
+        await backend.writePage("/s1", 20, filledPage(0x02));
+        await backend.writePage("/s2", 5, filledPage(0x03));
+
+        const indices = await backend.maxPageIndexBatch(["/s1", "/s2"]);
+        expect(indices).toEqual([20, 5]);
       });
     });
 
