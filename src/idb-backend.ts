@@ -299,22 +299,15 @@ export class IdbBackend implements StorageBackend {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(PAGES_STORE, "readonly");
       const store = tx.objectStore(PAGES_STORE);
-      const results = new Array<number>(paths.length);
+      const results = new Array<number>(paths.length).fill(-1);
       let completed = 0;
 
       for (let i = 0; i < paths.length; i++) {
-        const range = IDBKeyRange.bound(
-          [paths[i], 0],
-          [paths[i], ""],
-          false,
-          true,
-        );
+        const range = IDBKeyRange.bound([paths[i], 0], [paths[i], ""], false, true);
         const request = store.openCursor(range, "prev");
         request.onsuccess = () => {
           const cursor = request.result;
-          if (!cursor) {
-            results[i] = -1;
-          } else {
+          if (cursor) {
             const [, pageIndex] = cursor.key as [string, number];
             results[i] = pageIndex;
           }

@@ -969,95 +969,91 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const storagePaths = fileEntries.map((e) => e.storagePath);
       const allPageCounts = backend.countPagesBatch(storagePaths);
 
-      // Identify files needing crash recovery (page count mismatch).
-      // All such files need maxPageIndex; batch into a single call to
-      // reduce O(n) SAB bridge round-trips to O(1) during mount.
-      const recoveryIndices: number[] = [];
-      for (let i = 0; i < fileEntries.length; i++) {
-        const actualPageCount = allPageCounts[i];
-        const pagesFromMeta = fileEntries[i].meta.size > 0
-          ? Math.ceil(fileEntries[i].meta.size / PAGE_SIZE)
-          : 0;
-        if (actualPageCount !== 0 && actualPageCount !== pagesFromMeta) {
-          recoveryIndices.push(i);
-        }
-      }
-
-      // Batch maxPageIndex for all recovery files in a single call.
-      let recoveryMaxIndices: number[] = [];
-      if (recoveryIndices.length > 0) {
-        const recoveryPaths = recoveryIndices.map((i) => fileEntries[i].storagePath);
-        recoveryMaxIndices = backend.maxPageIndexBatch(recoveryPaths);
-      }
-
-      // Map from fileEntries index → maxPageIndex result
-      const maxIdxByEntry = new Map<number, number>();
-      for (let j = 0; j < recoveryIndices.length; j++) {
-        maxIdxByEntry.set(recoveryIndices[j], recoveryMaxIndices[j]);
-      }
+      // First pass: create nodes for files where page counts match metadata
+      // (the common case), and collect files that need maxPageIndex probing.
+      // The readPage probes for sparse file detection remain individual calls
+      // since they need cross-file batching which the API doesn't support.
+      // But maxPageIndex calls are batched into a single call.
+      const needsMaxIdx: number[] = []; // indices into fileEntries
+      const needsMaxIdxPaths: string[] = []; // parallel storage paths
+      // Cache readPage probe results so we don't re-probe in the second pass.
+      // true = last page exists (sparse file), false = last page missing (crash).
+      const lastPageExists: boolean[] = [];
 
       for (let i = 0; i < fileEntries.length; i++) {
         const { meta, parent, name, storagePath } = fileEntries[i];
-        const node = TOMEFS.createNode(parent, name, meta.mode, 0);
-        // Use metadata size, but verify against actual backend pages.
-        // Pages may extend beyond meta.size if writes occurred after the
-        // last metadata sync (e.g., Postgres shutdown writes during close),
-        // or may be fewer if a truncation wasn't synced before a crash.
         const actualPageCount = allPageCounts[i];
         const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
 
-        let fileSize: number;
-        if (actualPageCount === 0) {
-          fileSize = 0;
-        } else if (actualPageCount === pagesFromMeta) {
-          // Page count matches metadata — trust meta.size for sub-page precision
-          fileSize = meta.size;
+        if (actualPageCount === 0 || actualPageCount === pagesFromMeta) {
+          // Common case: page count matches metadata or file is empty.
+          // Create node immediately — no probing needed.
+          const node = TOMEFS.createNode(parent, name, meta.mode, 0);
+          node.usedBytes = actualPageCount === 0 ? 0 : meta.size;
+          node.atime = meta.atime ?? meta.mtime;
+          node.mtime = meta.mtime;
+          node.ctime = meta.ctime;
+          node._metaDirty = false;
         } else if (actualPageCount < pagesFromMeta) {
-          // Fewer pages than expected. Two possible causes:
-          // (a) Sparse file with zero-filled gaps — the last page exists but
-          //     intermediate pages were never written. Trust meta.size.
-          // (b) Crash after truncation deleted tail pages but before metadata
-          //     was updated. The last expected page is missing. Fall back to
-          //     probing for the true extent.
-          // Distinguish by probing the last page implied by meta.size.
+          // Fewer pages than expected — probe last page to distinguish
+          // sparse files from crash-truncated files.
           const lastPageIndex = pagesFromMeta - 1;
-          const highIdx = maxIdxByEntry.get(i)!;
           const lastPage = backend.readPage(storagePath, lastPageIndex);
-          if (lastPage !== null) {
-            // Last page exists — sparse file with gaps. Check if pages
-            // extend beyond the expected range (file extended after last
-            // metadata sync, then crashed before syncfs). Without this,
-            // extension pages are silently lost.
-            if (highIdx > lastPageIndex) {
-              // Pages beyond expected range — file was extended after sync
-              fileSize = (highIdx + 1) * PAGE_SIZE;
+          // Both cases need maxPageIndex: sparse files check for extension
+          // pages, crash-truncated files find the true extent.
+          needsMaxIdx.push(i);
+          needsMaxIdxPaths.push(storagePath);
+          lastPageExists.push(lastPage !== null);
+        } else {
+          // More pages than metadata expects — crash recovery. Need maxPageIndex.
+          needsMaxIdx.push(i);
+          needsMaxIdxPaths.push(storagePath);
+          lastPageExists.push(false); // not applicable for this case
+        }
+      }
+
+      // Batch maxPageIndex for all files that need probing.
+      // Reduces O(n) SAB bridge round-trips to O(1) during crash recovery.
+      if (needsMaxIdx.length > 0) {
+        const allMaxIndices = backend.maxPageIndexBatch(needsMaxIdxPaths);
+
+        for (let j = 0; j < needsMaxIdx.length; j++) {
+          const i = needsMaxIdx[j];
+          const { meta, parent, name } = fileEntries[i];
+          const actualPageCount = allPageCounts[i];
+          const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
+          const highIdx = allMaxIndices[j];
+
+          let fileSize: number;
+          if (actualPageCount < pagesFromMeta) {
+            const lastPageIndex = pagesFromMeta - 1;
+            if (lastPageExists[j]) {
+              // Last page exists — sparse file with gaps. Check if pages
+              // extend beyond the expected range (file extended after last
+              // metadata sync, then crashed before syncfs).
+              if (highIdx > lastPageIndex) {
+                fileSize = (highIdx + 1) * PAGE_SIZE;
+              } else {
+                fileSize = meta.size;
+              }
             } else {
-              // No extension — trust metadata for sub-page precision
-              fileSize = meta.size;
+              // Last page missing — crash recovery. Use maxPageIndex to
+              // find the true highest page index.
+              fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
             }
           } else {
-            // Last page missing — crash recovery. Use maxPageIndex to
-            // find the true highest page index rather than assuming
-            // pages are contiguous from index 0 (countPages only counts
-            // stored pages, not their maximum index — non-contiguous
-            // pages from allocate + crash would be lost otherwise).
+            // More pages than metadata expects: crash occurred between page
+            // writes and metadata sync.
             fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
           }
-        } else {
-          // More pages than metadata expects: crash occurred between page
-          // writes and metadata sync. Use maxPageIndex to find the true
-          // highest page index — pages may be non-contiguous if
-          // allocate/seek-past-end created sparse pages that were evicted
-          // before the crash. countPages only counts stored pages, not
-          // their maximum index.
-          const highIdx = maxIdxByEntry.get(i)!;
-          fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
+
+          const node = TOMEFS.createNode(parent, name, meta.mode, 0);
+          node.usedBytes = fileSize;
+          node.atime = meta.atime ?? meta.mtime;
+          node.mtime = meta.mtime;
+          node.ctime = meta.ctime;
+          node._metaDirty = false;
         }
-        node.usedBytes = fileSize;
-        node.atime = meta.atime ?? meta.mtime;
-        node.mtime = meta.mtime;
-        node.ctime = meta.ctime;
-        node._metaDirty = false;
       }
     }
 

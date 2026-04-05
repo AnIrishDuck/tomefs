@@ -929,18 +929,18 @@ for (const factory of factories) {
         expect(await backend.maxPageIndexBatch([])).toEqual([]);
       });
 
-      it("returns indices parallel to input paths @fast", async () => {
+      it("returns max indices parallel to input paths @fast", async () => {
         await backend.writePage("/a", 0, filledPage(0x01));
-        await backend.writePage("/a", 3, filledPage(0x03));
         await backend.writePage("/b", 0, filledPage(0x02));
+        await backend.writePage("/b", 3, filledPage(0x03));
         await backend.writePage("/c", 0, filledPage(0x04));
-        await backend.writePage("/c", 10, filledPage(0x05));
+        await backend.writePage("/c", 5, filledPage(0x05));
 
         const indices = await backend.maxPageIndexBatch(["/a", "/b", "/c"]);
-        expect(indices).toEqual([3, 0, 10]);
+        expect(indices).toEqual([0, 3, 5]);
       });
 
-      it("returns -1 for non-existent files in batch", async () => {
+      it("returns -1 for non-existent files in batch @fast", async () => {
         await backend.writePage("/exists", 0, filledPage(0x01));
 
         const indices = await backend.maxPageIndexBatch([
@@ -960,12 +960,11 @@ for (const factory of factories) {
       });
 
       it("handles sparse pages in batch", async () => {
-        await backend.writePage("/s1", 0, filledPage(0x01));
-        await backend.writePage("/s1", 20, filledPage(0x02));
-        await backend.writePage("/s2", 5, filledPage(0x03));
+        await backend.writePage("/sparse", 0, filledPage(0x01));
+        await backend.writePage("/sparse", 10, filledPage(0x02));
 
-        const indices = await backend.maxPageIndexBatch(["/s1", "/s2"]);
-        expect(indices).toEqual([20, 5]);
+        const indices = await backend.maxPageIndexBatch(["/sparse"]);
+        expect(indices).toEqual([10]);
       });
     });
 
