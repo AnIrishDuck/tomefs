@@ -113,7 +113,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    *
    * Enables O(dirty) syncfs instead of O(tree): when no orphan cleanup is
    * needed, syncfs iterates only this set instead of walking the entire
-   * node tree via persistTree + clearMetaDirty. For PGlite workloads
+   * node tree via persistTree. For PGlite workloads
    * where syncToFs is called after every query, this eliminates the
    * dominant overhead — repeated full tree walks on a large directory
    * structure with hundreds of Postgres catalog/data/WAL files.
@@ -1043,20 +1043,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
     // createNode marks parent directories dirty (timestamp updates), but
     // all metadata was just restored from the backend — nothing needs
-    // re-writing. Walk the tree and clear all dirty flags.
-    clearMetaDirty(root);
-    dirtyMetaNodes.clear();
-  }
-
-  /** Recursively clear _metaDirty on all nodes in a subtree. */
-  function clearMetaDirty(node: any): void {
-    node._metaDirty = false;
-    dirtyMetaNodes.delete(node);
-    if (node.contents) {
-      for (const name of Object.keys(node.contents)) {
-        clearMetaDirty(node.contents[name]);
-      }
+    // re-writing. Clear dirty flags on only the affected nodes via the
+    // dirty set — O(dirty) instead of O(tree).
+    for (const node of dirtyMetaNodes) {
+      node._metaDirty = false;
     }
+    dirtyMetaNodes.clear();
   }
 
   // ---------------------------------------------------------------
@@ -1280,9 +1272,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             needsCleanMarker = false;
 
             // Clear dirty flags on all nodes whose metadata was persisted.
-            // Walk the mount tree (visited nodes) and detached file nodes.
-            clearMetaDirty(mount.root);
-            for (const node of allFileNodes) {
+            // Uses the dirty set instead of walking the full tree — O(dirty)
+            // instead of O(tree) + O(files).
+            for (const node of dirtyMetaNodes) {
               node._metaDirty = false;
             }
             dirtyMetaNodes.clear();
