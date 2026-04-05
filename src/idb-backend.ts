@@ -66,6 +66,13 @@ export class IdbBackend implements StorageBackend {
 
       request.onsuccess = () => {
         this.db = request.result;
+        // If another tab opens the DB with a higher version, close gracefully
+        // so the upgrade can proceed and future operations reconnect.
+        this.db.onversionchange = () => {
+          this.db?.close();
+          this.db = null;
+          this.initPromise = null;
+        };
         resolve(this.db);
       };
 
@@ -103,6 +110,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -130,6 +138,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -146,6 +155,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -165,6 +175,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -183,6 +194,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -205,6 +217,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -230,6 +243,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -243,6 +257,7 @@ export class IdbBackend implements StorageBackend {
 
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -267,6 +282,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -290,6 +306,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -318,6 +335,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -356,6 +374,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -371,6 +390,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -394,6 +414,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -406,6 +427,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -425,6 +447,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -437,6 +460,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -454,6 +478,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -469,6 +494,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -497,6 +523,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
