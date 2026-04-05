@@ -1,18 +1,17 @@
 /**
- * Crash-recovery probe edge-case tests for PreloadBackend.doInit().
+ * Crash-recovery page discovery tests for PreloadBackend.doInit().
  *
- * The PreloadBackend uses an exponential probe + binary search algorithm
- * to discover pages that exist beyond what metadata accounts for. This
- * happens when a crash occurs after pages were written to the backend
- * but before metadata was synced.
+ * The PreloadBackend uses maxPageIndexBatch to discover the true page
+ * extent for each file, which may exceed metadata.size when a crash
+ * occurred after pages were written but before metadata was synced.
  *
- * These tests exercise boundary conditions of the probe algorithm:
- * - Power-of-2 page counts (where exponential doubling aligns exactly)
+ * These tests exercise:
+ * - Extra pages beyond metadata (crash recovery)
  * - Sub-page metadata sizes (meta.size not page-aligned)
  * - Multiple files with different orphan extents
  * - File with metadata but zero actual pages
- * - Exact boundary between exponential probe and binary search
- * - Single extra page (simplest probe case)
+ * - Sparse pages (non-contiguous indices)
+ * - Single extra page (simplest case)
  */
 import { describe, it, expect } from "vitest";
 import { MemoryBackend } from "../../src/memory-backend.js";
@@ -58,7 +57,7 @@ const baseMeta: FileMeta = {
 };
 
 /**
- * Wrapper that counts readPage calls to verify probe efficiency.
+ * Wrapper that counts readPage calls to verify efficiency.
  */
 class ReadCountingBackend implements StorageBackend {
   private inner: MemoryBackend;
@@ -134,12 +133,10 @@ class ReadCountingBackend implements StorageBackend {
   }
 }
 
-describe("PreloadBackend crash-recovery probe", () => {
-  describe("power-of-2 boundary conditions", () => {
+describe("PreloadBackend crash-recovery page discovery", () => {
+  describe("extra pages beyond metadata", () => {
     it("@fast exactly 1 extra page beyond metadata", async () => {
-      // meta says 2 pages, but 3 exist. Simplest probe: check page 2,
-      // found → lo=2, hi=3, check page 3 → missing. Binary search skips
-      // (hi - lo = 1). Load batch: just page 2 (already stored from initial check).
+      // meta says 2 pages, but 3 exist. maxPageIndex returns 2.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 3);
       await remote.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE * 2 });
@@ -151,11 +148,8 @@ describe("PreloadBackend crash-recovery probe", () => {
       expect(backend.readPage("/f", 3)).toBeNull();
     });
 
-    it("exactly 2 extra pages (triggers one probe doubling)", async () => {
+    it("exactly 2 extra pages", async () => {
       // meta says 1 page, but 3 exist (pages 0, 1, 2).
-      // Probe: check page 1 → found (lo=1, hi=2). Check page 2 → found
-      // (lo=2, hi=4). Check page 4 → missing. Binary: lo=2, hi=4, mid=3
-      // → missing → hi=3. hi-lo=1 → done. lo=2.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 3);
       await remote.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE });
@@ -167,12 +161,8 @@ describe("PreloadBackend crash-recovery probe", () => {
       expect(backend.readPage("/f", 3)).toBeNull();
     });
 
-    it("4 extra pages at power-of-2 boundary", async () => {
-      // meta says 0 pages, but 4 exist (0-3). pageCount=0.
-      // Probe: page 0 exists → stored. lo=0, hi=1.
-      // page 1 exists → lo=1, hi=2. page 2 exists → lo=2, hi=4.
-      // page 4 missing → exit. Binary: lo=2, hi=4, mid=3 → exists → lo=3.
-      // hi-lo=1 → done. Load pages 1 through 3.
+    it("4 extra pages", async () => {
+      // meta says 0 pages, but 4 exist (0-3).
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 4);
       await remote.writeMeta("/f", { ...baseMeta, size: 0 });
@@ -184,13 +174,8 @@ describe("PreloadBackend crash-recovery probe", () => {
       expect(backend.readPage("/f", 4)).toBeNull();
     });
 
-    it("8 extra pages — multiple probe doublings", async () => {
-      // meta says 1 page, 9 pages exist (0-8). pageCount=1.
-      // Probe page 1 → exists. lo=1, hi=2.
-      // page 2 → exists. lo=2, hi=4.
-      // page 4 → exists. lo=4, hi=8.
-      // page 8 → exists. lo=8, hi=16.
-      // page 16 → missing. Binary search narrows 8-16.
+    it("8 extra pages", async () => {
+      // meta says 1 page, 9 pages exist (0-8).
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 9);
       await remote.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE });
@@ -202,10 +187,8 @@ describe("PreloadBackend crash-recovery probe", () => {
       expect(backend.readPage("/f", 9)).toBeNull();
     });
 
-    it("16 extra pages — probe lands exactly on last page", async () => {
-      // meta says 0 pages, 16 pages exist (0-15). pageCount=0.
-      // The exponential probe should find hi=16 and page 16 is missing,
-      // then binary search between lo (some value) and 16 finds page 15.
+    it("16 extra pages", async () => {
+      // meta says 0 pages, 16 pages exist (0-15).
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 16);
       await remote.writeMeta("/f", { ...baseMeta, size: 0 });
@@ -220,8 +203,7 @@ describe("PreloadBackend crash-recovery probe", () => {
 
   describe("sub-page metadata sizes", () => {
     it("@fast meta.size is sub-page (partial first page) with extra pages", async () => {
-      // meta.size = 100 (sub-page), pageCount = ceil(100/8192) = 1.
-      // But 3 pages actually exist (0, 1, 2). Probe starts at page 1.
+      // meta.size = 100 (sub-page), but 3 pages actually exist.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 3);
       await remote.writeMeta("/f", { ...baseMeta, size: 100 });
@@ -234,7 +216,7 @@ describe("PreloadBackend crash-recovery probe", () => {
     });
 
     it("meta.size is exactly PAGE_SIZE (no partial page)", async () => {
-      // meta.size = PAGE_SIZE, pageCount = 1. Pages 0-4 exist.
+      // meta.size = PAGE_SIZE, but pages 0-4 exist.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 5);
       await remote.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE });
@@ -247,7 +229,7 @@ describe("PreloadBackend crash-recovery probe", () => {
     });
 
     it("meta.size is PAGE_SIZE + 1 (just over boundary)", async () => {
-      // meta.size = PAGE_SIZE + 1, pageCount = 2. Pages 0-5 exist.
+      // meta.size = PAGE_SIZE + 1, but pages 0-5 exist.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 6);
       await remote.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE + 1 });
@@ -260,7 +242,7 @@ describe("PreloadBackend crash-recovery probe", () => {
     });
 
     it("meta.size is PAGE_SIZE - 1 (just under boundary)", async () => {
-      // meta.size = PAGE_SIZE - 1, pageCount = 1. Pages 0-3 exist.
+      // meta.size = PAGE_SIZE - 1, but pages 0-3 exist.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 4);
       await remote.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE - 1 });
@@ -345,8 +327,7 @@ describe("PreloadBackend crash-recovery probe", () => {
 
     it("metadata with size > 0, some pages missing within expected range", async () => {
       // meta says 3 pages, but only pages 0 and 2 exist (page 1 missing).
-      // This simulates partial page loss. The probe for beyond-meta pages
-      // should still work correctly.
+      // This simulates partial page loss.
       const remote = new MemoryBackend();
       const d0 = new Uint8Array(PAGE_SIZE);
       d0[0] = 0xaa;
@@ -367,10 +348,9 @@ describe("PreloadBackend crash-recovery probe", () => {
     });
 
     it("pages exist beyond expected range at non-contiguous indices", async () => {
-      // meta says 1 page, pages 0 and 1 exist, but page 2 is missing
-      // and page 3 exists. The probe checks page 1 (pageCount=1),
-      // finds it, then checks page 2 — missing. So it stops at lo=1.
-      // Page 3 is NOT discovered (known limitation of contiguous probe).
+      // meta says 1 page, pages 0 and 1 exist, page 2 is missing,
+      // page 3 exists. maxPageIndex returns 3, so all indices 0-3 are
+      // loaded via readPages. The gap at page 2 returns null (sparse).
       const remote = new MemoryBackend();
       const d0 = new Uint8Array(PAGE_SIZE);
       d0[0] = 0x10;
@@ -387,15 +367,14 @@ describe("PreloadBackend crash-recovery probe", () => {
       const backend = new PreloadBackend(remote);
       await backend.init();
 
-      // Pages 0 and 1 should be loaded
+      // Pages 0, 1, and 3 should all be loaded; page 2 is a sparse gap
       expect(backend.readPage("/f", 0)![0]).toBe(0x10);
       expect(backend.readPage("/f", 1)![0]).toBe(0x20);
-      // Page 3 is NOT loaded (gap at page 2 stops the probe)
-      expect(backend.readPage("/f", 3)).toBeNull();
+      expect(backend.readPage("/f", 2)).toBeNull();
+      expect(backend.readPage("/f", 3)![0]).toBe(0x40);
     });
 
     it("large orphan count (50 pages beyond metadata)", async () => {
-      // Tests multiple exponential doublings + binary search convergence
       const remote = new MemoryBackend();
       const totalPages = 52;
       await seedPages(remote, "/f", totalPages);
@@ -422,11 +401,12 @@ describe("PreloadBackend crash-recovery probe", () => {
     });
   });
 
-  describe("probe efficiency", () => {
-    it("probe uses O(log n) readPage calls, not O(n)", async () => {
-      // 100 pages beyond metadata — should use ~14 readPage probes
-      // (log2(100) ≈ 7 for exponential + ~7 for binary search),
-      // not 100 linear scans.
+  describe("init efficiency", () => {
+    it("no per-file readPage probes — uses maxPageIndexBatch instead", async () => {
+      // With 100 pages beyond metadata, the old approach used O(log n)
+      // readPage probes per file. The new approach uses maxPageIndexBatch
+      // (one batch call) and readPages (one batch call per file), so
+      // readPage is never called during init.
       const inner = new MemoryBackend();
       await seedPages(inner, "/f", 100);
       await inner.writeMeta("/f", { ...baseMeta, size: 0 });
@@ -442,16 +422,12 @@ describe("PreloadBackend crash-recovery probe", () => {
       }
       expect(backend.readPage("/f", 100)).toBeNull();
 
-      // The probe should use far fewer than 100 readPage calls.
-      // Initial check (1) + exponential probe (~7) + binary search (~7) = ~15.
-      // Plus 1 readPage for the file's normal page loading is via readPages (not counted).
-      // Allow generous margin but confirm it's logarithmic, not linear.
-      expect(counting.readPageCount).toBeLessThan(30);
+      // No individual readPage calls should occur during init —
+      // extent discovery uses maxPageIndexBatch, page loading uses readPages.
+      expect(counting.readPageCount).toBe(0);
     });
 
-    it("no extra readPage calls when metadata matches actual extent", async () => {
-      // When no orphan pages exist, the probe should make exactly 1 extra
-      // readPage call (checking the page at pageCount, which returns null).
+    it("no readPage calls when metadata matches actual extent", async () => {
       const inner = new MemoryBackend();
       await seedPages(inner, "/f", 5);
       await inner.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE * 5 });
@@ -461,14 +437,14 @@ describe("PreloadBackend crash-recovery probe", () => {
       counting.resetCount();
       await backend.init();
 
-      // 1 readPage call to check page 5 (doesn't exist)
-      expect(counting.readPageCount).toBe(1);
+      // No individual readPage calls — everything goes through batch APIs
+      expect(counting.readPageCount).toBe(0);
     });
   });
 
-  describe("flush after probe-loaded pages", () => {
-    it("@fast probe-loaded pages are not dirty (no unnecessary flush)", async () => {
-      // Pages loaded during init via the probe should not be marked dirty.
+  describe("flush after init-loaded pages", () => {
+    it("@fast init-loaded pages are not dirty (no unnecessary flush)", async () => {
+      // Pages loaded during init should not be marked dirty.
       // They're already in the backend — writing them back wastes I/O.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 5);
@@ -482,7 +458,7 @@ describe("PreloadBackend crash-recovery probe", () => {
       expect(backend.dirtyPageCount).toBe(0);
     });
 
-    it("writing to a probe-loaded page marks it dirty correctly", async () => {
+    it("writing to an init-loaded page marks it dirty correctly", async () => {
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 3);
       await remote.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE });
@@ -490,7 +466,7 @@ describe("PreloadBackend crash-recovery probe", () => {
       const backend = new PreloadBackend(remote);
       await backend.init();
 
-      // Modify a probe-loaded page
+      // Modify an orphan page (loaded via maxPageIndex discovery)
       const modified = new Uint8Array(PAGE_SIZE);
       modified[0] = 0xff;
       backend.writePage("/f", 2, modified);
@@ -505,8 +481,8 @@ describe("PreloadBackend crash-recovery probe", () => {
       expect(page![0]).toBe(0xff);
     });
 
-    it("flush + re-init round-trip preserves probe-loaded pages", async () => {
-      // Write pages beyond metadata, init (probe loads them),
+    it("flush + re-init round-trip preserves init-loaded pages", async () => {
+      // Write pages beyond metadata, init (maxPageIndex discovers them),
       // write new data, flush, then re-init and verify everything survived.
       const remote = new MemoryBackend();
       await seedPages(remote, "/f", 5);
@@ -519,7 +495,7 @@ describe("PreloadBackend crash-recovery probe", () => {
       backend1.writeMeta("/f", { ...baseMeta, size: PAGE_SIZE * 5 });
       await backend1.flush();
 
-      // Re-init: should load all 5 pages without probe (metadata now correct)
+      // Re-init: should load all 5 pages without discovery (metadata now correct)
       const backend2 = new PreloadBackend(remote);
       await backend2.init();
 
