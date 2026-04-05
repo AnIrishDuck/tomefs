@@ -109,6 +109,13 @@ class CountingBackend implements StorageBackend {
     this.count("listFiles");
     return this.inner.listFiles();
   }
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    await this.writePages(pages);
+    await this.writeMetas(metas);
+  }
 }
 
 describe("PreloadBackend", () => {
@@ -240,6 +247,7 @@ describe("PreloadBackend", () => {
         async deleteFiles() {},
         async maxPageIndex() { return -1; },
         async maxPageIndexBatch(paths: string[]) { return paths.map(() => -1); },
+        async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await this.writePages(pages); await this.writeMetas(metas); },
       };
 
       const backend = new PreloadBackend(failOnce);
@@ -296,6 +304,7 @@ describe("PreloadBackend", () => {
         async deleteFiles(ps: string[]) { return inner.deleteFiles(ps); },
         async maxPageIndex(p: string) { return inner.maxPageIndex(p); },
         async maxPageIndexBatch(ps: string[]) { return inner.maxPageIndexBatch(ps); },
+        async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await inner.writePages(pages); await inner.writeMetas(metas); },
       };
 
       const backend = new PreloadBackend(failFirstReadMetas);
@@ -336,6 +345,7 @@ describe("PreloadBackend", () => {
         async deleteFiles() {},
         async maxPageIndex() { return -1; },
         async maxPageIndexBatch(paths: string[]) { return paths.map(() => -1); },
+        async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await this.writePages(pages); await this.writeMetas(metas); },
       };
 
       const backend = new PreloadBackend(alwaysFails);
@@ -1298,6 +1308,7 @@ describe("PreloadBackend", () => {
       async maxPageIndex(path: string) { return this.inner.maxPageIndex(path); }
       async maxPageIndexBatch(paths: string[]) { return this.inner.maxPageIndexBatch(paths); }
       async listFiles() { return this.inner.listFiles(); }
+      async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await this.writePages(pages); await this.writeMetas(metas); }
     }
 
     it("retains dirty tracking when writePages fails so retry succeeds", async () => {

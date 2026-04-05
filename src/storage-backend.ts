@@ -69,4 +69,18 @@ export interface StorageBackend {
 
   /** List all file paths that have metadata stored. */
   listFiles(): Promise<string[]>;
+
+  /**
+   * Atomically write dirty pages and metadata in a single operation.
+   *
+   * For IDB backends, this uses a single multi-store transaction spanning
+   * both the pages and metadata stores, ensuring page data and metadata
+   * are committed together. This eliminates the crash window between
+   * separate writePages + writeMetas calls during syncfs, and halves
+   * SAB bridge round-trips (2→1).
+   */
+  syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void>;
 }

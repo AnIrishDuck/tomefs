@@ -380,6 +380,35 @@ export class SabClient implements SyncStorageBackend {
     return allFiles;
   }
 
+  syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): void {
+    if (pages.length === 0 && metas.length === 0) return;
+
+    // Fast path: everything fits in a single SAB call.
+    // This is the common case — steady-state syncfs writes a handful of
+    // dirty pages + their metadata, well within the 1 MB SAB buffer.
+    if (pages.length <= this.maxBatchPages) {
+      const pageMeta = pages.map((p) => ({
+        path: p.path,
+        pageIndex: p.pageIndex,
+        dataLen: p.data.length,
+      }));
+      const chunks = pages.map((p) => p.data);
+      this.call(OpCode.SYNC_ALL, { pages: pageMeta, metas }, chunks);
+      return;
+    }
+
+    // Fallback: too many pages for a single call. Use separate writePages
+    // + writeMetas calls. This loses single-transaction atomicity for the
+    // IDB backend, but is needed to avoid SAB buffer overflow.
+    this.writePages(pages);
+    if (metas.length > 0) {
+      this.writeMetas(metas);
+    }
+  }
+
   /**
    * Send a request and block until the response arrives.
    */

@@ -189,4 +189,12 @@ export class MemoryBackend implements StorageBackend {
   async listFiles(): Promise<string[]> {
     return Array.from(this.meta.keys());
   }
+
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    await this.writePages(pages);
+    await this.writeMetas(metas);
+  }
 }

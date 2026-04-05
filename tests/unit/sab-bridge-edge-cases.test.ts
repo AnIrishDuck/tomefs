@@ -191,6 +191,14 @@ class FailingBackend implements StorageBackend {
     this.maybeThrow("listFiles");
     return this.inner.listFiles();
   }
+
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    await this.writePages(pages);
+    await this.writeMetas(metas);
+  }
 }
 
 /**
@@ -281,6 +289,14 @@ class SlowBackend implements StorageBackend {
 
   async listFiles(): Promise<string[]> {
     return this.inner.listFiles();
+  }
+
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    await this.writePages(pages);
+    await this.writeMetas(metas);
   }
 }
 

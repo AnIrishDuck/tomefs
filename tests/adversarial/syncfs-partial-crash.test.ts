@@ -185,6 +185,14 @@ class CrashAfterNOpsSyncBackend implements SyncStorageBackend {
     this.tick();
     this.inner.renameFile(oldPath, newPath);
   }
+
+  syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): void {
+    this.writePages(pages);
+    this.writeMetas(metas);
+  }
 }
 
 async function mountTome(backend: SyncStorageBackend, maxPages?: number) {

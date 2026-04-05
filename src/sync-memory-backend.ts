@@ -162,4 +162,12 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   listFiles(): string[] {
     return [...this.meta.keys()];
   }
+
+  syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): void {
+    this.writePages(pages);
+    this.writeMetas(metas);
+  }
 }
