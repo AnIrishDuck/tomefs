@@ -72,4 +72,16 @@ export interface SyncStorageBackend {
 
   /** List all paths that have metadata stored. */
   listFiles(): string[];
+
+  /**
+   * Atomically write dirty pages and metadata in a single operation.
+   *
+   * Through the SAB bridge, this combines what would be separate
+   * writePages + writeMetas calls into a single round-trip.
+   * For IDB, the worker executes both in one multi-store transaction.
+   */
+  syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): void;
 }

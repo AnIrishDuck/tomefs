@@ -437,5 +437,12 @@ function createTrackingBackend(
     listFiles() {
       return inner.listFiles();
     },
+    syncAll(
+      pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+      metas: Array<{ path: string; meta: FileMeta }>,
+    ): void {
+      inner.writePages(pages);
+      inner.writeMetas(metas);
+    },
   };
 }

@@ -460,6 +460,15 @@ export class OpfsBackend implements StorageBackend {
     return paths;
   }
 
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    // OPFS has no multi-operation transactions, so execute sequentially.
+    await this.writePages(pages);
+    await this.writeMetas(metas);
+  }
+
   /**
    * Remove all data and metadata. The backend should not be used after this.
    */

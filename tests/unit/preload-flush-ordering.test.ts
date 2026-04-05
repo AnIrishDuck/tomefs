@@ -106,6 +106,13 @@ class OrderTrackingBackend implements StorageBackend {
   async listFiles() {
     return this.inner.listFiles();
   }
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    await this.writePages(pages);
+    await this.writeMetas(metas);
+  }
 }
 
 /**
@@ -193,6 +200,13 @@ class CrashAfterNOpsBackend implements StorageBackend {
   }
   async listFiles() {
     return this.inner.listFiles();
+  }
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    await this.writePages(pages);
+    await this.writeMetas(metas);
   }
 }
 

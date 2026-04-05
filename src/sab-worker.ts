@@ -393,6 +393,35 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.SYNC_ALL: {
+        const pageMeta = params.pages as Array<{
+          path: string;
+          pageIndex: number;
+          dataLen: number;
+        }>;
+        const metaEntries = params.metas as Array<{
+          path: string;
+          meta: FileMeta;
+        }>;
+        let offset = 0;
+        const pages = pageMeta.map((pm) => {
+          if (pm.dataLen < 0 || offset + pm.dataLen > binary.length) {
+            throw new Error(
+              `SYNC_ALL: dataLen ${pm.dataLen} at offset ${offset} exceeds binary length ${binary.length}`,
+            );
+          }
+          const data = binary.slice(offset, offset + pm.dataLen);
+          offset += pm.dataLen;
+          return { path: pm.path, pageIndex: pm.pageIndex, data };
+        });
+        await this.backend.syncAll(pages, metaEntries);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          ok: true,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       default:
         throw new Error(`Unknown opcode: ${opcode}`);
     }

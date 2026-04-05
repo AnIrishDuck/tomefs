@@ -40,6 +40,7 @@ export const OpCode = {
   LIST_FILES_RANGE: 18,
   COUNT_PAGES_BATCH: 19,
   MAX_PAGE_INDEX_BATCH: 20,
+  SYNC_ALL: 21,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];

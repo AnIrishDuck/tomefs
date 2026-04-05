@@ -392,6 +392,14 @@ export class PreloadBackend implements SyncStorageBackend {
     return [...this.meta.keys()];
   }
 
+  syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): void {
+    this.writePages(pages);
+    this.writeMetas(metas);
+  }
+
   // --- Flush: persist dirty state back to the async backend ---
 
   /** Number of dirty pages pending flush. */

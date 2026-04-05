@@ -60,6 +60,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     countPagesBatch: async (ps) => sync.countPagesBatch(ps),
     maxPageIndex: async (p) => sync.maxPageIndex(p),
     maxPageIndexBatch: async (ps) => sync.maxPageIndexBatch(ps),
+    syncAll: async (pages, metas) => sync.syncAll(pages, metas),
   };
 }
 

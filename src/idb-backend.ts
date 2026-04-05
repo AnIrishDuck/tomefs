@@ -479,6 +479,34 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    if (pages.length === 0 && metas.length === 0) return;
+
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      // Single transaction spanning both stores — pages and metadata
+      // are committed atomically. A crash can never leave pages updated
+      // without their corresponding metadata (or vice versa).
+      const tx = db.transaction([PAGES_STORE, META_STORE], "readwrite");
+      const pageStore = tx.objectStore(PAGES_STORE);
+      const metaStore = tx.objectStore(META_STORE);
+
+      for (const { path, pageIndex, data } of pages) {
+        pageStore.put(new Uint8Array(data), this.pageKey(path, pageIndex));
+      }
+
+      for (const { path, meta } of metas) {
+        metaStore.put({ ...meta }, path);
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   /** Close the database connection. */
   close(): void {
     if (this.db) {

@@ -473,6 +473,44 @@ export class SyncPageCache {
   }
 
   /**
+   * Collect all dirty pages and clear their dirty flags without writing
+   * to the backend. Returns the pages that would have been flushed.
+   *
+   * Used by tomefs syncfs to combine dirty pages with metadata into a
+   * single backend.syncAll() call, reducing SAB round-trips from 2→1
+   * and enabling atomic IDB commits (pages + metadata in one transaction).
+   */
+  collectDirtyPages(): Array<{
+    path: string;
+    pageIndex: number;
+    data: Uint8Array;
+  }> {
+    if (this.dirtyKeys.size === 0) return [];
+
+    const dirtyPages: Array<{
+      path: string;
+      pageIndex: number;
+      data: Uint8Array;
+    }> = [];
+
+    for (const key of this.dirtyKeys) {
+      const page = this.cache.get(key)!;
+      dirtyPages.push({
+        path: page.path,
+        pageIndex: page.pageIndex,
+        data: page.data,
+      });
+      page.dirty = false;
+    }
+
+    this._flushes += dirtyPages.length;
+    this.dirtyKeys.clear();
+    this.dirtyFileKeys.clear();
+
+    return dirtyPages;
+  }
+
+  /**
    * Evict all cached pages for a file. Dirty pages are flushed first.
    * O(pages-for-file) via filePages index.
    */

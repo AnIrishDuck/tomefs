@@ -1119,13 +1119,17 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             return;
           }
 
-          pageCache.flushAll();
-
           if (!needsOrphanCleanup) {
             // Incremental path: only persist metadata for dirty nodes.
             // O(dirty) instead of O(tree-size). This is the common case
             // for steady-state PGlite workloads where most queries only
             // modify a few files (WAL + heap + index) out of hundreds.
+            //
+            // Collect dirty pages without flushing, then combine with
+            // dirty metadata into a single backend.syncAll() call. This
+            // halves SAB bridge round-trips (2→1) and for IDB backends
+            // writes pages + metadata in a single atomic transaction.
+            const dirtyPages = pageCache.collectDirtyPages();
             const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
             const mountPrefix = mount.mountpoint || "";
 
@@ -1178,8 +1182,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               node._metaDirty = false;
             }
 
-            if (metaBatch.length > 0) {
-              backend.writeMetas(metaBatch);
+            if (dirtyPages.length > 0 || metaBatch.length > 0) {
+              backend.syncAll(dirtyPages, metaBatch);
             }
             dirtyMetaNodes.clear();
           } else {
@@ -1187,11 +1191,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             // (after rename/unlink operations). Builds currentPaths set to
             // detect stale backend entries.
             //
-            // Persist the full tree first, then clean up stale entries.
+            // Collect dirty pages first, then build the metadata batch,
+            // then write both atomically via syncAll. Orphan cleanup
+            // follows as a separate operation.
+            //
             // This ordering is critical for crash safety with IDB: if the
-            // process is killed mid-sync (e.g., tab close), current metadata
-            // is already written. Worst case is stale orphan entries that get
-            // cleaned up on the next sync — never metadata loss.
+            // process is killed mid-sync (e.g., tab close), current data
+            // is already written. Worst case is stale orphan entries that
+            // get cleaned up on the next sync — never data loss.
+            const dirtyPages = pageCache.collectDirtyPages();
             const currentPaths = new Set<string>();
             const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
             const visited = persistTree(mount.root, "/", currentPaths, metaBatch);
@@ -1209,9 +1217,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               if (node.unlinked) continue;
               const path = nodeStoragePath(node, mountPrefix);
               currentPaths.add(path);
-              // flushAll() already flushed dirty pages, but detached nodes
-              // may not have been flushed if their storagePath differs.
-              pageCache.flushFile(node.storagePath);
               // Only persist metadata when dirty — avoids redundant backend
               // writes for detached nodes that haven't changed since last sync.
               if (node._metaDirty) {
@@ -1270,10 +1275,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               }
             }
 
-            // Batch-write all collected metadata in a single backend call.
-            // Through the SAB bridge, this reduces O(n) round-trips to O(1).
-            if (metaBatch.length > 0) {
-              backend.writeMetas(metaBatch);
+            // Write dirty pages + metadata atomically via syncAll.
+            // For IDB, this is a single multi-store transaction.
+            if (dirtyPages.length > 0 || metaBatch.length > 0) {
+              backend.syncAll(dirtyPages, metaBatch);
             }
 
             // Clear dirty flags on all nodes whose metadata was persisted.
