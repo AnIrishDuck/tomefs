@@ -96,6 +96,26 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   // flag since a crash between their backend writes could leave orphans.
   let needsOrphanCleanup = true;
 
+  /**
+   * Set of nodes with dirty metadata (not yet persisted to the backend).
+   *
+   * Enables O(dirty) syncfs instead of O(tree): when no orphan cleanup is
+   * needed, syncfs iterates only this set instead of walking the entire
+   * node tree via persistTree + clearMetaDirty. For PGlite workloads
+   * where syncToFs is called after every query, this eliminates the
+   * dominant overhead — repeated full tree walks on a large directory
+   * structure with hundreds of Postgres catalog/data/WAL files.
+   */
+  const dirtyMetaNodes = new Set<any>();
+
+  /** Mark a node's metadata as dirty and add it to the dirty set. */
+  function markMetaDirty(node: any): void {
+    if (!node._metaDirty) {
+      node._metaDirty = true;
+      dirtyMetaNodes.add(node);
+    }
+  }
+
   // ---------------------------------------------------------------
   // Page-cached file I/O
   // ---------------------------------------------------------------
@@ -301,12 +321,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     for (const key of ["mode", "atime", "mtime", "ctime"] as const) {
       if (attr[key] != null) {
         node[key] = attr[key];
-        node._metaDirty = true;
+        markMetaDirty(node);
       }
     }
     if (attr.size !== undefined) {
       resizeFileStorage(node, attr.size);
-      node._metaDirty = true;
+      markMetaDirty(node);
     }
   }
 
@@ -445,9 +465,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     old_node.name = new_name;
     const now = Date.now();
     new_dir.ctime = new_dir.mtime = now;
-    new_dir._metaDirty = true;
+    markMetaDirty(new_dir);
     old_parent.ctime = old_parent.mtime = now;
-    old_parent._metaDirty = true;
+    markMetaDirty(old_parent);
   }
 
   function unlink(parent: any, name: string) {
@@ -497,7 +517,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     }
     delete parent.contents[name];
     parent.ctime = parent.mtime = Date.now();
-    parent._metaDirty = true;
+    markMetaDirty(parent);
   }
 
   function rmdir(parent: any, name: string) {
@@ -511,7 +531,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     backend.deleteMeta(sp);
     delete parent.contents[name];
     parent.ctime = parent.mtime = Date.now();
-    parent._metaDirty = true;
+    markMetaDirty(parent);
   }
 
   /** Compute a storage path for a node given its parent and name. */
@@ -677,7 +697,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (!length) return 0;
       const node = stream.node;
       node.mtime = node.ctime = Date.now();
-      node._metaDirty = true;
+      markMetaDirty(node);
       return writePages(node, buffer, offset, length, position);
     },
 
@@ -1045,11 +1065,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // all metadata was just restored from the backend — nothing needs
     // re-writing. Walk the tree and clear all dirty flags.
     clearMetaDirty(root);
+    dirtyMetaNodes.clear();
   }
 
   /** Recursively clear _metaDirty on all nodes in a subtree. */
   function clearMetaDirty(node: any): void {
     node._metaDirty = false;
+    dirtyMetaNodes.delete(node);
     if (node.contents) {
       for (const name of Object.keys(node.contents)) {
         clearMetaDirty(node.contents[name]);
@@ -1083,113 +1105,186 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     syncfs(mount: any, populate: boolean, callback: (err?: Error | null) => void) {
       try {
         if (!populate) {
-          pageCache.flushAll();
-          // Persist the full tree first, then clean up stale entries.
-          // This ordering is critical for crash safety with IDB: if the
-          // process is killed mid-sync (e.g., tab close), current metadata
-          // is already written. Worst case is stale orphan entries that get
-          // cleaned up on the next sync — never metadata loss.
-          const currentPaths = new Set<string>();
-          const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
-          const visited = persistTree(mount.root, "/", currentPaths, metaBatch);
-
-          // Persist "detached" file nodes — nodes created via tomefs's
-          // createNode but parented in MEMFS's directory tree instead of
-          // the tomefs mount root. This happens with PGlite's MemoryFS
-          // preloading, where Emscripten's path resolution routes through
-          // MEMFS parent nodes. These nodes have tomefs stream_ops and
-          // storagePaths, so reads/writes go through the page cache
-          // correctly, but they don't appear in mount.root's subtree.
-          const mountPrefix = mount.mountpoint || "";
-          for (const node of allFileNodes) {
-            if (visited.has(node)) continue;
-            if (node.unlinked) continue;
-            const path = nodeStoragePath(node, mountPrefix);
-            currentPaths.add(path);
-            // flushAll() already flushed dirty pages, but detached nodes
-            // may not have been flushed if their storagePath differs.
-            pageCache.flushFile(node.storagePath);
-            // Only persist metadata when dirty — avoids redundant backend
-            // writes for detached nodes that haven't changed since last sync.
-            if (node._metaDirty) {
-              metaBatch.push({
-                path,
-                meta: {
-                  size: node.usedBytes,
-                  mode: node.mode,
-                  ctime: node.ctime,
-                  mtime: node.mtime,
-                  atime: node.atime,
-                },
-              });
-            }
+          // Fast path: nothing to sync — no dirty pages, no dirty metadata,
+          // and no orphan cleanup needed. This is the common case when
+          // PGlite calls syncToFs after read-only queries. Avoids the
+          // O(tree-size) persistTree walk that otherwise dominates syncfs
+          // cost for databases with hundreds of files.
+          if (
+            dirtyMetaNodes.size === 0 &&
+            pageCache.dirtyCount === 0 &&
+            !needsOrphanCleanup
+          ) {
+            callback(null);
+            return;
           }
 
-          // Also persist parent directories for detached nodes
-          // so restoreTree can recreate the full tree structure.
-          // Use currentPaths (in-memory set) instead of backend.readMeta()
-          // to check for already-collected directories. This avoids O(depth)
-          // synchronous backend reads per detached node — each of which is
-          // a SAB bridge round-trip in production.
-          for (const node of allFileNodes) {
-            if (visited.has(node)) continue;
-            if (node.unlinked) continue;
-            // Walk up from node's parent to the mount boundary,
-            // persisting any directories not already collected.
-            let dir = node.parent;
-            while (dir && dir.parent && dir.parent !== dir) {
-              const dirPath = nodeStoragePath(dir, mountPrefix);
-              if (currentPaths.has(dirPath)) break; // already collected
-              currentPaths.add(dirPath);
-              if (FS.isDir(dir.mode)) {
+          pageCache.flushAll();
+
+          if (!needsOrphanCleanup) {
+            // Incremental path: only persist metadata for dirty nodes.
+            // O(dirty) instead of O(tree-size). This is the common case
+            // for steady-state PGlite workloads where most queries only
+            // modify a few files (WAL + heap + index) out of hundreds.
+            const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
+            const mountPrefix = mount.mountpoint || "";
+
+            for (const node of dirtyMetaNodes) {
+              // Skip fully cleaned-up unlinked nodes
+              if (node.unlinked && node.openCount === 0) continue;
+
+              let path: string;
+              if (FS.isFile(node.mode)) {
+                path = node.storagePath;
+              } else {
+                path = nodeStoragePath(node, mountPrefix);
+              }
+
+              if (FS.isFile(node.mode)) {
                 metaBatch.push({
-                  path: dirPath,
+                  path,
+                  meta: {
+                    size: node.usedBytes,
+                    mode: node.mode,
+                    ctime: node.ctime,
+                    mtime: node.mtime,
+                    atime: node.atime,
+                  },
+                });
+              } else if (FS.isLink(node.mode)) {
+                metaBatch.push({
+                  path,
                   meta: {
                     size: 0,
-                    mode: dir.mode,
-                    ctime: dir.ctime,
-                    mtime: dir.mtime,
-                    atime: dir.atime,
+                    mode: node.mode,
+                    ctime: node.ctime,
+                    mtime: node.mtime,
+                    atime: node.atime,
+                    link: node.link,
+                  },
+                });
+              } else if (FS.isDir(node.mode)) {
+                metaBatch.push({
+                  path,
+                  meta: {
+                    size: 0,
+                    mode: node.mode,
+                    ctime: node.ctime,
+                    mtime: node.mtime,
+                    atime: node.atime,
                   },
                 });
               }
-              dir = dir.parent;
+              node._metaDirty = false;
             }
-          }
 
-          // Preserve /__deleted_* paths for unlinked nodes that still have
-          // open fds. These have marker metadata in the backend; without
-          // adding them to currentPaths, orphan cleanup would delete their
-          // pages while fds are still reading them.
-          for (const node of allFileNodes) {
-            if (node.unlinked && node.openCount > 0) {
-              currentPaths.add(node.storagePath);
+            if (metaBatch.length > 0) {
+              backend.writeMetas(metaBatch);
             }
-          }
+            dirtyMetaNodes.clear();
+          } else {
+            // Full tree walk path: needed when orphan cleanup is required
+            // (after rename/unlink operations). Builds currentPaths set to
+            // detect stale backend entries.
+            //
+            // Persist the full tree first, then clean up stale entries.
+            // This ordering is critical for crash safety with IDB: if the
+            // process is killed mid-sync (e.g., tab close), current metadata
+            // is already written. Worst case is stale orphan entries that get
+            // cleaned up on the next sync — never metadata loss.
+            const currentPaths = new Set<string>();
+            const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
+            const visited = persistTree(mount.root, "/", currentPaths, metaBatch);
 
-          // Batch-write all collected metadata in a single backend call.
-          // Through the SAB bridge, this reduces O(n) round-trips to O(1).
-          if (metaBatch.length > 0) {
-            backend.writeMetas(metaBatch);
-          }
+            // Persist "detached" file nodes — nodes created via tomefs's
+            // createNode but parented in MEMFS's directory tree instead of
+            // the tomefs mount root. This happens with PGlite's MemoryFS
+            // preloading, where Emscripten's path resolution routes through
+            // MEMFS parent nodes. These nodes have tomefs stream_ops and
+            // storagePaths, so reads/writes go through the page cache
+            // correctly, but they don't appear in mount.root's subtree.
+            const mountPrefix = mount.mountpoint || "";
+            for (const node of allFileNodes) {
+              if (visited.has(node)) continue;
+              if (node.unlinked) continue;
+              const path = nodeStoragePath(node, mountPrefix);
+              currentPaths.add(path);
+              // flushAll() already flushed dirty pages, but detached nodes
+              // may not have been flushed if their storagePath differs.
+              pageCache.flushFile(node.storagePath);
+              // Only persist metadata when dirty — avoids redundant backend
+              // writes for detached nodes that haven't changed since last sync.
+              if (node._metaDirty) {
+                metaBatch.push({
+                  path,
+                  meta: {
+                    size: node.usedBytes,
+                    mode: node.mode,
+                    ctime: node.ctime,
+                    mtime: node.mtime,
+                    atime: node.atime,
+                  },
+                });
+              }
+            }
 
-          // Clear dirty flags on all nodes whose metadata was persisted.
-          // Walk the mount tree (visited nodes) and detached file nodes.
-          clearMetaDirty(mount.root);
-          for (const node of allFileNodes) {
-            node._metaDirty = false;
-          }
+            // Also persist parent directories for detached nodes
+            // so restoreTree can recreate the full tree structure.
+            // Use currentPaths (in-memory set) instead of backend.readMeta()
+            // to check for already-collected directories. This avoids O(depth)
+            // synchronous backend reads per detached node — each of which is
+            // a SAB bridge round-trip in production.
+            for (const node of allFileNodes) {
+              if (visited.has(node)) continue;
+              if (node.unlinked) continue;
+              // Walk up from node's parent to the mount boundary,
+              // persisting any directories not already collected.
+              let dir = node.parent;
+              while (dir && dir.parent && dir.parent !== dir) {
+                const dirPath = nodeStoragePath(dir, mountPrefix);
+                if (currentPaths.has(dirPath)) break; // already collected
+                currentPaths.add(dirPath);
+                if (FS.isDir(dir.mode)) {
+                  metaBatch.push({
+                    path: dirPath,
+                    meta: {
+                      size: 0,
+                      mode: dir.mode,
+                      ctime: dir.ctime,
+                      mtime: dir.mtime,
+                      atime: dir.atime,
+                    },
+                  });
+                }
+                dir = dir.parent;
+              }
+            }
 
-          // Delete metadata and orphaned page data for paths no longer in the tree.
-          // Page data can become orphaned if the process crashes between an unlink
-          // (which deletes pages) and the next syncfs (which updates metadata).
-          // On restart, restoreTree recreates the file from stale metadata, but
-          // the pages may already be gone — or they may still exist if the crash
-          // happened before backend.deleteFile completed.  Either way, clean up both.
-          //
-          // Skip this scan when no orphans are possible — avoids a full
-          // backend.listFiles() round-trip on every sync (the common case).
-          if (needsOrphanCleanup) {
+            // Preserve /__deleted_* paths for unlinked nodes that still have
+            // open fds. These have marker metadata in the backend; without
+            // adding them to currentPaths, orphan cleanup would delete their
+            // pages while fds are still reading them.
+            for (const node of allFileNodes) {
+              if (node.unlinked && node.openCount > 0) {
+                currentPaths.add(node.storagePath);
+              }
+            }
+
+            // Batch-write all collected metadata in a single backend call.
+            // Through the SAB bridge, this reduces O(n) round-trips to O(1).
+            if (metaBatch.length > 0) {
+              backend.writeMetas(metaBatch);
+            }
+
+            // Clear dirty flags on all nodes whose metadata was persisted.
+            // Walk the mount tree (visited nodes) and detached file nodes.
+            clearMetaDirty(mount.root);
+            for (const node of allFileNodes) {
+              node._metaDirty = false;
+            }
+            dirtyMetaNodes.clear();
+
+            // Delete metadata and orphaned page data for paths no longer in the tree.
             const orphanPaths: string[] = [];
             for (const path of backend.listFiles()) {
               if (!currentPaths.has(path)) {
@@ -1246,12 +1341,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       }
 
       node.atime = node.mtime = node.ctime = Date.now();
-      node._metaDirty = true;
+      markMetaDirty(node);
 
       if (parent) {
         parent.contents[name] = node;
         parent.atime = parent.mtime = parent.ctime = node.atime;
-        parent._metaDirty = true;
+        markMetaDirty(parent);
       }
 
       return node;

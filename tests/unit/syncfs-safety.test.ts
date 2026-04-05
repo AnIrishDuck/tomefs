@@ -545,10 +545,11 @@ describe("syncfs detached node handling", () => {
     // the parent's contents and re-parenting it under a MEMFS directory.
     const fileNode = tomefs.createNode(mountNode, "detached", 0o100666, 0);
 
-    // Write initial data via the page cache
-    const path = fileNode.storagePath;
-    tomefs.pageCache.write(path, encode("initial"), 0, 7, 0, 0);
-    fileNode.usedBytes = 7;
+    // Write initial data and open a fd BEFORE detaching — path resolution
+    // won't work after detachment since the node isn't in Emscripten's
+    // nameTable under the new parent. Keep the fd for later writes.
+    const fd = FS.open(`${MOUNT}/detached`, O.RDWR);
+    FS.write(fd, encode("initial"), 0, 7, 0);
 
     // Remove from mount tree so persistTree won't find it
     delete mountNode.contents["detached"];
@@ -563,11 +564,6 @@ describe("syncfs detached node handling", () => {
 
     // First sync — should persist the detached node's metadata
     syncfs(FS, tomefs);
-    const meta1 = backend.readMeta(
-      // The detached node's metadata path is computed via nodeStoragePath,
-      // which walks up through the MEMFS parent chain
-      path,
-    );
     // The detached node may or may not be found by nodeStoragePath depending
     // on mount prefix stripping. Check the backend for any metadata with size 7.
     const allFiles = backend.listFiles();
@@ -576,18 +572,18 @@ describe("syncfs detached node handling", () => {
       .find((f) => f.meta && f.meta.size === 7);
     expect(detachedMeta).toBeDefined();
 
-    // Modify the file's size (simulate Postgres writing more data).
-    // Set _metaDirty to simulate a real write through stream_ops, which
-    // marks metadata dirty when updating mtime/ctime/size.
-    const detachedPath = fileNode.storagePath;
-    tomefs.pageCache.write(detachedPath, encode("much longer data"), 0, 16, 0, 7);
-    fileNode.usedBytes = 16;
-    fileNode._metaDirty = true;
+    // Write more data through the open fd — this goes through stream_ops.write
+    // which marks metadata dirty via markMetaDirty(). Using the FS API
+    // instead of direct pageCache access ensures dirty tracking works with
+    // the incremental syncfs optimization (dirtyMetaNodes set).
+    FS.write(fd, encode("much longer data"), 0, 16, 0);
+    FS.close(fd);
 
     // Second sync — metadata MUST be updated (this was the bug)
     syncfs(FS, tomefs);
 
-    const updatedMeta = allFiles
+    const updatedFiles = backend.listFiles();
+    const updatedMeta = updatedFiles
       .map((f) => ({ path: f, meta: backend.readMeta(f) }))
       .find((f) => f.meta && f.meta.size === 16);
     expect(updatedMeta).toBeDefined();
