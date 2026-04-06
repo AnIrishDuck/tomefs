@@ -19,14 +19,20 @@ function isNotFoundError(err: unknown): boolean {
 const PAGES_DIR = "pages";
 const META_DIR = "meta";
 
+/** Precomputed hex lookup table — avoids per-byte toString(16) + padStart. */
+const HEX_TABLE: string[] = new Array(256);
+for (let i = 0; i < 256; i++) {
+  HEX_TABLE[i] = i.toString(16).padStart(2, "0");
+}
+
 /** Encode a virtual file path as a hex string safe for use as an OPFS name. */
 function encodePath(path: string): string {
   const bytes = new TextEncoder().encode(path);
-  let hex = "";
-  for (const b of bytes) {
-    hex += b.toString(16).padStart(2, "0");
+  const parts = new Array<string>(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    parts[i] = HEX_TABLE[bytes[i]];
   }
-  return hex;
+  return parts.join("");
 }
 
 /** Decode a hex-encoded OPFS name back to the original virtual file path. */
@@ -178,10 +184,41 @@ export class OpfsBackend implements StorageBackend {
       await this.writePage(pages[0].path, pages[0].pageIndex, pages[0].data);
       return;
     }
+
+    // Group pages by file path so each unique path gets a single
+    // getFileDir call instead of one per page. During syncfs, many
+    // dirty pages often belong to the same file (e.g., WAL, heap),
+    // so this reduces redundant OPFS directory handle lookups.
+    const byPath = new Map<
+      string,
+      Array<{ pageIndex: number; data: Uint8Array }>
+    >();
+    for (const { path, pageIndex, data } of pages) {
+      let group = byPath.get(path);
+      if (!group) {
+        group = [];
+        byPath.set(path, group);
+      }
+      group.push({ pageIndex, data });
+    }
+
     await Promise.all(
-      pages.map(({ path, pageIndex, data }) =>
-        this.writePage(path, pageIndex, data),
-      ),
+      [...byPath.entries()].map(async ([path, group]) => {
+        const fileDir = await this.getFileDir(path, true);
+        await Promise.all(
+          group.map(async ({ pageIndex, data }) => {
+            const handle = await fileDir!.getFileHandle(String(pageIndex), {
+              create: true,
+            });
+            const writable = await handle.createWritable();
+            try {
+              await writable.write(new Uint8Array(data));
+            } finally {
+              await writable.close();
+            }
+          }),
+        );
+      }),
     );
   }
 
