@@ -190,6 +190,52 @@ describe("restoreTree: non-contiguous pages (allocate + crash)", () => {
     FS2.close(s2);
   });
 
+  it("recovers when page count matches metadata but pages are shifted @fast", async () => {
+    // Edge case: countPages == pagesFromMeta, but pages are at wrong indices.
+    // A truncate-then-extend could leave pages at non-contiguous positions
+    // with the same count. The old countPagesBatch-based restoreTree would
+    // fast-path this as "count matches → trust metadata" and miss the gap.
+    //
+    // Scenario: meta says 3 pages, backend has pages [0, 1, 4] (count = 3).
+    // Old code: countPages(3) == pagesFromMeta(3) → trust meta.size (WRONG).
+    // New code: maxPageIndex(4) > lastPageIndex(2) → extend to 5 pages.
+    const { FS, tomefs } = await mountTome(backend);
+    const data = new Uint8Array(PAGE_SIZE * 3);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 13) & 0xff;
+    const s = FS.open(`${MOUNT}/shifted`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, data, 0, data.length);
+    FS.close(s);
+    syncAndUnmount(FS, tomefs);
+
+    // Simulate: page 2 was deleted and page 4 was written (truncate + extend)
+    // but syncfs didn't run before crash.
+    backend.deletePagesFrom("/shifted", 2); // delete pages 2
+    backend.writePage("/shifted", 4, new Uint8Array(PAGE_SIZE).fill(0xff));
+
+    // Backend: pages [0, 1, 4], count = 3 == pagesFromMeta = 3
+    expect(backend.countPages("/shifted")).toBe(3);
+    expect(backend.maxPageIndex("/shifted")).toBe(4);
+
+    const { FS: FS2 } = await mountTome(backend);
+    const stat = FS2.stat(`${MOUNT}/shifted`);
+
+    // Must cover page 4 — not trust stale metadata
+    expect(stat.size).toBe(5 * PAGE_SIZE);
+
+    // Original pages 0, 1 intact
+    const buf = new Uint8Array(PAGE_SIZE * 2);
+    const s2 = FS2.open(`${MOUNT}/shifted`, O.RDONLY);
+    FS2.read(s2, buf, 0, PAGE_SIZE * 2, 0);
+    expect(buf).toEqual(data.subarray(0, PAGE_SIZE * 2));
+
+    // Page 4 readable with correct data
+    const buf4 = new Uint8Array(PAGE_SIZE);
+    FS2.read(s2, buf4, 0, PAGE_SIZE, 4 * PAGE_SIZE);
+    expect(buf4[0]).toBe(0xff);
+
+    FS2.close(s2);
+  });
+
   it("does not affect normal recovery (contiguous pages beyond metadata)", async () => {
     // Standard crash recovery: pages 0-3 exist, meta says 2 pages.
     // countPages = 4, which equals max index + 1. No bug here.
