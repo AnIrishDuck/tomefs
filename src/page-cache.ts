@@ -479,6 +479,69 @@ export class PageCache {
   }
 
   /**
+   * Collect all dirty pages without clearing their dirty flags.
+   *
+   * Used to combine dirty pages with metadata into a single backend
+   * write (e.g., syncAll), reducing round-trips and enabling atomic
+   * commits (pages + metadata in one transaction).
+   *
+   * Call commitDirtyPages() after the backend write succeeds to clear
+   * dirty flags. This two-phase approach preserves dirty state if the
+   * write fails (e.g., IDB quota exceeded, crash during syncAll), so
+   * the next sync retries the flush instead of silently losing data.
+   */
+  collectDirtyPages(): Array<{
+    path: string;
+    pageIndex: number;
+    data: Uint8Array;
+  }> {
+    if (this.dirtyKeys.size === 0) return [];
+
+    const dirtyPages: Array<{
+      path: string;
+      pageIndex: number;
+      data: Uint8Array;
+    }> = [];
+
+    for (const key of this.dirtyKeys) {
+      const page = this.cache.get(key)!;
+      dirtyPages.push({
+        path: page.path,
+        pageIndex: page.pageIndex,
+        data: page.data,
+      });
+    }
+
+    return dirtyPages;
+  }
+
+  /**
+   * Clear dirty flags for pages previously returned by collectDirtyPages.
+   *
+   * Only clears pages that are still in the cache and still dirty —
+   * pages dirtied between collectDirtyPages and commitDirtyPages are
+   * preserved for the next sync cycle.
+   */
+  commitDirtyPages(
+    pages: Array<{ path: string; pageIndex: number }>,
+  ): void {
+    for (const { path, pageIndex } of pages) {
+      const key = pageKeyStr(path, pageIndex);
+      const page = this.cache.get(key);
+      if (page && page.dirty) {
+        page.dirty = false;
+        this.dirtyKeys.delete(key);
+        const fileSet = this.dirtyFileKeys.get(path);
+        if (fileSet) {
+          fileSet.delete(key);
+          if (fileSet.size === 0) this.dirtyFileKeys.delete(path);
+        }
+      }
+    }
+    this._flushes += pages.length;
+  }
+
+  /**
    * Evict all cached pages for a file. Dirty pages are flushed first.
    * O(pages-for-file) via filePages index.
    */
