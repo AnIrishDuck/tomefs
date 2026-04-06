@@ -971,14 +971,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
       // First pass: create nodes for files where page counts match metadata
       // (the common case), and collect files that need maxPageIndex probing.
-      // The readPage probes for sparse file detection remain individual calls
-      // since they need cross-file batching which the API doesn't support.
-      // But maxPageIndex calls are batched into a single call.
+      // maxPageIndex calls are batched into a single backend call.
       const needsMaxIdx: number[] = []; // indices into fileEntries
       const needsMaxIdxPaths: string[] = []; // parallel storage paths
-      // Cache readPage probe results so we don't re-probe in the second pass.
-      // true = last page exists (sparse file), false = last page missing (crash).
-      const lastPageExists: boolean[] = [];
 
       for (let i = 0; i < fileEntries.length; i++) {
         const { meta, parent, name, storagePath } = fileEntries[i];
@@ -994,57 +989,49 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           node.mtime = meta.mtime;
           node.ctime = meta.ctime;
           node._metaDirty = false;
-        } else if (actualPageCount < pagesFromMeta) {
-          // Fewer pages than expected — probe last page to distinguish
-          // sparse files from crash-truncated files.
-          const lastPageIndex = pagesFromMeta - 1;
-          const lastPage = backend.readPage(storagePath, lastPageIndex);
-          // Both cases need maxPageIndex: sparse files check for extension
-          // pages, crash-truncated files find the true extent.
-          needsMaxIdx.push(i);
-          needsMaxIdxPaths.push(storagePath);
-          lastPageExists.push(lastPage !== null);
         } else {
-          // More pages than metadata expects — crash recovery. Need maxPageIndex.
+          // Page count mismatch: either fewer pages (sparse or crash-truncated)
+          // or more pages (crash before metadata sync). Batch maxPageIndex to
+          // determine the true file extent without individual readPage probes.
+          //
+          // Key insight: maxPageIndex encodes whether the last expected page
+          // exists. If highIdx >= lastPageIndex, the last expected page is at
+          // or below the highest stored page (sparse file). If highIdx <
+          // lastPageIndex, pages are missing from the end (crash truncation).
+          // This eliminates O(n) serial readPage calls during mount.
           needsMaxIdx.push(i);
           needsMaxIdxPaths.push(storagePath);
-          lastPageExists.push(false); // not applicable for this case
         }
       }
 
       // Batch maxPageIndex for all files that need probing.
-      // Reduces O(n) SAB bridge round-trips to O(1) during crash recovery.
+      // Single backend call reduces O(n) SAB bridge round-trips to O(1).
       if (needsMaxIdx.length > 0) {
         const allMaxIndices = backend.maxPageIndexBatch(needsMaxIdxPaths);
 
         for (let j = 0; j < needsMaxIdx.length; j++) {
           const i = needsMaxIdx[j];
           const { meta, parent, name } = fileEntries[i];
-          const actualPageCount = allPageCounts[i];
           const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
           const highIdx = allMaxIndices[j];
+          const lastPageIndex = pagesFromMeta - 1;
 
           let fileSize: number;
-          if (actualPageCount < pagesFromMeta) {
-            const lastPageIndex = pagesFromMeta - 1;
-            if (lastPageExists[j]) {
-              // Last page exists — sparse file with gaps. Check if pages
-              // extend beyond the expected range (file extended after last
-              // metadata sync, then crashed before syncfs).
-              if (highIdx > lastPageIndex) {
-                fileSize = (highIdx + 1) * PAGE_SIZE;
-              } else {
-                fileSize = meta.size;
-              }
-            } else {
-              // Last page missing — crash recovery. Use maxPageIndex to
-              // find the true highest page index.
-              fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
-            }
+          if (highIdx < 0) {
+            // No pages at all — file was fully truncated.
+            fileSize = 0;
+          } else if (highIdx > lastPageIndex) {
+            // Pages exist beyond what metadata expects — file was extended
+            // after last metadata sync (crash recovery or sparse+extension).
+            fileSize = (highIdx + 1) * PAGE_SIZE;
+          } else if (highIdx === lastPageIndex) {
+            // Highest page matches last expected — sparse file with internal
+            // gaps but correct extent. Trust metadata for sub-page precision.
+            fileSize = meta.size;
           } else {
-            // More pages than metadata expects: crash occurred between page
-            // writes and metadata sync.
-            fileSize = highIdx >= 0 ? (highIdx + 1) * PAGE_SIZE : 0;
+            // Highest page is below last expected — pages were lost from the
+            // end (crash truncation). Adjust size to actual extent.
+            fileSize = (highIdx + 1) * PAGE_SIZE;
           }
 
           const node = TOMEFS.createNode(parent, name, meta.mode, 0);
