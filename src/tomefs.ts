@@ -905,7 +905,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const allMeta = backend.readMetas(livePaths);
 
     // First pass: create directories and symlinks, collect file entries.
-    // Files need countPages verification, which we batch in a single call
+    // Files need maxPageIndex verification, which we batch in a single call
     // to reduce SAB bridge round-trips from O(n) to O(1).
     interface FileEntry {
       path: string;
@@ -963,84 +963,50 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       }
     }
 
-    // Batch countPages for all files in a single backend call.
-    // Reduces O(n) SAB bridge round-trips to O(1) during mount/restore.
+    // Batch maxPageIndex for all files in a single backend call.
+    // This single call replaces the previous two-call approach
+    // (countPagesBatch + maxPageIndexBatch), halving SAB bridge
+    // round-trips during mount from 2 to 1.
+    //
+    // maxPageIndex alone encodes all the information we need:
+    // - highIdx == -1: no pages exist → empty file
+    // - highIdx == lastPageIndex: extent matches → trust meta.size
+    // - highIdx > lastPageIndex: file extended past metadata → recover
+    // - highIdx < lastPageIndex: crash truncation → adjust size
     if (fileEntries.length > 0) {
       const storagePaths = fileEntries.map((e) => e.storagePath);
-      const allPageCounts = backend.countPagesBatch(storagePaths);
-
-      // First pass: create nodes for files where page counts match metadata
-      // (the common case), and collect files that need maxPageIndex probing.
-      // maxPageIndex calls are batched into a single backend call.
-      const needsMaxIdx: number[] = []; // indices into fileEntries
-      const needsMaxIdxPaths: string[] = []; // parallel storage paths
+      const allMaxIndices = backend.maxPageIndexBatch(storagePaths);
 
       for (let i = 0; i < fileEntries.length; i++) {
-        const { meta, parent, name, storagePath } = fileEntries[i];
-        const actualPageCount = allPageCounts[i];
+        const { meta, parent, name } = fileEntries[i];
         const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
+        const highIdx = allMaxIndices[i];
+        const lastPageIndex = pagesFromMeta - 1;
 
-        if (actualPageCount === 0 || actualPageCount === pagesFromMeta) {
-          // Common case: page count matches metadata or file is empty.
-          // Create node immediately — no probing needed.
-          const node = TOMEFS.createNode(parent, name, meta.mode, 0);
-          node.usedBytes = actualPageCount === 0 ? 0 : meta.size;
-          node.atime = meta.atime ?? meta.mtime;
-          node.mtime = meta.mtime;
-          node.ctime = meta.ctime;
-          node._metaDirty = false;
+        let fileSize: number;
+        if (highIdx < 0) {
+          // No pages at all — empty file or fully truncated.
+          fileSize = 0;
+        } else if (highIdx > lastPageIndex) {
+          // Pages exist beyond what metadata expects — file was extended
+          // after last metadata sync (crash recovery or sparse+extension).
+          fileSize = (highIdx + 1) * PAGE_SIZE;
+        } else if (highIdx === lastPageIndex) {
+          // Highest page matches last expected — common case or sparse file
+          // with correct extent. Trust metadata for sub-page precision.
+          fileSize = meta.size;
         } else {
-          // Page count mismatch: either fewer pages (sparse or crash-truncated)
-          // or more pages (crash before metadata sync). Batch maxPageIndex to
-          // determine the true file extent without individual readPage probes.
-          //
-          // Key insight: maxPageIndex encodes whether the last expected page
-          // exists. If highIdx >= lastPageIndex, the last expected page is at
-          // or below the highest stored page (sparse file). If highIdx <
-          // lastPageIndex, pages are missing from the end (crash truncation).
-          // This eliminates O(n) serial readPage calls during mount.
-          needsMaxIdx.push(i);
-          needsMaxIdxPaths.push(storagePath);
+          // Highest page is below last expected — pages were lost from the
+          // end (crash truncation). Adjust size to actual extent.
+          fileSize = (highIdx + 1) * PAGE_SIZE;
         }
-      }
 
-      // Batch maxPageIndex for all files that need probing.
-      // Single backend call reduces O(n) SAB bridge round-trips to O(1).
-      if (needsMaxIdx.length > 0) {
-        const allMaxIndices = backend.maxPageIndexBatch(needsMaxIdxPaths);
-
-        for (let j = 0; j < needsMaxIdx.length; j++) {
-          const i = needsMaxIdx[j];
-          const { meta, parent, name } = fileEntries[i];
-          const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
-          const highIdx = allMaxIndices[j];
-          const lastPageIndex = pagesFromMeta - 1;
-
-          let fileSize: number;
-          if (highIdx < 0) {
-            // No pages at all — file was fully truncated.
-            fileSize = 0;
-          } else if (highIdx > lastPageIndex) {
-            // Pages exist beyond what metadata expects — file was extended
-            // after last metadata sync (crash recovery or sparse+extension).
-            fileSize = (highIdx + 1) * PAGE_SIZE;
-          } else if (highIdx === lastPageIndex) {
-            // Highest page matches last expected — sparse file with internal
-            // gaps but correct extent. Trust metadata for sub-page precision.
-            fileSize = meta.size;
-          } else {
-            // Highest page is below last expected — pages were lost from the
-            // end (crash truncation). Adjust size to actual extent.
-            fileSize = (highIdx + 1) * PAGE_SIZE;
-          }
-
-          const node = TOMEFS.createNode(parent, name, meta.mode, 0);
-          node.usedBytes = fileSize;
-          node.atime = meta.atime ?? meta.mtime;
-          node.mtime = meta.mtime;
-          node.ctime = meta.ctime;
-          node._metaDirty = false;
-        }
+        const node = TOMEFS.createNode(parent, name, meta.mode, 0);
+        node.usedBytes = fileSize;
+        node.atime = meta.atime ?? meta.mtime;
+        node.mtime = meta.mtime;
+        node.ctime = meta.ctime;
+        node._metaDirty = false;
       }
     }
 
