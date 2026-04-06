@@ -94,7 +94,19 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   // a successful orphan cleanup pass in syncfs. Operations that directly
   // modify backend metadata (rename, unlink-with-open-fds) re-set this
   // flag since a crash between their backend writes could leave orphans.
+  //
+  // On mount, this is set to true by default. If the backend has a clean-
+  // shutdown marker (written at the end of a successful syncfs), we know
+  // the backend is consistent and can skip the first full tree walk.
   let needsOrphanCleanup = true;
+
+  /** Backend key for the clean-shutdown marker. */
+  const CLEAN_MARKER_PATH = "/__tomefs_clean";
+
+  /** True when the clean marker needs to be written to the backend.
+   *  Set when the marker is consumed during mount (restoreTree) and
+   *  cleared after a successful syncfs writes it back. */
+  let needsCleanMarker = false;
 
   /**
    * Set of nodes with dirty metadata (not yet persisted to the backend).
@@ -896,10 +908,28 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       return da - db || a.localeCompare(b);
     });
 
-    // Filter out /__deleted_* marker entries — these are orphaned pages from
-    // files that had open fds when the process crashed. They'll be
-    // cleaned up by the first syncfs call (orphan cleanup pass).
-    const livePaths = paths.filter((p) => !p.startsWith("/__deleted_"));
+    // Check for clean-shutdown marker. If present AND no /__deleted_* orphans
+    // exist, the backend is consistent — no orphan cleanup needed on first syncfs.
+    // /__deleted_* entries are created by rename/unlink during normal operation
+    // and cleaned up by orphan cleanup. If they survive to mount time, a crash
+    // occurred between the operation and the next syncfs — the backend is dirty
+    // regardless of the marker.
+    const hasCleanMarker = paths.includes(CLEAN_MARKER_PATH);
+    const hasOrphans = paths.some((p) => p.startsWith("/__deleted_"));
+    if (hasCleanMarker && !hasOrphans) {
+      needsOrphanCleanup = false;
+    }
+    if (hasCleanMarker) {
+      needsCleanMarker = true; // Re-write marker on next syncfs
+      backend.deleteMeta(CLEAN_MARKER_PATH);
+    }
+
+    // Filter out internal marker entries — /__deleted_* are orphaned pages
+    // from files that had open fds when the process crashed, and
+    // /__tomefs_clean is the shutdown marker we just consumed.
+    const livePaths = paths.filter(
+      (p) => !p.startsWith("/__deleted_") && p !== CLEAN_MARKER_PATH,
+    );
 
     // Batch-read all metadata in a single backend call to reduce SAB bridge
     // round-trips from O(n) to O(1) during mount/restore.
@@ -1065,6 +1095,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             pageCache.dirtyCount === 0 &&
             !needsOrphanCleanup
           ) {
+            // Re-write clean marker if it was consumed during mount.
+            // This ensures a clean exit writes the marker even if no
+            // data was modified (pure read-only session).
+            if (needsCleanMarker) {
+              backend.writeMeta(CLEAN_MARKER_PATH, {
+                size: 0, mode: 0, ctime: Date.now(), mtime: Date.now(),
+              });
+              needsCleanMarker = false;
+            }
             callback(null);
             return;
           }
@@ -1132,9 +1171,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               node._metaDirty = false;
             }
 
-            if (dirtyPages.length > 0 || metaBatch.length > 0) {
-              backend.syncAll(dirtyPages, metaBatch);
-            }
+            // Include clean-shutdown marker in the same batch so it's
+            // atomically committed with the data (for IDB backends).
+            metaBatch.push({
+              path: CLEAN_MARKER_PATH,
+              meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
+            });
+            backend.syncAll(dirtyPages, metaBatch);
+            needsCleanMarker = false;
             dirtyMetaNodes.clear();
           } else {
             // Full tree walk path: needed when orphan cleanup is required
@@ -1227,9 +1271,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
             // Write dirty pages + metadata atomically via syncAll.
             // For IDB, this is a single multi-store transaction.
-            if (dirtyPages.length > 0 || metaBatch.length > 0) {
-              backend.syncAll(dirtyPages, metaBatch);
-            }
+            // Include clean-shutdown marker in the same batch.
+            metaBatch.push({
+              path: CLEAN_MARKER_PATH,
+              meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
+            });
+            backend.syncAll(dirtyPages, metaBatch);
+            needsCleanMarker = false;
 
             // Clear dirty flags on all nodes whose metadata was persisted.
             // Walk the mount tree (visited nodes) and detached file nodes.
@@ -1240,9 +1288,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             dirtyMetaNodes.clear();
 
             // Delete metadata and orphaned page data for paths no longer in the tree.
+            // Exclude the clean-shutdown marker — it's internal bookkeeping, not
+            // an orphan. It will be re-written after this cleanup completes.
             const orphanPaths: string[] = [];
             for (const path of backend.listFiles()) {
-              if (!currentPaths.has(path)) {
+              if (!currentPaths.has(path) && path !== CLEAN_MARKER_PATH) {
                 orphanPaths.push(path);
               }
             }
