@@ -17,14 +17,25 @@ export class MemoryBackend implements StorageBackend {
    *  Avoids O(total-pages) full-map scans in deleteFile, renameFile, deletePagesFrom. */
   private filePageKeys = new Map<string, Set<string>>();
 
-  /** Add a page key to the filePageKeys index. */
-  private trackPage(path: string, key: string): void {
+  /** Secondary index: file path → Map<pageIndex, key>.
+   *  Avoids string parsing (indexOf + parseInt) in maxPageIndex and deletePagesFrom. */
+  private filePageIndices = new Map<string, Map<number, string>>();
+
+  /** Add a page key to the secondary indexes. */
+  private trackPage(path: string, key: string, pageIndex: number): void {
     let keys = this.filePageKeys.get(path);
     if (!keys) {
       keys = new Set();
       this.filePageKeys.set(path, keys);
     }
     keys.add(key);
+
+    let indices = this.filePageIndices.get(path);
+    if (!indices) {
+      indices = new Map();
+      this.filePageIndices.set(path, indices);
+    }
+    indices.set(pageIndex, key);
   }
 
   async readPage(path: string, pageIndex: number): Promise<Uint8Array | null> {
@@ -51,7 +62,7 @@ export class MemoryBackend implements StorageBackend {
   ): Promise<void> {
     const key = pageKeyStr(path, pageIndex);
     this.pages.set(key, new Uint8Array(data));
-    this.trackPage(path, key);
+    this.trackPage(path, key, pageIndex);
   }
 
   async writePages(
@@ -70,6 +81,7 @@ export class MemoryBackend implements StorageBackend {
       }
       this.filePageKeys.delete(path);
     }
+    this.filePageIndices.delete(path);
   }
 
   async deleteFiles(paths: string[]): Promise<void> {
@@ -79,20 +91,20 @@ export class MemoryBackend implements StorageBackend {
   }
 
   async deletePagesFrom(path: string, fromPageIndex: number): Promise<void> {
+    const indices = this.filePageIndices.get(path);
+    if (!indices) return;
     const keys = this.filePageKeys.get(path);
-    if (!keys) return;
-    for (const key of keys) {
-      const page = this.pages.get(key);
-      if (page) {
-        const nullIdx = key.indexOf("\0");
-        const idx = parseInt(key.substring(nullIdx + 1), 10);
-        if (idx >= fromPageIndex) {
-          this.pages.delete(key);
-          keys.delete(key);
-        }
+    for (const [idx, key] of indices) {
+      if (idx >= fromPageIndex) {
+        this.pages.delete(key);
+        keys?.delete(key);
+        indices.delete(idx);
       }
     }
-    if (keys.size === 0) this.filePageKeys.delete(path);
+    if (indices.size === 0) {
+      this.filePageIndices.delete(path);
+      this.filePageKeys.delete(path);
+    }
   }
 
   async countPages(path: string): Promise<number> {
@@ -104,12 +116,10 @@ export class MemoryBackend implements StorageBackend {
   }
 
   async maxPageIndex(path: string): Promise<number> {
-    const keys = this.filePageKeys.get(path);
-    if (!keys || keys.size === 0) return -1;
+    const indices = this.filePageIndices.get(path);
+    if (!indices || indices.size === 0) return -1;
     let max = -1;
-    for (const key of keys) {
-      const nullIdx = key.indexOf("\0");
-      const idx = parseInt(key.substring(nullIdx + 1), 10);
+    for (const idx of indices.keys()) {
       if (idx > max) max = idx;
     }
     return max;
@@ -117,12 +127,10 @@ export class MemoryBackend implements StorageBackend {
 
   async maxPageIndexBatch(paths: string[]): Promise<number[]> {
     return paths.map((path) => {
-      const keys = this.filePageKeys.get(path);
-      if (!keys || keys.size === 0) return -1;
+      const indices = this.filePageIndices.get(path);
+      if (!indices || indices.size === 0) return -1;
       let max = -1;
-      for (const key of keys) {
-        const nullIdx = key.indexOf("\0");
-        const idx = parseInt(key.substring(nullIdx + 1), 10);
+      for (const idx of indices.keys()) {
         if (idx > max) max = idx;
       }
       return max;
@@ -135,20 +143,20 @@ export class MemoryBackend implements StorageBackend {
     // pages than destination (same contract as IDB and OPFS backends).
     await this.deleteFile(newPath);
 
-    const oldKeys = this.filePageKeys.get(oldPath);
-    if (!oldKeys) return;
-    const oldPrefix = `${oldPath}\0`;
-    const toAdd: Array<[string, Uint8Array]> = [];
-    for (const key of oldKeys) {
+    const oldIndices = this.filePageIndices.get(oldPath);
+    if (!oldIndices) return;
+    const toAdd: Array<[number, string, Uint8Array]> = [];
+    for (const [pageIndex, key] of oldIndices) {
       const data = this.pages.get(key)!;
-      const pageIndex = key.slice(oldPrefix.length);
-      toAdd.push([`${newPath}\0${pageIndex}`, data]);
+      const newKey = pageKeyStr(newPath, pageIndex);
+      toAdd.push([pageIndex, newKey, data]);
       this.pages.delete(key);
     }
     this.filePageKeys.delete(oldPath);
-    for (const [key, data] of toAdd) {
+    this.filePageIndices.delete(oldPath);
+    for (const [pageIndex, key, data] of toAdd) {
       this.pages.set(key, data);
-      this.trackPage(newPath, key);
+      this.trackPage(newPath, key, pageIndex);
     }
   }
 
