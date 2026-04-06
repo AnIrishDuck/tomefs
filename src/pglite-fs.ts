@@ -89,20 +89,32 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
     };
   };
 
-  // Override syncToFs to flush tomefs
-  adapter.syncToFs = async (_relaxedDurability?: boolean) => {
+  // Override syncToFs to flush tomefs.
+  // When relaxedDurability is false (or omitted), also flush the backend
+  // to the remote storage. This is critical for PreloadBackend, where
+  // syncfs only pushes data from the page cache to in-memory maps —
+  // without flush(), data never reaches the persistent remote (IDB/OPFS).
+  adapter.syncToFs = async (relaxedDurability?: boolean) => {
     if (!moduleFS) return;
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       moduleFS.syncfs(false, (err: Error | null) => {
         if (err) reject(err);
         else resolve();
       });
     });
+    // Flush the backend to persistent storage when durability is required.
+    // For SyncMemoryBackend and SabClient this is a no-op (no flush method).
+    // For PreloadBackend this persists dirty data to the async remote.
+    if (!relaxedDurability && typeof (backend as any).flush === "function") {
+      await (backend as any).flush();
+    }
   };
 
   // Override closeFs to persist all state before shutdown.
   // During pg.close(), Postgres modifies files (WAL, temp cleanup), so we
   // must re-persist both pages AND metadata — not just flush pages.
+  // Always flush the backend to persistent storage on close — data must be
+  // durable after shutdown regardless of relaxedDurability preferences.
   const originalCloseFs = adapter.closeFs.bind(adapter);
   adapter.closeFs = async () => {
     if (moduleFS) {
@@ -112,6 +124,9 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
           else resolve();
         });
       });
+      if (typeof (backend as any).flush === "function") {
+        await (backend as any).flush();
+      }
     }
     return originalCloseFs();
   };
