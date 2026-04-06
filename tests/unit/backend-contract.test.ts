@@ -982,5 +982,101 @@ for (const factory of factories) {
         expect(results).toEqual([meta, meta]);
       });
     });
+
+    // syncAll
+    // §9: verify the combined write path used by syncfs
+
+    describe("syncAll", () => {
+      it("writes pages and metadata in a single call @fast", async () => {
+        const pageData = filledPage(0xaa);
+        await backend.syncAll(
+          [{ path: "/f", pageIndex: 0, data: pageData }],
+          [{ path: "/f", meta }],
+        );
+
+        const readBack = await backend.readPage("/f", 0);
+        expect(readBack).toEqual(pageData);
+        const metaBack = await backend.readMeta("/f");
+        expect(metaBack).toEqual(meta);
+      });
+
+      it("handles empty pages and empty metas", async () => {
+        await backend.syncAll([], []);
+        // Should not throw; no data written
+        expect(await backend.listFiles()).toEqual([]);
+      });
+
+      it("handles empty pages with non-empty metas", async () => {
+        await backend.syncAll([], [{ path: "/f", meta }]);
+        expect(await backend.readMeta("/f")).toEqual(meta);
+        expect(await backend.readPage("/f", 0)).toBeNull();
+      });
+
+      it("handles non-empty pages with empty metas", async () => {
+        const pageData = filledPage(0xbb);
+        await backend.syncAll(
+          [{ path: "/f", pageIndex: 0, data: pageData }],
+          [],
+        );
+        expect(await backend.readPage("/f", 0)).toEqual(pageData);
+        expect(await backend.readMeta("/f")).toBeNull();
+      });
+
+      it("writes multiple pages across multiple files", async () => {
+        const p1 = filledPage(0x11);
+        const p2 = filledPage(0x22);
+        const p3 = filledPage(0x33);
+        const meta2 = { ...meta, size: 16384 };
+
+        await backend.syncAll(
+          [
+            { path: "/a", pageIndex: 0, data: p1 },
+            { path: "/a", pageIndex: 1, data: p2 },
+            { path: "/b", pageIndex: 0, data: p3 },
+          ],
+          [
+            { path: "/a", meta: meta2 },
+            { path: "/b", meta },
+          ],
+        );
+
+        expect(await backend.readPage("/a", 0)).toEqual(p1);
+        expect(await backend.readPage("/a", 1)).toEqual(p2);
+        expect(await backend.readPage("/b", 0)).toEqual(p3);
+        expect(await backend.readMeta("/a")).toEqual(meta2);
+        expect(await backend.readMeta("/b")).toEqual(meta);
+      });
+
+      it("overwrites existing pages and metadata", async () => {
+        const old = filledPage(0x01);
+        const updated = filledPage(0x02);
+        const updatedMeta = { ...meta, mtime: 9999 };
+
+        await backend.writePage("/f", 0, old);
+        await backend.writeMeta("/f", meta);
+
+        await backend.syncAll(
+          [{ path: "/f", pageIndex: 0, data: updated }],
+          [{ path: "/f", meta: updatedMeta }],
+        );
+
+        expect(await backend.readPage("/f", 0)).toEqual(updated);
+        expect(await backend.readMeta("/f")).toEqual(updatedMeta);
+      });
+
+      it("does not affect unrelated files", async () => {
+        const existing = filledPage(0xee);
+        await backend.writePage("/existing", 0, existing);
+        await backend.writeMeta("/existing", meta);
+
+        await backend.syncAll(
+          [{ path: "/new", pageIndex: 0, data: filledPage(0xff) }],
+          [{ path: "/new", meta: { ...meta, size: 4096 } }],
+        );
+
+        expect(await backend.readPage("/existing", 0)).toEqual(existing);
+        expect(await backend.readMeta("/existing")).toEqual(meta);
+      });
+    });
   });
 }
