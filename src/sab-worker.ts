@@ -33,6 +33,14 @@ export class SabWorker {
   private readonly uint8View: Uint8Array;
   private running = false;
 
+  /**
+   * Promise that resolves when stop() is called. Used to break out of the
+   * waitAsync await without polling — eliminates the 10ms setTimeout loop
+   * that previously created closure allocations on every poll cycle.
+   */
+  private stopResolve: (() => void) | null = null;
+  private stopPromise: Promise<void> = Promise.resolve();
+
   constructor(sab: SharedArrayBuffer, backend: StorageBackend) {
     this.sab = sab;
     this.backend = backend;
@@ -47,6 +55,9 @@ export class SabWorker {
    */
   async start(): Promise<void> {
     this.running = true;
+    this.stopPromise = new Promise<void>((resolve) => {
+      this.stopResolve = resolve;
+    });
 
     while (this.running) {
       // Non-blocking wait: yields to the event loop while waiting
@@ -67,25 +78,10 @@ export class SabWorker {
       );
 
       if (waitResult.async) {
-        // Wait for either a status change or timeout
-        await Promise.race([
-          waitResult.value,
-          new Promise<void>((resolve) => {
-            const check = () => {
-              if (!this.running) {
-                resolve();
-                return;
-              }
-              const s = Atomics.load(this.controlView, SLOT_STATUS);
-              if (s !== status) {
-                resolve();
-                return;
-              }
-              setTimeout(check, 10);
-            };
-            setTimeout(check, 10);
-          }),
-        ]);
+        // Wait for either a status change or stop signal.
+        // stopPromise resolves when stop() is called, replacing the
+        // previous 10ms setTimeout polling loop with zero overhead.
+        await Promise.race([waitResult.value, this.stopPromise]);
       }
       // If not async, the value already changed — loop back to check it
     }
@@ -94,7 +90,10 @@ export class SabWorker {
   /** Stop the processing loop. */
   stop(): void {
     this.running = false;
-    // Change status to wake up any waitAsync
+    // Resolve the stop promise to break out of the waitAsync race
+    this.stopResolve?.();
+    this.stopResolve = null;
+    // Notify to wake up any waitAsync on the control word
     Atomics.notify(this.controlView, SLOT_STATUS);
   }
 
