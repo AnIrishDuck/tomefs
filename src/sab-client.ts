@@ -389,7 +389,10 @@ export class SabClient implements SyncStorageBackend {
     // Fast path: everything fits in a single SAB call.
     // This is the common case — steady-state syncfs writes a handful of
     // dirty pages + their metadata, well within the 1 MB SAB buffer.
-    if (pages.length <= this.maxBatchPages) {
+    // Check both pages AND metas fit — a large metadata payload (hundreds
+    // of files in a PGlite database) can overflow the buffer even when
+    // the page count is within limits.
+    if (pages.length <= this.maxBatchPages && metas.length <= this.maxBatchMetas) {
       const pageMeta = pages.map((p) => ({
         path: p.path,
         pageIndex: p.pageIndex,
