@@ -1176,4 +1176,130 @@ describe("PageCache", () => {
       }
     });
   });
+
+  describe("collectDirtyPages", () => {
+    it("returns empty array when no dirty pages", () => {
+      expect(cache.collectDirtyPages()).toEqual([]);
+    });
+
+    it("returns all dirty pages without clearing dirty flags", async () => {
+      const buf1 = fillBuf(PAGE_SIZE, 0xaa);
+      const buf2 = fillBuf(PAGE_SIZE, 0xbb);
+      await cache.write("/a", buf1, 0, PAGE_SIZE, 0, 0);
+      await cache.write("/b", buf2, 0, PAGE_SIZE, 0, 0);
+
+      const collected = cache.collectDirtyPages();
+      expect(collected.length).toBe(2);
+
+      // Pages should still be dirty after collection
+      expect(cache.dirtyCount).toBe(2);
+      expect(cache.isDirty("/a", 0)).toBe(true);
+      expect(cache.isDirty("/b", 0)).toBe(true);
+
+      // Verify collected data
+      const paths = collected.map((p) => p.path).sort();
+      expect(paths).toEqual(["/a", "/b"]);
+    });
+
+    it("can be called multiple times without side effects", async () => {
+      await cache.write("/f", fillBuf(PAGE_SIZE, 1), 0, PAGE_SIZE, 0, 0);
+
+      const first = cache.collectDirtyPages();
+      const second = cache.collectDirtyPages();
+      expect(first.length).toBe(1);
+      expect(second.length).toBe(1);
+      expect(cache.dirtyCount).toBe(1);
+    });
+  });
+
+  describe("commitDirtyPages", () => {
+    it("clears dirty flags for committed pages", async () => {
+      await cache.write("/a", fillBuf(PAGE_SIZE, 0xaa), 0, PAGE_SIZE, 0, 0);
+      await cache.write("/b", fillBuf(PAGE_SIZE, 0xbb), 0, PAGE_SIZE, 0, 0);
+
+      const collected = cache.collectDirtyPages();
+      expect(cache.dirtyCount).toBe(2);
+
+      cache.commitDirtyPages(collected);
+      expect(cache.dirtyCount).toBe(0);
+      expect(cache.isDirty("/a", 0)).toBe(false);
+      expect(cache.isDirty("/b", 0)).toBe(false);
+    });
+
+    it("preserves pages dirtied between collect and commit", async () => {
+      await cache.write("/a", fillBuf(PAGE_SIZE, 0xaa), 0, PAGE_SIZE, 0, 0);
+      const collected = cache.collectDirtyPages();
+
+      // Dirty a new page after collection
+      await cache.write("/b", fillBuf(PAGE_SIZE, 0xbb), 0, PAGE_SIZE, 0, 0);
+      expect(cache.dirtyCount).toBe(2);
+
+      // Commit only the originally collected pages
+      cache.commitDirtyPages(collected);
+      expect(cache.dirtyCount).toBe(1);
+      expect(cache.isDirty("/a", 0)).toBe(false);
+      expect(cache.isDirty("/b", 0)).toBe(true);
+    });
+
+    it("handles pages evicted between collect and commit", async () => {
+      const smallCache = new PageCache(backend, 2);
+      await smallCache.write("/a", fillBuf(PAGE_SIZE, 1), 0, PAGE_SIZE, 0, 0);
+      const collected = smallCache.collectDirtyPages();
+
+      // Fill cache to force eviction of /a
+      await smallCache.getPage("/b", 0);
+      await smallCache.getPage("/c", 0);
+
+      // Commit should be a no-op for the evicted page (it was flushed on eviction)
+      smallCache.commitDirtyPages(collected);
+      // No error, no crash
+      expect(smallCache.dirtyCount).toBe(0);
+    });
+
+    it("handles pages re-dirtied between collect and commit", async () => {
+      await cache.write("/a", fillBuf(PAGE_SIZE, 0xaa), 0, PAGE_SIZE, 0, 0);
+      const collected = cache.collectDirtyPages();
+
+      // Re-dirty the same page with new data
+      await cache.write("/a", fillBuf(PAGE_SIZE, 0xbb), 0, PAGE_SIZE, 0, PAGE_SIZE);
+
+      // Commit clears dirty flag — the re-dirtied page's flag is the same flag
+      // (page is still in cache at the same key), so commit clears it.
+      // This matches the sync variant's behavior: collectDirtyPages snapshots
+      // dirty page references, and commitDirtyPages clears each one.
+      cache.commitDirtyPages(collected);
+      expect(cache.isDirty("/a", 0)).toBe(false);
+    });
+
+    it("increments flush counter", async () => {
+      await cache.write("/a", fillBuf(PAGE_SIZE, 1), 0, PAGE_SIZE, 0, 0);
+      await cache.write("/b", fillBuf(PAGE_SIZE, 2), 0, PAGE_SIZE, 0, 0);
+
+      const before = cache.getStats().flushes;
+      cache.commitDirtyPages(cache.collectDirtyPages());
+      expect(cache.getStats().flushes).toBe(before + 2);
+    });
+
+    it("two-phase commit round-trip: collect → backend write → commit", async () => {
+      // Write dirty pages
+      await cache.write("/f", fillBuf(PAGE_SIZE, 0x42), 0, PAGE_SIZE, 0, 0);
+
+      // Phase 1: collect
+      const dirty = cache.collectDirtyPages();
+      expect(dirty.length).toBe(1);
+      expect(cache.dirtyCount).toBe(1); // still dirty
+
+      // Phase 2: write to backend
+      await backend.writePages(dirty);
+
+      // Phase 3: commit
+      cache.commitDirtyPages(dirty);
+      expect(cache.dirtyCount).toBe(0);
+
+      // Verify data persisted correctly
+      const stored = await backend.readPage("/f", 0);
+      expect(stored).not.toBeNull();
+      expect(stored![0]).toBe(0x42);
+    });
+  });
 });
