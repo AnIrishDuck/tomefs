@@ -264,9 +264,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       backend.deletePagesFrom(path, neededPages);
     } else {
       // Growing: materialize only the LAST new page so it's flushed during
-      // syncfs. restoreTree distinguishes sparse files from crash-truncated
-      // files by probing the last expected page — if it exists in the
-      // backend, restoreTree trusts metadata.size. Intermediate pages don't
+      // syncfs. restoreTree uses maxPageIndex to determine file extent — if
+      // the highest stored page matches the last expected page, restoreTree
+      // trusts metadata.size. Materializing the sentinel ensures maxPageIndex
+      // reflects the true file extent after a crash. Intermediate pages don't
       // need materializing: they read as zeros on demand (correct for
       // allocate/extend semantics) and are never written to the backend
       // unless the caller actually writes data to them.
