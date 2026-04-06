@@ -752,9 +752,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
-        } else {
-          pageCache.flushFile(node.storagePath);
         }
+        // Dirty pages remain in the cache and are flushed by syncfs or
+        // eviction. POSIX close() does not guarantee persistence — that
+        // is fsync's job. Deferring flush eliminates O(dirty) backend
+        // writes on every close, matching MEMFS behavior.
       }
     },
 
@@ -1160,7 +1162,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
                   },
                 });
               }
-              node._metaDirty = false;
             }
 
             // Include clean-shutdown marker in the same batch so it's
@@ -1170,6 +1171,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
             });
             backend.syncAll(dirtyPages, metaBatch);
+
+            // Two-phase commit: clear dirty flags only after syncAll
+            // succeeds. If syncAll throws (IDB error, crash), dirty
+            // state is preserved so the next syncfs retries the flush.
+            pageCache.commitDirtyPages(dirtyPages);
+            for (const node of dirtyMetaNodes) {
+              node._metaDirty = false;
+            }
             needsCleanMarker = false;
             dirtyMetaNodes.clear();
           } else {
@@ -1269,14 +1278,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
             });
             backend.syncAll(dirtyPages, metaBatch);
-            needsCleanMarker = false;
 
-            // Clear dirty flags on all nodes whose metadata was persisted.
-            // Uses the dirty set instead of walking the full tree — O(dirty)
-            // instead of O(tree) + O(files).
+            // Two-phase commit: clear dirty flags only after syncAll
+            // succeeds. If syncAll throws, dirty state is preserved.
+            pageCache.commitDirtyPages(dirtyPages);
             for (const node of dirtyMetaNodes) {
               node._metaDirty = false;
             }
+            needsCleanMarker = false;
             dirtyMetaNodes.clear();
 
             // Delete metadata and orphaned page data for paths no longer in the tree.

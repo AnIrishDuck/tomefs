@@ -65,38 +65,21 @@ async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
   // Wrap FS with path rewriting so benchmarks use clean paths.
-  // Pre-bind methods to avoid Proxy overhead on the hot path —
-  // a Proxy get-trap calling val.bind(target) on every access creates
-  // a new Function object per call, unfairly penalizing tomefs benchmarks.
-  const methodCache = new Map<string, Function>();
-  const pathMethods = new Set([
+  // Uses a plain object with pre-bound methods instead of a Proxy to
+  // avoid the Proxy get-trap overhead on every method call, which
+  // would unfairly penalize tomefs benchmarks.
+  const fs = rawFS as any;
+  const wrappedFS = Object.create(rawFS) as EmscriptenFS;
+  for (const prop of [
     "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
     "readdir", "unlink", "writeFile", "readFile", "mknod",
     "chmod", "utime",
-  ]);
-
-  const wrappedFS = new Proxy(rawFS, {
-    get(target: any, prop: string) {
-      const cached = methodCache.get(prop);
-      if (cached) return cached;
-
-      const val = target[prop];
-      if (typeof val !== "function") return val;
-
-      let wrapped: Function;
-      if (pathMethods.has(prop)) {
-        wrapped = (path: string, ...args: any[]) =>
-          val.call(target, rewritePath(path), ...args);
-      } else if (prop === "rename") {
-        wrapped = (oldPath: string, newPath: string) =>
-          val.call(target, rewritePath(oldPath), rewritePath(newPath));
-      } else {
-        wrapped = val.bind(target);
-      }
-      methodCache.set(prop, wrapped);
-      return wrapped;
-    },
-  }) as unknown as EmscriptenFS;
+  ] as const) {
+    (wrappedFS as any)[prop] = (path: string, ...args: any[]) =>
+      fs[prop](rewritePath(path), ...args);
+  }
+  (wrappedFS as any).rename = (oldPath: string, newPath: string) =>
+    fs.rename(rewritePath(oldPath), rewritePath(newPath));
 
   return { FS: wrappedFS, label: `tomefs-${maxPages}` };
 }
@@ -331,4 +314,42 @@ describe("Mixed Multi-File Read/Write (8 files, 50 rounds)", async () => {
   bench("MEMFS", () => mixedOps(memfs));
   bench("tomefs (4096 pages)", () => mixedOps(tome4096));
   bench("tomefs (16 pages, eviction)", () => mixedOps(tome16));
+});
+
+// ---------------------------------------------------------------------------
+// Hot-Path Read/Write: repeat access to same pages (Postgres-like pattern)
+// ---------------------------------------------------------------------------
+
+const HOT_ROUNDS = 200;
+const HOT_PAGES = 4; // Small working set, all in per-node page table
+
+describe("Hot-Path Read-Modify-Write (200 rounds, 4 pages)", async () => {
+  const memfs = await createMemFSHarness();
+  const tome4096 = await createTomeFSHarness(4096);
+
+  // Pre-populate
+  for (const h of [memfs, tome4096]) {
+    const s = h.FS.open("/bench_hot", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    for (let i = 0; i < HOT_PAGES; i++) {
+      h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
+    }
+    h.FS.close(s);
+  }
+
+  function hotPath(h: BenchHarness) {
+    const stream = h.FS.open("/bench_hot", O.RDWR);
+    for (let r = 0; r < HOT_ROUNDS; r++) {
+      const pageIdx = r % HOT_PAGES;
+      // Read page
+      h.FS.llseek(stream, pageIdx * PAGE_SIZE, SEEK_SET);
+      h.FS.read(stream, READ_BUF, 0, PAGE_SIZE);
+      // Modify and write back
+      h.FS.llseek(stream, pageIdx * PAGE_SIZE, SEEK_SET);
+      h.FS.write(stream, READ_BUF, 0, PAGE_SIZE);
+    }
+    h.FS.close(stream);
+  }
+
+  bench("MEMFS", () => hotPath(memfs));
+  bench("tomefs (4096 pages)", () => hotPath(tome4096));
 });
