@@ -813,4 +813,68 @@ describe("syncfs detached node handling", () => {
     }
     FS3.unmount(MOUNT);
   });
+
+  it("clean-shutdown marker skips first-syncfs tree walk @fast", async () => {
+    // Phase 1: create files, sync (writes marker), unmount
+    const { FS, tomefs } = await mountTome(backend);
+    const s = FS.open(`${MOUNT}/data`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("hello"), 0, 5);
+    FS.close(s);
+    syncAndUnmount(FS, tomefs);
+
+    // Marker should be in the backend
+    expect(backend.readMeta("/__tomefs_clean")).not.toBeNull();
+
+    // Phase 2: remount cleanly — marker consumed
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+
+    // Marker was consumed (deleted from backend during mount)
+    expect(backend.readMeta("/__tomefs_clean")).toBeNull();
+
+    // First syncfs should be a no-op (no tree walk, no listFiles) because
+    // the marker told us the backend is clean and no mutations occurred.
+    backend.startRecording();
+    syncfs(FS2, t2);
+    backend.stopRecording();
+
+    // Should NOT call listFiles (orphan cleanup) — that's the full tree walk
+    const listOps = backend.operations.filter((o) => o.op === "listFiles");
+    expect(listOps.length).toBe(0);
+
+    // Marker re-written for next mount
+    expect(backend.readMeta("/__tomefs_clean")).not.toBeNull();
+
+    FS2.unmount(MOUNT);
+  });
+
+  it("clean-shutdown marker ignored when /__deleted_* orphans exist @fast", async () => {
+    // Phase 1: create and sync
+    const { FS, tomefs } = await mountTome(backend);
+    const s = FS.open(`${MOUNT}/file`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("data"), 0, 4);
+    FS.close(s);
+    syncAndUnmount(FS, tomefs);
+
+    // Simulate crash: inject orphaned /__deleted_* entry
+    backend.writeMeta("/__deleted_42", {
+      size: 100,
+      mode: 0o100666,
+      ctime: Date.now(),
+      mtime: Date.now(),
+    });
+
+    // Marker is still present from Phase 1
+    expect(backend.readMeta("/__tomefs_clean")).not.toBeNull();
+
+    // Phase 2: remount — marker should be ignored due to orphans
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+
+    // Trigger syncfs — should do full tree walk + orphan cleanup
+    syncfs(FS2, t2);
+
+    // Orphan should be cleaned up
+    expect(backend.readMeta("/__deleted_42")).toBeNull();
+
+    FS2.unmount(MOUNT);
+  });
 });
