@@ -25,23 +25,46 @@ for (let i = 0; i < 256; i++) {
   HEX_TABLE[i] = i.toString(16).padStart(2, "0");
 }
 
+/** Reverse hex lookup table — maps hex pair string to byte value.
+ *  Avoids parseInt(hex, 16) per byte in decodePath. */
+const HEX_TO_BYTE = new Map<string, number>();
+for (let i = 0; i < 256; i++) {
+  HEX_TO_BYTE.set(HEX_TABLE[i], i);
+}
+
+/** Reusable TextEncoder — avoids allocating a new one on every encodePath call. */
+const textEncoder = new TextEncoder();
+
+/** Reusable TextDecoder — avoids allocating a new one on every decodePath call. */
+const textDecoder = new TextDecoder();
+
+/** Cache of path → hex-encoded path. Paths are reused heavily (every read,
+ *  write, meta op re-encodes the same path), so caching eliminates the
+ *  TextEncoder.encode + hex conversion on the hot path. */
+const encodeCache = new Map<string, string>();
+
 /** Encode a virtual file path as a hex string safe for use as an OPFS name. */
 function encodePath(path: string): string {
-  const bytes = new TextEncoder().encode(path);
+  const cached = encodeCache.get(path);
+  if (cached !== undefined) return cached;
+
+  const bytes = textEncoder.encode(path);
   const parts = new Array<string>(bytes.length);
   for (let i = 0; i < bytes.length; i++) {
     parts[i] = HEX_TABLE[bytes[i]];
   }
-  return parts.join("");
+  const encoded = parts.join("");
+  encodeCache.set(path, encoded);
+  return encoded;
 }
 
 /** Decode a hex-encoded OPFS name back to the original virtual file path. */
 function decodePath(hex: string): string {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    bytes[i] = HEX_TO_BYTE.get(hex.slice(i * 2, i * 2 + 2))!;
   }
-  return new TextDecoder().decode(bytes);
+  return textDecoder.decode(bytes);
 }
 
 /** Options for creating an OpfsBackend. */
@@ -501,9 +524,11 @@ export class OpfsBackend implements StorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void> {
-    // OPFS has no multi-operation transactions, so execute sequentially.
-    await this.writePages(pages);
-    await this.writeMetas(metas);
+    // OPFS has no multi-operation transactions, so page writes and meta
+    // writes are independent. Run them concurrently to reduce wall-clock
+    // time — the OPFS file handle operations for pages/ and meta/ don't
+    // contend since they target different subdirectories.
+    await Promise.all([this.writePages(pages), this.writeMetas(metas)]);
   }
 
   /**
