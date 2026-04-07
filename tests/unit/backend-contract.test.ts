@@ -970,6 +970,154 @@ for (const factory of factories) {
     });
 
     // ---------------------------------------------------------------
+    // syncAll
+    // ---------------------------------------------------------------
+
+    describe("syncAll", () => {
+      it("writes pages and metadata atomically @fast", async () => {
+        await backend.syncAll(
+          [
+            { path: "/f", pageIndex: 0, data: filledPage(0xaa) },
+            { path: "/f", pageIndex: 1, data: filledPage(0xbb) },
+          ],
+          [{ path: "/f", meta }],
+        );
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0xaa));
+        expect(await backend.readPage("/f", 1)).toEqual(filledPage(0xbb));
+        expect(await backend.readMeta("/f")).toEqual(meta);
+      });
+
+      it("empty pages and metas is a no-op @fast", async () => {
+        await backend.syncAll([], []);
+      });
+
+      it("pages only (no metadata)", async () => {
+        await backend.syncAll(
+          [{ path: "/f", pageIndex: 0, data: filledPage(0x42) }],
+          [],
+        );
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x42));
+      });
+
+      it("metadata only (no pages)", async () => {
+        await backend.syncAll([], [{ path: "/f", meta }]);
+
+        expect(await backend.readMeta("/f")).toEqual(meta);
+      });
+
+      it("overwrites existing pages and metadata", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writeMeta("/f", { ...meta, size: 100 });
+
+        const updatedMeta = { ...meta, size: 16384, mtime: 9999 };
+        await backend.syncAll(
+          [{ path: "/f", pageIndex: 0, data: filledPage(0xff) }],
+          [{ path: "/f", meta: updatedMeta }],
+        );
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0xff));
+        expect(await backend.readMeta("/f")).toEqual(updatedMeta);
+      });
+
+      it("writes pages across multiple files", async () => {
+        const m1 = { ...meta, size: 100 };
+        const m2 = { ...meta, size: 200 };
+        await backend.syncAll(
+          [
+            { path: "/a", pageIndex: 0, data: filledPage(0x01) },
+            { path: "/b", pageIndex: 0, data: filledPage(0x02) },
+            { path: "/b", pageIndex: 1, data: filledPage(0x03) },
+          ],
+          [
+            { path: "/a", meta: m1 },
+            { path: "/b", meta: m2 },
+          ],
+        );
+
+        expect(await backend.readPage("/a", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readPage("/b", 0)).toEqual(filledPage(0x02));
+        expect(await backend.readPage("/b", 1)).toEqual(filledPage(0x03));
+        expect(await backend.readMeta("/a")).toEqual(m1);
+        expect(await backend.readMeta("/b")).toEqual(m2);
+      });
+
+      it("does not affect unrelated files", async () => {
+        await backend.writePage("/other", 0, filledPage(0xdd));
+        await backend.writeMeta("/other", meta);
+
+        await backend.syncAll(
+          [{ path: "/f", pageIndex: 0, data: filledPage(0xaa) }],
+          [{ path: "/f", meta: { ...meta, size: 999 } }],
+        );
+
+        expect(await backend.readPage("/other", 0)).toEqual(filledPage(0xdd));
+        expect(await backend.readMeta("/other")).toEqual(meta);
+      });
+
+      it("stores copies of page data, not references", async () => {
+        const data = filledPage(0x42);
+        await backend.syncAll(
+          [{ path: "/f", pageIndex: 0, data }],
+          [],
+        );
+        // Mutate the source buffer after syncAll
+        data.fill(0xff);
+        expect((await backend.readPage("/f", 0))![0]).toBe(0x42);
+      });
+
+      it("stores copies of metadata, not references", async () => {
+        const m = { ...meta };
+        await backend.syncAll([], [{ path: "/f", meta: m }]);
+        // Mutate the source object after syncAll
+        m.size = 99999;
+        expect((await backend.readMeta("/f"))!.size).toBe(meta.size);
+      });
+
+      it("handles metadata with optional fields (atime, link)", async () => {
+        const symMeta = {
+          ...meta,
+          mode: 0o120777,
+          atime: 500,
+          link: "/target",
+        };
+        await backend.syncAll([], [{ path: "/link", meta: symMeta }]);
+
+        const result = await backend.readMeta("/link");
+        expect(result!.atime).toBe(500);
+        expect(result!.link).toBe("/target");
+      });
+
+      it("countPages and maxPageIndex reflect syncAll writes", async () => {
+        await backend.syncAll(
+          [
+            { path: "/f", pageIndex: 0, data: filledPage(0x01) },
+            { path: "/f", pageIndex: 3, data: filledPage(0x03) },
+            { path: "/f", pageIndex: 7, data: filledPage(0x07) },
+          ],
+          [{ path: "/f", meta }],
+        );
+
+        expect(await backend.countPages("/f")).toBe(3);
+        expect(await backend.maxPageIndex("/f")).toBe(7);
+      });
+
+      it("listFiles reflects metadata written by syncAll", async () => {
+        await backend.syncAll(
+          [],
+          [
+            { path: "/a", meta },
+            { path: "/b", meta },
+          ],
+        );
+
+        const files = await backend.listFiles();
+        expect(files.sort()).toEqual(["/a", "/b"]);
+      });
+    });
+
+    // ---------------------------------------------------------------
     // readMetas batch
     // ---------------------------------------------------------------
 
