@@ -436,6 +436,101 @@ describe("SAB+Atomics Bridge", () => {
     });
   });
 
+  describe("syncAll", () => {
+    it("@fast writes pages and metadata atomically in one call", async () => {
+      const data0 = new Uint8Array(PAGE_SIZE);
+      data0[0] = 0xaa;
+      const data1 = new Uint8Array(PAGE_SIZE);
+      data1[0] = 0xbb;
+      const meta = { size: PAGE_SIZE * 2, mode: 0o644, ctime: 100, mtime: 200 };
+
+      await callClient(clientWorker, "syncAll", [
+        [
+          { path: "/sync-test", pageIndex: 0, data: data0 },
+          { path: "/sync-test", pageIndex: 1, data: data1 },
+        ],
+        [{ path: "/sync-test", meta }],
+      ]);
+
+      // Verify pages
+      const r0 = await callClient(clientWorker, "readPage", ["/sync-test", 0]);
+      expect(toUint8Array(r0)[0]).toBe(0xaa);
+      const r1 = await callClient(clientWorker, "readPage", ["/sync-test", 1]);
+      expect(toUint8Array(r1)[0]).toBe(0xbb);
+
+      // Verify metadata
+      const readMeta = (await callClient(clientWorker, "readMeta", [
+        "/sync-test",
+      ])) as { size: number; mode: number };
+      expect(readMeta.size).toBe(PAGE_SIZE * 2);
+      expect(readMeta.mode).toBe(0o644);
+    });
+
+    it("syncAll with only pages and no metadata", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0xcc;
+
+      await callClient(clientWorker, "syncAll", [
+        [{ path: "/pages-only", pageIndex: 0, data }],
+        [],
+      ]);
+
+      const r = await callClient(clientWorker, "readPage", ["/pages-only", 0]);
+      expect(toUint8Array(r)[0]).toBe(0xcc);
+      expect(await callClient(clientWorker, "readMeta", ["/pages-only"])).toBeNull();
+    });
+
+    it("syncAll with only metadata and no pages", async () => {
+      const meta = { size: 0, mode: 0o755, ctime: 300, mtime: 400 };
+
+      await callClient(clientWorker, "syncAll", [
+        [],
+        [{ path: "/meta-only", meta }],
+      ]);
+
+      const readMeta = (await callClient(clientWorker, "readMeta", [
+        "/meta-only",
+      ])) as { size: number; mode: number };
+      expect(readMeta.size).toBe(0);
+      expect(readMeta.mode).toBe(0o755);
+    });
+
+    it("syncAll with empty pages and empty metas is a no-op", async () => {
+      // Should not throw
+      await callClient(clientWorker, "syncAll", [[], []]);
+    });
+
+    it("syncAll across multiple files", async () => {
+      const dataA = new Uint8Array(PAGE_SIZE);
+      dataA[0] = 0x11;
+      const dataB = new Uint8Array(PAGE_SIZE);
+      dataB[0] = 0x22;
+      const metaA = { size: PAGE_SIZE, mode: 0o644, ctime: 1, mtime: 2 };
+      const metaB = { size: PAGE_SIZE, mode: 0o600, ctime: 3, mtime: 4 };
+
+      await callClient(clientWorker, "syncAll", [
+        [
+          { path: "/fileA", pageIndex: 0, data: dataA },
+          { path: "/fileB", pageIndex: 0, data: dataB },
+        ],
+        [
+          { path: "/fileA", meta: metaA },
+          { path: "/fileB", meta: metaB },
+        ],
+      ]);
+
+      const rA = await callClient(clientWorker, "readPage", ["/fileA", 0]);
+      expect(toUint8Array(rA)[0]).toBe(0x11);
+      const rB = await callClient(clientWorker, "readPage", ["/fileB", 0]);
+      expect(toUint8Array(rB)[0]).toBe(0x22);
+
+      const mA = (await callClient(clientWorker, "readMeta", ["/fileA"])) as { mode: number };
+      expect(mA.mode).toBe(0o644);
+      const mB = (await callClient(clientWorker, "readMeta", ["/fileB"])) as { mode: number };
+      expect(mB.mode).toBe(0o600);
+    });
+  });
+
   describe("page + metadata combined", () => {
     it("page data and metadata are independent", async () => {
       const data = new Uint8Array(PAGE_SIZE);

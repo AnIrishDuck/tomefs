@@ -1229,6 +1229,166 @@ describe("SAB bridge: large batch operations", () => {
   });
 });
 
+describe("SAB bridge: syncAll through bridge", () => {
+  let backend: MemoryBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  async function setup(bufferSize?: number) {
+    backend = new MemoryBackend();
+    sab = SabClient.createBuffer(bufferSize);
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 0 },
+    });
+    await waitReady(clientWorker);
+  }
+
+  it("@fast syncAll fast path writes pages and metadata atomically", async () => {
+    // Default 1MB buffer — a small batch fits easily
+    await setup();
+    const pages = Array.from({ length: 5 }, (_, i) => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = i + 1;
+      return { path: "/synctest", pageIndex: i, data };
+    });
+    const metas = [
+      {
+        path: "/synctest",
+        meta: { size: PAGE_SIZE * 5, mode: 0o644, ctime: 100, mtime: 200 },
+      },
+    ];
+
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    // Verify all pages were written
+    for (let i = 0; i < 5; i++) {
+      const r = await callClient(clientWorker, "readPage", ["/synctest", i]);
+      expect(toUint8Array(r)[0]).toBe(i + 1);
+    }
+
+    // Verify metadata
+    const meta = (await callClient(clientWorker, "readMeta", [
+      "/synctest",
+    ])) as { size: number };
+    expect(meta.size).toBe(PAGE_SIZE * 5);
+  });
+
+  it("@fast syncAll fallback path when pages exceed maxBatchPages", async () => {
+    // Default 1MB buffer has maxBatchPages ≈ 124.
+    // 150 pages × 8KB = 1.2MB — exceeds buffer, triggers fallback
+    // to writePages + writeMetas (with auto-chunking).
+    await setup();
+    const pages = Array.from({ length: 150 }, (_, i) => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = i & 0xff;
+      data[1] = (i >> 8) & 0xff;
+      return { path: "/fallback", pageIndex: i, data };
+    });
+    const metas = [
+      {
+        path: "/fallback",
+        meta: { size: PAGE_SIZE * 150, mode: 0o644, ctime: 1, mtime: 2 },
+      },
+    ];
+
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    // Verify sample pages across chunk boundaries
+    for (const idx of [0, 50, 99, 123, 124, 149]) {
+      const r = await callClient(clientWorker, "readPage", ["/fallback", idx]);
+      const buf = toUint8Array(r);
+      expect(buf[0]).toBe(idx & 0xff);
+      expect(buf[1]).toBe((idx >> 8) & 0xff);
+    }
+
+    // Verify metadata was also persisted via fallback
+    const meta = (await callClient(clientWorker, "readMeta", [
+      "/fallback",
+    ])) as { size: number };
+    expect(meta.size).toBe(PAGE_SIZE * 150);
+  });
+
+  it("syncAll fallback with multiple files and metadata entries", async () => {
+    // Use default buffer; 150 total pages across 3 files triggers fallback
+    await setup();
+    const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
+    const metas: Array<{ path: string; meta: { size: number; mode: number; ctime: number; mtime: number } }> = [];
+
+    for (let f = 0; f < 3; f++) {
+      const path = `/multi-${f}`;
+      for (let i = 0; i < 50; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data[0] = f;
+        data[1] = i;
+        pages.push({ path, pageIndex: i, data });
+      }
+      metas.push({
+        path,
+        meta: { size: PAGE_SIZE * 50, mode: 0o644, ctime: f, mtime: f },
+      });
+    }
+
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    // Verify each file got its pages and metadata
+    for (let f = 0; f < 3; f++) {
+      const path = `/multi-${f}`;
+      const r = await callClient(clientWorker, "readPage", [path, 25]);
+      const buf = toUint8Array(r);
+      expect(buf[0]).toBe(f);
+      expect(buf[1]).toBe(25);
+
+      const meta = (await callClient(clientWorker, "readMeta", [path])) as {
+        ctime: number;
+      };
+      expect(meta.ctime).toBe(f);
+    }
+  });
+
+  it("syncAll fallback with many metadata entries but few pages", async () => {
+    // Few pages (fits in buffer) but many metadata entries — should take fast path
+    // since page count determines the fallback, not metadata count
+    await setup();
+    const pages = [
+      {
+        path: "/single",
+        pageIndex: 0,
+        data: new Uint8Array(PAGE_SIZE).fill(0x42),
+      },
+    ];
+    const metas = Array.from({ length: 50 }, (_, i) => ({
+      path: `/meta-${i}`,
+      meta: { size: 0, mode: 0o644, ctime: i, mtime: i },
+    }));
+
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    // Page was written
+    const r = await callClient(clientWorker, "readPage", ["/single", 0]);
+    expect(toUint8Array(r)[0]).toBe(0x42);
+
+    // All metadata entries were persisted
+    for (const idx of [0, 24, 49]) {
+      const meta = (await callClient(clientWorker, "readMeta", [
+        `/meta-${idx}`,
+      ])) as { ctime: number };
+      expect(meta.ctime).toBe(idx);
+    }
+  });
+});
+
 describe("SAB bridge: protocol edge cases", () => {
   it("decodeMessage with zero-length binary section", () => {
     const buf = new ArrayBuffer(CONTROL_BYTES + 200);
