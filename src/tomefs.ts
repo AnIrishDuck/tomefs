@@ -752,9 +752,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
-        } else {
-          pageCache.flushFile(node.storagePath);
         }
+        // Dirty pages remain in the cache and are flushed by syncfs or
+        // eviction. POSIX close() does not guarantee persistence — that
+        // is fsync's job. Deferring flush eliminates O(dirty) backend
+        // writes on every close, matching MEMFS behavior.
       }
     },
 
@@ -835,7 +837,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (FS.isFile(node.mode)) {
         currentPaths.add(path);
         // Only write metadata if it changed since last sync (or first sync).
-        // Page data is already flushed by flushAll() before persistTree().
+        // Page data is collected by collectDirtyPages() before persistTree()
+        // and written to the backend via syncAll() after metadata collection.
         if (node._metaDirty) {
           metaBatch.push({
             path,
@@ -1106,10 +1109,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             // for steady-state PGlite workloads where most queries only
             // modify a few files (WAL + heap + index) out of hundreds.
             //
-            // Collect dirty pages without flushing, then combine with
-            // dirty metadata into a single backend.syncAll() call. This
-            // halves SAB bridge round-trips (2→1) and for IDB backends
-            // writes pages + metadata in a single atomic transaction.
+            // Two-phase commit: collect dirty pages without clearing flags,
+            // combine with dirty metadata into a single backend.syncAll()
+            // call, then commit (clear flags) only on success. If syncAll
+            // throws, dirty state is preserved so the next syncfs retries.
             const dirtyPages = pageCache.collectDirtyPages();
             const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
             const mountPrefix = mount.mountpoint || "";
@@ -1160,7 +1163,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
                   },
                 });
               }
-              node._metaDirty = false;
             }
 
             // Include clean-shutdown marker in the same batch so it's
@@ -1170,16 +1172,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
             });
             backend.syncAll(dirtyPages, metaBatch);
+
+            // Phase 2: clear dirty flags only after backend writes succeed.
+            // If syncAll throws, dirty state is preserved for retry.
             pageCache.commitDirtyPages(dirtyPages);
             needsCleanMarker = false;
+            for (const node of dirtyMetaNodes) {
+              node._metaDirty = false;
+            }
             dirtyMetaNodes.clear();
           } else {
             // Full tree walk path: needed when orphan cleanup is required
             // (after rename/unlink operations). Builds currentPaths set to
             // detect stale backend entries.
             //
-            // Collect dirty pages first, then build the metadata batch,
-            // then write both atomically via syncAll. Orphan cleanup
+            // Two-phase commit: collect dirty pages without clearing flags,
+            // then build the metadata batch, write both atomically via
+            // syncAll, then commit (clear flags) on success. Orphan cleanup
             // follows as a separate operation.
             //
             // This ordering is critical for crash safety with IDB: if the
@@ -1270,12 +1279,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
             });
             backend.syncAll(dirtyPages, metaBatch);
+
+            // Phase 2: clear dirty flags only after backend writes succeed.
+            // If syncAll throws, dirty state is preserved for retry.
             pageCache.commitDirtyPages(dirtyPages);
             needsCleanMarker = false;
-
-            // Clear dirty flags on all nodes whose metadata was persisted.
-            // Uses the dirty set instead of walking the full tree — O(dirty)
-            // instead of O(tree) + O(files).
             for (const node of dirtyMetaNodes) {
               node._metaDirty = false;
             }
