@@ -110,8 +110,11 @@ class OrderTrackingBackend implements StorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void> {
-    await this.writePages(pages);
-    await this.writeMetas(metas);
+    this.log.push(["syncAll", {
+      pages: pages.map((p) => ({ path: p.path, pageIndex: p.pageIndex })),
+      metas: metas.map((m) => m.path),
+    }]);
+    return this.inner.syncAll(pages, metas);
   }
 }
 
@@ -205,8 +208,8 @@ class CrashAfterNOpsBackend implements StorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void> {
-    await this.writePages(pages);
-    await this.writeMetas(metas);
+    this.tick();
+    return this.inner.syncAll(pages, metas);
   }
 }
 
@@ -255,34 +258,36 @@ describe("PreloadBackend flush ordering", () => {
     // Flush and examine operation order
     await backend.flush();
 
-    // Find the index of each operation type involving /target
+    // Find the index of each operation type involving /target.
+    // flush() uses syncAll for atomic page+metadata writes, so we check
+    // both syncAll entries and individual writePages/writeMetas entries.
     const deleteIndex = remote.log.findIndex(
       ([op, arg]) =>
         (op === "deleteFiles" && (arg as string[]).includes("/target")) ||
         (op === "deleteFile" && arg === "/target"),
     );
-    const metaWriteIndex = remote.log.findIndex(
-      ([op, arg]) =>
-        (op === "writeMetas" && (arg as string[]).includes("/target")) ||
-        (op === "writeMeta" && arg === "/target"),
-    );
-    const pageWriteIndex = remote.log.findIndex(
+    const writeIndex = remote.log.findIndex(
       ([op, arg]) => {
+        if (op === "syncAll") {
+          const sa = arg as { pages: Array<{ path: string }>; metas: string[] };
+          return sa.pages.some((p) => p.path === "/target") ||
+                 sa.metas.includes("/target");
+        }
         if (op === "writePages") {
           return (arg as Array<{ path: string }>).some((p) => p.path === "/target");
         }
+        if (op === "writeMetas") return (arg as string[]).includes("/target");
         if (op === "writePage") return arg === "/target";
+        if (op === "writeMeta") return arg === "/target";
         return false;
       },
     );
 
     expect(deleteIndex).toBeGreaterThanOrEqual(0);
-    expect(metaWriteIndex).toBeGreaterThanOrEqual(0);
-    expect(pageWriteIndex).toBeGreaterThanOrEqual(0);
+    expect(writeIndex).toBeGreaterThanOrEqual(0);
 
-    // Both metadata and pages for the recreated /target must come AFTER the delete
-    expect(pageWriteIndex).toBeGreaterThan(deleteIndex);
-    expect(metaWriteIndex).toBeGreaterThan(deleteIndex);
+    // Pages + metadata for the recreated /target must come AFTER the delete
+    expect(writeIndex).toBeGreaterThan(deleteIndex);
   });
 
   it("defers metadata write when renameFile triggers delete-then-recreate", async () => {
@@ -331,21 +336,28 @@ describe("PreloadBackend flush ordering", () => {
 
     await backend.flush();
 
-    // Verify: metadata for /target must be written AFTER /target is deleted
+    // Verify: metadata for /target must be written AFTER /target is deleted.
+    // flush() uses syncAll, so check both syncAll and writeMetas entries.
     const deleteIndex = remote.log.findIndex(
       ([op, arg]) =>
         (op === "deleteFiles" && (arg as string[]).includes("/target")) ||
         (op === "deleteFile" && arg === "/target"),
     );
-    const metaWriteIndex = remote.log.findIndex(
-      ([op, arg]) =>
-        (op === "writeMetas" && (arg as string[]).includes("/target")) ||
-        (op === "writeMeta" && arg === "/target"),
+    const writeIndex = remote.log.findIndex(
+      ([op, arg]) => {
+        if (op === "syncAll") {
+          const sa = arg as { pages: Array<{ path: string }>; metas: string[] };
+          return sa.metas.includes("/target");
+        }
+        if (op === "writeMetas") return (arg as string[]).includes("/target");
+        if (op === "writeMeta") return arg === "/target";
+        return false;
+      },
     );
 
     expect(deleteIndex).toBeGreaterThanOrEqual(0);
-    expect(metaWriteIndex).toBeGreaterThanOrEqual(0);
-    expect(metaWriteIndex).toBeGreaterThan(deleteIndex);
+    expect(writeIndex).toBeGreaterThanOrEqual(0);
+    expect(writeIndex).toBeGreaterThan(deleteIndex);
   });
 
   it("crash after early metadata write does not orphan data", async () => {
@@ -421,7 +433,7 @@ describe("PreloadBackend flush ordering", () => {
     await backend.flush();
 
     // The metadata write for /f must come after the file delete.
-    // Count operations before and after delete.
+    // flush() uses syncAll, so check both syncAll and writeMetas entries.
     const ops = remote.log.map(([op, ...args]) => ({ op, args }));
     let sawDelete = false;
     for (const { op, args } of ops) {
@@ -431,6 +443,13 @@ describe("PreloadBackend flush ordering", () => {
       ) {
         sawDelete = true;
       }
+      // Check syncAll entries for the path
+      if (op === "syncAll") {
+        const sa = args[0] as { pages: Array<{ path: string }>; metas: string[] };
+        if (sa.metas.includes("/f")) {
+          expect(sawDelete).toBe(true);
+        }
+      }
       if (
         (op === "writeMetas" && (args[0] as string[]).includes("/f")) ||
         (op === "writeMeta" && args[0] === "/f")
@@ -439,5 +458,152 @@ describe("PreloadBackend flush ordering", () => {
       }
     }
     expect(sawDelete).toBe(true);
+  });
+
+  it("@fast flush uses syncAll for common case (no deletes)", async () => {
+    // When there are no deletions or truncations, flush should use a
+    // single syncAll call instead of separate writePages + writeMetas.
+    // This gives IDB backends a single atomic transaction.
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+    remote.clearLog();
+
+    // Write some pages and metadata
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0x42;
+    backend.writePage("/a", 0, data);
+    backend.writeMeta("/a", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+
+    backend.writePage("/b", 0, data);
+    backend.writeMeta("/b", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+
+    await backend.flush();
+
+    // Verify flush used syncAll (not separate writePages + writeMetas)
+    const syncAllCalls = remote.log.filter(([op]) => op === "syncAll");
+    expect(syncAllCalls.length).toBe(1);
+
+    // The single syncAll should contain both files' pages and metadata
+    const sa = syncAllCalls[0][1] as {
+      pages: Array<{ path: string; pageIndex: number }>;
+      metas: string[];
+    };
+    expect(sa.pages).toHaveLength(2);
+    expect(sa.metas).toHaveLength(2);
+    expect(sa.pages.map((p) => p.path).sort()).toEqual(["/a", "/b"]);
+    expect([...sa.metas].sort()).toEqual(["/a", "/b"]);
+
+    // No separate writePages or writeMetas calls should appear
+    const separateCalls = remote.log.filter(
+      ([op]) => op === "writePages" || op === "writeMetas",
+    );
+    expect(separateCalls).toHaveLength(0);
+  });
+
+  it("flush uses syncAll for late batch (delete-then-recreate)", async () => {
+    // Even in the delete-then-recreate case, the late batch should use
+    // syncAll for atomicity — pages and metadata are committed together.
+    const oldData = new Uint8Array(PAGE_SIZE);
+    oldData[0] = 0xaa;
+    await innerRemote.writePage("/f", 0, oldData);
+    await innerRemote.writeMeta("/f", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+    remote.clearLog();
+
+    // Delete and recreate at same path
+    backend.deleteFile("/f");
+    backend.deleteMeta("/f");
+
+    const newData = new Uint8Array(PAGE_SIZE);
+    newData[0] = 0xbb;
+    backend.writePage("/f", 0, newData);
+    backend.writeMeta("/f", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 2000,
+      mtime: 2000,
+    });
+
+    await backend.flush();
+
+    // The late batch should be a single syncAll containing both pages and meta
+    const syncAllCalls = remote.log.filter(([op]) => op === "syncAll");
+    // May have 1 or 2 syncAll calls depending on whether there's an early batch
+    const lateSyncAll = syncAllCalls.find(([, arg]) => {
+      const sa = arg as { pages: Array<{ path: string }>; metas: string[] };
+      return sa.metas.includes("/f") || sa.pages.some((p) => p.path === "/f");
+    });
+    expect(lateSyncAll).toBeDefined();
+
+    const sa = lateSyncAll![1] as {
+      pages: Array<{ path: string; pageIndex: number }>;
+      metas: string[];
+    };
+    // Both page and metadata for /f should be in the same syncAll call
+    expect(sa.pages.some((p) => p.path === "/f")).toBe(true);
+    expect(sa.metas.includes("/f")).toBe(true);
+  });
+
+  it("crash during syncAll is atomic — no partial page+meta writes", async () => {
+    // With syncAll, a crash during the atomic operation should leave the
+    // remote in a consistent state: either both pages and metadata are
+    // written, or neither is. CrashAfterNOpsBackend counts syncAll as
+    // a single op, modeling IDB's transactional semantics.
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0x42;
+    await innerRemote.writePage("/existing", 0, data);
+    await innerRemote.writeMeta("/existing", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+
+    // Crash after 0 ops: the syncAll call itself fails, so nothing is written
+    const crashBackend = new CrashAfterNOpsBackend(innerRemote, 0);
+    const backend = new PreloadBackend(crashBackend);
+    await backend.init();
+
+    // Write new data — this will try to flush via syncAll
+    const newData = new Uint8Array(PAGE_SIZE);
+    newData[0] = 0xff;
+    backend.writePage("/new", 0, newData);
+    backend.writeMeta("/new", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 2000,
+      mtime: 2000,
+    });
+
+    // Flush should fail (crash on first syncAll)
+    await expect(backend.flush()).rejects.toThrow("SIMULATED_CRASH");
+
+    // Remote should not have the new file (syncAll was atomic)
+    const page = await innerRemote.readPage("/new", 0);
+    expect(page).toBeNull();
+    const meta = await innerRemote.readMeta("/new");
+    expect(meta).toBeNull();
+
+    // Existing data should be untouched
+    const existingPage = await innerRemote.readPage("/existing", 0);
+    expect(existingPage).not.toBeNull();
+    expect(existingPage![0]).toBe(0x42);
   });
 });

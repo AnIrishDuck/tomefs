@@ -396,9 +396,12 @@ export class PreloadBackend implements SyncStorageBackend {
    * to avoid the subsequent deleteFile removing newly written pages.
    * These are handled in a separate pass after deletions.
    *
-   * Operations within each step are batched to minimize round-trips
-   * to the remote backend (important when the remote is IDB behind
-   * a SAB bridge, where each call is a cross-worker round-trip).
+   * Pages and metadata within each phase are written atomically via
+   * syncAll(). For IDB backends, this means a single multi-store
+   * transaction — the same atomicity guarantee as the SAB bridge path.
+   * This eliminates the crash window between separate writePages and
+   * writeMetas calls that could leave pages without metadata (or vice
+   * versa).
    *
    * Safe to call multiple times — no-op if nothing is dirty.
    */
@@ -464,7 +467,7 @@ export class PreloadBackend implements SyncStorageBackend {
     // Truncations delete stale tail pages from the remote. If a file was
     // truncated and then extended (e.g., truncate to 100 bytes then write
     // at offset 8192), the new page at the truncation point is dirty and
-    // will be written in step 3. Without this ordering, page writes would
+    // will be written in step 2. Without this ordering, page writes would
     // go to the remote first, then the truncation would delete them.
     if (this.truncations.size > 0) {
       await Promise.all(
@@ -475,39 +478,33 @@ export class PreloadBackend implements SyncStorageBackend {
     }
     this.truncations.clear();
 
-    // 2. Write new pages at non-deleted paths (after truncation cleanup)
-    if (earlyBatch.length > 0) {
-      await this.remote.writePages(earlyBatch);
+    // 2. Atomically write pages + metadata for non-deleted paths.
+    // Uses syncAll so IDB backends commit both in a single transaction,
+    // eliminating the crash window between separate writePages + writeMetas
+    // calls. This matches the SAB bridge path's atomicity guarantee.
+    if (earlyBatch.length > 0 || earlyMeta.length > 0) {
+      await this.remote.syncAll(earlyBatch, earlyMeta);
     }
 
-    // 3. Batch-write dirty metadata for non-deleted paths
-    if (earlyMeta.length > 0) {
-      await this.remote.writeMetas(earlyMeta);
-    }
-
-    // 4. Batch-delete files from remote (single call instead of O(n))
+    // 3. Batch-delete files from remote (single call instead of O(n))
     if (this.deletedFiles.size > 0) {
       await this.remote.deleteFiles([...this.deletedFiles]);
     }
     this.deletedFiles.clear();
 
-    // 5. Batch-delete metadata
+    // 4. Batch-delete metadata
     if (this.deletedMeta.size > 0) {
       await this.remote.deleteMetas([...this.deletedMeta]);
     }
     this.deletedMeta.clear();
 
-    // 6. Write pages for delete-then-recreate paths
-    if (lateBatch.length > 0) {
-      await this.remote.writePages(lateBatch);
+    // 5. Atomically write pages + metadata for delete-then-recreate paths.
+    // Same syncAll guarantee as step 2 — IDB commits both in one transaction.
+    if (lateBatch.length > 0 || lateMeta.length > 0) {
+      await this.remote.syncAll(lateBatch, lateMeta);
     }
 
-    // 7. Batch-write metadata for delete-then-recreate paths
-    if (lateMeta.length > 0) {
-      await this.remote.writeMetas(lateMeta);
-    }
-
-    // 8. All operations succeeded — clear dirty tracking for flushed entries.
+    // 6. All operations succeeded — clear dirty tracking for flushed entries.
     // We clear individual entries (not the whole set) so that writes that
     // occurred during flush are preserved for the next flush cycle.
     for (const key of flushedPageKeys) {
