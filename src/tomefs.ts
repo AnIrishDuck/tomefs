@@ -1170,6 +1170,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
             });
             backend.syncAll(dirtyPages, metaBatch);
+            pageCache.commitDirtyPages(dirtyPages);
             needsCleanMarker = false;
             dirtyMetaNodes.clear();
           } else {
@@ -1269,6 +1270,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
             });
             backend.syncAll(dirtyPages, metaBatch);
+            pageCache.commitDirtyPages(dirtyPages);
             needsCleanMarker = false;
 
             // Clear dirty flags on all nodes whose metadata was persisted.

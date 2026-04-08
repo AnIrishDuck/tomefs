@@ -1266,4 +1266,123 @@ describe("SyncPageCache", () => {
       }
     });
   });
+
+  describe("collectDirtyPages", () => {
+    it("returns empty array when no dirty pages", () => {
+      const cache = new SyncPageCache(backend, 16);
+      expect(cache.collectDirtyPages()).toEqual([]);
+    });
+
+    it("returns all dirty pages without clearing dirty flags", () => {
+      const cache = new SyncPageCache(backend, 16);
+      const buf1 = new Uint8Array(PAGE_SIZE).fill(0xaa);
+      const buf2 = new Uint8Array(PAGE_SIZE).fill(0xbb);
+      cache.write("/a", buf1, 0, PAGE_SIZE, 0, 0);
+      cache.write("/b", buf2, 0, PAGE_SIZE, 0, 0);
+
+      const collected = cache.collectDirtyPages();
+      expect(collected.length).toBe(2);
+
+      // Pages should still be dirty after collection
+      expect(cache.dirtyCount).toBe(2);
+      expect(cache.isDirty("/a", 0)).toBe(true);
+      expect(cache.isDirty("/b", 0)).toBe(true);
+
+      // Collected data should reference the cached page buffers
+      const paths = collected.map((p) => p.path).sort();
+      expect(paths).toEqual(["/a", "/b"]);
+    });
+
+    it("can be called multiple times without side effects", () => {
+      const cache = new SyncPageCache(backend, 16);
+      cache.write("/f", new Uint8Array(PAGE_SIZE).fill(1), 0, PAGE_SIZE, 0, 0);
+
+      const first = cache.collectDirtyPages();
+      const second = cache.collectDirtyPages();
+      expect(first.length).toBe(1);
+      expect(second.length).toBe(1);
+      expect(cache.dirtyCount).toBe(1);
+    });
+  });
+
+  describe("commitDirtyPages", () => {
+    it("clears dirty flags for committed pages", () => {
+      const cache = new SyncPageCache(backend, 16);
+      cache.write("/a", new Uint8Array(PAGE_SIZE).fill(0xaa), 0, PAGE_SIZE, 0, 0);
+      cache.write("/b", new Uint8Array(PAGE_SIZE).fill(0xbb), 0, PAGE_SIZE, 0, 0);
+
+      const collected = cache.collectDirtyPages();
+      expect(cache.dirtyCount).toBe(2);
+
+      cache.commitDirtyPages(collected);
+      expect(cache.dirtyCount).toBe(0);
+      expect(cache.isDirty("/a", 0)).toBe(false);
+      expect(cache.isDirty("/b", 0)).toBe(false);
+    });
+
+    it("preserves pages dirtied between collect and commit", () => {
+      const cache = new SyncPageCache(backend, 16);
+      cache.write("/a", new Uint8Array(PAGE_SIZE).fill(0xaa), 0, PAGE_SIZE, 0, 0);
+      const collected = cache.collectDirtyPages();
+
+      // Dirty a new page after collection
+      cache.write("/b", new Uint8Array(PAGE_SIZE).fill(0xbb), 0, PAGE_SIZE, 0, 0);
+      expect(cache.dirtyCount).toBe(2);
+
+      // Commit only the originally collected pages
+      cache.commitDirtyPages(collected);
+      expect(cache.dirtyCount).toBe(1);
+      expect(cache.isDirty("/a", 0)).toBe(false);
+      expect(cache.isDirty("/b", 0)).toBe(true);
+    });
+
+    it("handles pages evicted between collect and commit", () => {
+      const smallCache = new SyncPageCache(backend, 2);
+      smallCache.write("/a", new Uint8Array(PAGE_SIZE).fill(1), 0, PAGE_SIZE, 0, 0);
+      const collected = smallCache.collectDirtyPages();
+
+      // Fill cache to force eviction of /a
+      smallCache.getPage("/b", 0);
+      smallCache.getPage("/c", 0);
+
+      // Commit should be a no-op for the evicted page (it was flushed on eviction)
+      smallCache.commitDirtyPages(collected);
+      // No error, no crash
+      expect(smallCache.dirtyCount).toBe(0);
+    });
+
+    it("increments flush counter", () => {
+      const cache = new SyncPageCache(backend, 16);
+      cache.write("/a", new Uint8Array(PAGE_SIZE).fill(1), 0, PAGE_SIZE, 0, 0);
+      cache.write("/b", new Uint8Array(PAGE_SIZE).fill(2), 0, PAGE_SIZE, 0, 0);
+
+      const before = cache.getStats().flushes;
+      cache.commitDirtyPages(cache.collectDirtyPages());
+      expect(cache.getStats().flushes).toBe(before + 2);
+    });
+
+    it("two-phase commit round-trip: collect → backend write → commit", () => {
+      const cache = new SyncPageCache(backend, 16);
+      // Write dirty pages
+      cache.write("/f", new Uint8Array(PAGE_SIZE).fill(0x42), 0, PAGE_SIZE, 0, 0);
+
+      // Phase 1: collect
+      const dirty = cache.collectDirtyPages();
+      expect(dirty.length).toBe(1);
+      expect(cache.dirtyCount).toBe(1); // still dirty
+
+      // Phase 2: write to backend
+      backend.writePages(dirty);
+
+      // Phase 3: commit
+      cache.commitDirtyPages(dirty);
+      expect(cache.dirtyCount).toBe(0);
+
+      // Verify data persisted correctly
+      cache.evictFile("/f");
+      const buf = new Uint8Array(PAGE_SIZE);
+      cache.read("/f", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0x42);
+    });
+  });
 });
