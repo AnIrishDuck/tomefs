@@ -318,8 +318,8 @@ describe("SyncPageCache error handling", () => {
     });
   });
 
-  describe("collectDirtyPages error recovery", () => {
-    it("dirty pages collected then backend write fails — data available for retry", () => {
+  describe("two-phase commit (collectDirtyPages + commitDirtyPages)", () => {
+    it("preserves dirty flags when backend write fails between collect and commit", () => {
       const backend = new FailingSyncBackend();
       const cache = new SyncPageCache(backend, 16);
 
@@ -327,26 +327,59 @@ describe("SyncPageCache error handling", () => {
       cache.write("/file", new Uint8Array(PAGE_SIZE).fill(0xcd), 0, PAGE_SIZE, 0, 0);
       expect(cache.dirtyCount).toBe(1);
 
-      // collectDirtyPages clears flags (current behavior)
+      // Phase 1: collect (dirty flags preserved)
       const dirty = cache.collectDirtyPages();
       expect(dirty.length).toBe(1);
-      expect(cache.dirtyCount).toBe(0);
+      expect(cache.dirtyCount).toBe(1);
 
-      // Backend write fails
+      // Phase 2: backend write fails
       backend.writePagesFails = true;
       expect(() => backend.writePages(dirty)).toThrow(
         "injected writePages failure",
       );
 
-      // Data is still in cache — caller can retry with the collected pages
-      expect(cache.has("/file", 0)).toBe(true);
+      // Do NOT call commitDirtyPages — the write failed
+      // Dirty flags should still be set
+      expect(cache.dirtyCount).toBe(1);
+      expect(cache.isDirty("/file", 0)).toBe(true);
 
-      // Retry succeeds
+      // Phase 3: retry succeeds
       backend.writePagesFails = false;
-      backend.writePages(dirty);
+      const retry = cache.collectDirtyPages();
+      expect(retry.length).toBe(1);
+      backend.writePages(retry);
+      cache.commitDirtyPages(retry);
+      expect(cache.dirtyCount).toBe(0);
+
+      // Verify data persisted
       const stored = backend.readPage("/file", 0);
       expect(stored).not.toBeNull();
       expect(stored![0]).toBe(0xcd);
+    });
+
+    it("preserves pages dirtied between collect and commit", () => {
+      const backend = new FailingSyncBackend();
+      const cache = new SyncPageCache(backend, 16);
+
+      // Write initial dirty page
+      cache.write("/a", new Uint8Array(PAGE_SIZE).fill(1), 0, PAGE_SIZE, 0, 0);
+
+      // Collect
+      const dirty = cache.collectDirtyPages();
+      expect(dirty.length).toBe(1);
+
+      // Write a NEW dirty page during the collect-commit window
+      cache.write("/b", new Uint8Array(PAGE_SIZE).fill(2), 0, PAGE_SIZE, 0, 0);
+      expect(cache.dirtyCount).toBe(2);
+
+      // Backend write succeeds, commit only the original pages
+      backend.writePages(dirty);
+      cache.commitDirtyPages(dirty);
+
+      // Only /a should be committed; /b is still dirty
+      expect(cache.dirtyCount).toBe(1);
+      expect(cache.isDirty("/a", 0)).toBe(false);
+      expect(cache.isDirty("/b", 0)).toBe(true);
     });
   });
 });
