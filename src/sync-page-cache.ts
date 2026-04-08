@@ -473,12 +473,16 @@ export class SyncPageCache {
   }
 
   /**
-   * Collect all dirty pages and clear their dirty flags without writing
-   * to the backend. Returns the pages that would have been flushed.
+   * Collect all dirty pages without clearing their dirty flags.
    *
    * Used by tomefs syncfs to combine dirty pages with metadata into a
    * single backend.syncAll() call, reducing SAB round-trips from 2→1
    * and enabling atomic IDB commits (pages + metadata in one transaction).
+   *
+   * Call confirmFlush() after the backend write succeeds to clear dirty
+   * flags. If the write fails, NOT calling confirmFlush() preserves the
+   * flags so pages will be retried on the next syncfs or flushed on
+   * eviction — preventing silent data loss.
    */
   collectDirtyPages(): Array<{
     path: string;
@@ -500,14 +504,30 @@ export class SyncPageCache {
         pageIndex: page.pageIndex,
         data: page.data,
       });
-      page.dirty = false;
     }
 
-    this._flushes += dirtyPages.length;
+    return dirtyPages;
+  }
+
+  /**
+   * Clear dirty flags for all currently-dirty pages.
+   *
+   * Called after a successful backend write (syncAll) to complete the
+   * two-phase collect+confirm pattern. Pages collected by
+   * collectDirtyPages() remain dirty until this is called, ensuring
+   * that a failed backend write doesn't silently drop dirty pages.
+   */
+  confirmFlush(): void {
+    if (this.dirtyKeys.size === 0) return;
+
+    for (const key of this.dirtyKeys) {
+      const page = this.cache.get(key);
+      if (page) page.dirty = false;
+    }
+
+    this._flushes += this.dirtyKeys.size;
     this.dirtyKeys.clear();
     this.dirtyFileKeys.clear();
-
-    return dirtyPages;
   }
 
   /**

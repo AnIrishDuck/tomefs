@@ -319,7 +319,7 @@ describe("SyncPageCache error handling", () => {
   });
 
   describe("collectDirtyPages error recovery", () => {
-    it("dirty pages collected then backend write fails — data available for retry", () => {
+    it("dirty flags preserved after collectDirtyPages — retry possible after failed write", () => {
       const backend = new FailingSyncBackend();
       const cache = new SyncPageCache(backend, 16);
 
@@ -327,10 +327,10 @@ describe("SyncPageCache error handling", () => {
       cache.write("/file", new Uint8Array(PAGE_SIZE).fill(0xcd), 0, PAGE_SIZE, 0, 0);
       expect(cache.dirtyCount).toBe(1);
 
-      // collectDirtyPages clears flags (current behavior)
+      // collectDirtyPages does NOT clear flags — two-phase pattern
       const dirty = cache.collectDirtyPages();
       expect(dirty.length).toBe(1);
-      expect(cache.dirtyCount).toBe(0);
+      expect(cache.dirtyCount).toBe(1); // still dirty!
 
       // Backend write fails
       backend.writePagesFails = true;
@@ -338,12 +338,18 @@ describe("SyncPageCache error handling", () => {
         "injected writePages failure",
       );
 
-      // Data is still in cache — caller can retry with the collected pages
+      // Dirty flag preserved — page will be flushed on eviction or next sync
       expect(cache.has("/file", 0)).toBe(true);
+      expect(cache.isDirty("/file", 0)).toBe(true);
 
-      // Retry succeeds
+      // Retry: collect again, write succeeds, then confirm
       backend.writePagesFails = false;
-      backend.writePages(dirty);
+      const retry = cache.collectDirtyPages();
+      expect(retry.length).toBe(1);
+      backend.writePages(retry);
+      cache.confirmFlush();
+
+      expect(cache.dirtyCount).toBe(0);
       const stored = backend.readPage("/file", 0);
       expect(stored).not.toBeNull();
       expect(stored![0]).toBe(0xcd);
