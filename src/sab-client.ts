@@ -162,7 +162,7 @@ export class SabClient implements SyncStorageBackend {
             `SAB bridge readPages: binary data underflow at offset ${offset} + size ${size} > ${binary.length}`,
           );
         }
-        pages.push(new Uint8Array(binary.slice(offset, offset + size)));
+        pages.push(binary.slice(offset, offset + size));
         offset += size;
       }
     }

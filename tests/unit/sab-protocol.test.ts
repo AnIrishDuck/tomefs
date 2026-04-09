@@ -319,7 +319,7 @@ describe("sab-protocol", () => {
   });
 
   describe("data isolation", () => {
-    it("decodeMessage returns copies, not views into the buffer", () => {
+    it("decodeMessage returns a view into the buffer, not a copy", () => {
       const { dataView, uint8View } = createViews();
       const json = { path: "/test" };
       const chunk = new Uint8Array([1, 2, 3]);
@@ -327,11 +327,11 @@ describe("sab-protocol", () => {
       const totalLen = encodeMessage(dataView, uint8View, json, [chunk]);
       const decoded = decodeMessage(dataView, uint8View, totalLen);
 
-      // Mutate the original buffer
-      uint8View.fill(0);
-
-      // Decoded binary should be unaffected (it's a slice copy)
+      // Binary is a subarray (view) — shares the underlying buffer.
+      // Callers that need the data to outlive the SAB call must copy
+      // (e.g., binary.slice() or new Uint8Array(binary)).
       expect(decoded.binary).toEqual(new Uint8Array([1, 2, 3]));
+      expect(decoded.binary.buffer).toBe(uint8View.buffer);
     });
 
     it("successive encodes overwrite previous data", () => {

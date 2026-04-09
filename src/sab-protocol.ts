@@ -174,7 +174,13 @@ export function decodeMessage(
 
   const binaryStart = JSON_REGION_OFFSET + 4 + jsonLen;
   const binaryEnd = JSON_REGION_OFFSET + totalLen;
-  const binary = uint8View.slice(binaryStart, binaryEnd);
+  // Return a subarray (view) instead of a slice (copy) — callers that need
+  // the data to outlive the current SAB call must copy it themselves. Both
+  // SabClient (readPage, readPagesChunk) and SabWorker (WRITE_PAGE,
+  // WRITE_PAGES, SYNC_ALL) already copy before the buffer is reused,
+  // so this eliminates an unnecessary intermediate allocation that could
+  // be up to 1 MB per readPages batch.
+  const binary = uint8View.subarray(binaryStart, binaryEnd);
 
   return { json, binary };
 }
