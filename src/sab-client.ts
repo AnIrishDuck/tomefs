@@ -463,8 +463,18 @@ export class SabClient implements SyncStorageBackend {
 
     if (status === STATUS_ERROR) {
       const responseLen = Atomics.load(this.controlView, SLOT_DATA_LEN);
-      const { json } = decodeMessage(this.dataView, this.uint8View, responseLen);
-      const errMsg = (json as { error: string }).error;
+
+      // Decode the error message from the worker. If decoding fails
+      // (e.g., worker set dataLen=0 because the error message itself
+      // overflowed the buffer), fall back to a generic error message
+      // instead of throwing from decodeMessage and leaking state.
+      let errMsg: string;
+      try {
+        const { json } = decodeMessage(this.dataView, this.uint8View, responseLen);
+        errMsg = (json as { error: string }).error;
+      } catch {
+        errMsg = "storage worker error (error details unavailable)";
+      }
 
       // Reset to idle for next call
       Atomics.store(this.controlView, SLOT_STATUS, STATUS_IDLE);

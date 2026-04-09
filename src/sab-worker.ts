@@ -119,10 +119,27 @@ export class SabWorker {
     } catch (err: unknown) {
       const errMsg =
         err instanceof Error ? err.message : "Unknown bridge error";
-      const errLen = encodeMessage(this.dataView, this.uint8View, {
-        error: errMsg,
-      });
-      Atomics.store(this.controlView, SLOT_DATA_LEN, errLen);
+      try {
+        const errLen = encodeMessage(this.dataView, this.uint8View, {
+          error: errMsg,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, errLen);
+      } catch {
+        // encodeMessage itself failed (e.g., error message overflows the
+        // SAB buffer). Write a minimal hardcoded error directly so the
+        // client doesn't hang forever on Atomics.wait().
+        try {
+          const errLen = encodeMessage(this.dataView, this.uint8View, {
+            error: "SAB worker error (message too large for buffer)",
+          });
+          Atomics.store(this.controlView, SLOT_DATA_LEN, errLen);
+        } catch {
+          // Even the minimal message doesn't fit — set dataLen to 0.
+          // The client will see STATUS_ERROR with no decodable payload
+          // and throw a generic error, which is better than deadlocking.
+          Atomics.store(this.controlView, SLOT_DATA_LEN, 0);
+        }
+      }
       Atomics.store(this.controlView, SLOT_STATUS, STATUS_ERROR);
       Atomics.notify(this.controlView, SLOT_STATUS);
     }

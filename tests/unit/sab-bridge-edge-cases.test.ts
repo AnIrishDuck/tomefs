@@ -24,6 +24,12 @@ import {
   CONTROL_BYTES,
   JSON_REGION_OFFSET,
   DEFAULT_BUFFER_SIZE,
+  SLOT_STATUS as PROTO_SLOT_STATUS,
+  SLOT_OPCODE as PROTO_SLOT_OPCODE,
+  SLOT_DATA_LEN as PROTO_SLOT_DATA_LEN,
+  STATUS_REQUEST as PROTO_STATUS_REQUEST,
+  STATUS_RESPONSE as PROTO_STATUS_RESPONSE,
+  STATUS_ERROR as PROTO_STATUS_ERROR,
 } from "../../src/sab-protocol.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1577,5 +1583,167 @@ describe("SAB bridge: worker-side dataLen validation", () => {
     const page = await backend.readPage("/valid", 0);
     expect(page).not.toBeNull();
     expect(page![0]).toBe(0x42);
+  });
+});
+
+describe("SAB bridge: worker error encoding double-fault", () => {
+  // Tests for the case where the backend throws an error whose message is too
+  // large to encode into the SAB buffer. Without the double-fault fix, the
+  // worker's catch handler would throw from encodeMessage, leaving the status
+  // word stuck at STATUS_REQUEST — deadlocking the client's Atomics.wait().
+
+  const OPCODE_READ_PAGE = 1;
+
+  /**
+   * Create a FailingBackend that throws errors with configurable message size.
+   */
+  class HugeErrorBackend implements StorageBackend {
+    private inner = new MemoryBackend();
+    errorMessage = "";
+
+    async readPage(_path: string, _pageIndex: number): Promise<Uint8Array | null> {
+      throw new Error(this.errorMessage);
+    }
+
+    // Delegate everything else to inner
+    async readPages(path: string, pageIndices: number[]) { return this.inner.readPages(path, pageIndices); }
+    async writePage(path: string, pageIndex: number, data: Uint8Array) { return this.inner.writePage(path, pageIndex, data); }
+    async writePages(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) { return this.inner.writePages(pages); }
+    async deleteFile(path: string) { return this.inner.deleteFile(path); }
+    async deleteFiles(paths: string[]) { return this.inner.deleteFiles(paths); }
+    async deletePagesFrom(path: string, fromPageIndex: number) { return this.inner.deletePagesFrom(path, fromPageIndex); }
+    async renameFile(oldPath: string, newPath: string) { return this.inner.renameFile(oldPath, newPath); }
+    async readMeta(path: string) { return this.inner.readMeta(path); }
+    async readMetas(paths: string[]) { return this.inner.readMetas(paths); }
+    async writeMeta(path: string, meta: FileMeta) { return this.inner.writeMeta(path, meta); }
+    async writeMetas(entries: Array<{ path: string; meta: FileMeta }>) { return this.inner.writeMetas(entries); }
+    async deleteMeta(path: string) { return this.inner.deleteMeta(path); }
+    async deleteMetas(paths: string[]) { return this.inner.deleteMetas(paths); }
+    async countPages(path: string) { return this.inner.countPages(path); }
+    async countPagesBatch(paths: string[]) { return this.inner.countPagesBatch(paths); }
+    async maxPageIndex(path: string) { return this.inner.maxPageIndex(path); }
+    async maxPageIndexBatch(paths: string[]) { return this.inner.maxPageIndexBatch(paths); }
+    async listFiles() { return this.inner.listFiles(); }
+    async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { return this.inner.syncAll(pages, metas); }
+  }
+
+  /**
+   * Send a request to a SabWorker on a custom buffer and poll for the response.
+   * Returns the raw status and dataLen (doesn't attempt to decode — the
+   * response may be intentionally undecodable in double-fault cases).
+   */
+  async function sendAndPoll(
+    testSab: SharedArrayBuffer,
+    worker: SabWorker,
+    opcode: number,
+    json: unknown,
+  ): Promise<{ status: number; dataLen: number }> {
+    const controlView = new Int32Array(testSab, 0, 3);
+    const dataView = new DataView(testSab);
+    const uint8View = new Uint8Array(testSab);
+
+    const dataLen = encodeMessage(dataView, uint8View, json);
+    Atomics.store(controlView, PROTO_SLOT_OPCODE, opcode);
+    Atomics.store(controlView, PROTO_SLOT_DATA_LEN, dataLen);
+
+    const workerPromise = worker.start();
+    Atomics.store(controlView, PROTO_SLOT_STATUS, PROTO_STATUS_REQUEST);
+    Atomics.notify(controlView, PROTO_SLOT_STATUS);
+
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      const status = Atomics.load(controlView, PROTO_SLOT_STATUS);
+      if (status === PROTO_STATUS_RESPONSE || status === PROTO_STATUS_ERROR) {
+        worker.stop();
+        const respLen = Atomics.load(controlView, PROTO_SLOT_DATA_LEN);
+        return { status, dataLen: respLen };
+      }
+    }
+    worker.stop();
+    throw new Error("Worker did not respond within timeout");
+  }
+
+  it("@fast signals STATUS_ERROR with fallback message when error message overflows buffer", async () => {
+    // Use a 256-byte buffer: fits the request and the hardcoded fallback
+    // error, but not the 1000-char backend error message.
+    const tinyBuffer = CONTROL_BYTES + 244;
+    const hugeBackend = new HugeErrorBackend();
+    hugeBackend.errorMessage = "x".repeat(1000);
+    const testSab = new SharedArrayBuffer(tinyBuffer);
+    const worker = new SabWorker(testSab, hugeBackend);
+
+    const result = await sendAndPoll(
+      testSab, worker, OPCODE_READ_PAGE,
+      { path: "/t", pageIndex: 0 },
+    );
+
+    expect(result.status).toBe(PROTO_STATUS_ERROR);
+    // The fallback message should have been encoded successfully
+    expect(result.dataLen).toBeGreaterThan(0);
+
+    // Decode to verify it's the fallback message
+    const dataView = new DataView(testSab);
+    const uint8View = new Uint8Array(testSab);
+    const decoded = decodeMessage(dataView, uint8View, result.dataLen);
+    expect((decoded.json as { error: string }).error).toBe(
+      "SAB worker error (message too large for buffer)",
+    );
+  });
+
+  it("@fast signals STATUS_ERROR with dataLen=0 when even fallback overflows", async () => {
+    // Use a 60-byte buffer: fits the request JSON (27 bytes) but not the
+    // error response or even the hardcoded fallback (~59 bytes of JSON).
+    // Data region = 48 bytes. JSON space = 48 - 4 prefix = 44 bytes.
+    // Error JSON {"error":"x"*40} = 51 bytes — too big.
+    // Fallback JSON {"error":"SAB worker error (...)"} = ~59 bytes — also too big.
+    const tinyBuffer = CONTROL_BYTES + 48;
+    const hugeBackend = new HugeErrorBackend();
+    hugeBackend.errorMessage = "x".repeat(40);
+    const testSab = new SharedArrayBuffer(tinyBuffer);
+    const worker = new SabWorker(testSab, hugeBackend);
+
+    const result = await sendAndPoll(
+      testSab, worker, OPCODE_READ_PAGE,
+      { path: "/t", pageIndex: 0 },
+    );
+
+    // Worker must still signal error — never leave client hanging
+    expect(result.status).toBe(PROTO_STATUS_ERROR);
+    // dataLen is 0 because even the fallback couldn't be encoded
+    expect(result.dataLen).toBe(0);
+  });
+
+  it("worker remains usable after double-fault recovery", async () => {
+    // Verify a fresh worker processes a normal request after a previous
+    // worker instance handled a double-fault on a tiny buffer.
+    const hugeBackend = new HugeErrorBackend();
+    hugeBackend.errorMessage = "x".repeat(1000);
+
+    // Phase 1: trigger double-fault on a tiny buffer
+    const tinyBuffer = CONTROL_BYTES + 244;
+    const testSab = new SharedArrayBuffer(tinyBuffer);
+    const worker = new SabWorker(testSab, hugeBackend);
+    const result1 = await sendAndPoll(
+      testSab, worker, OPCODE_READ_PAGE,
+      { path: "/t", pageIndex: 0 },
+    );
+    expect(result1.status).toBe(PROTO_STATUS_ERROR);
+
+    // Phase 2: normal operation on a full-size buffer
+    const normalSab = new SharedArrayBuffer(DEFAULT_BUFFER_SIZE);
+    const normalBackend = new MemoryBackend();
+    await normalBackend.writePage("/test", 0, new Uint8Array(PAGE_SIZE));
+    const normalWorker = new SabWorker(normalSab, normalBackend);
+
+    const result2 = await sendAndPoll(
+      normalSab, normalWorker, OPCODE_READ_PAGE,
+      { path: "/test", pageIndex: 0 },
+    );
+
+    expect(result2.status).toBe(PROTO_STATUS_RESPONSE);
+    const dataView = new DataView(normalSab);
+    const uint8View = new Uint8Array(normalSab);
+    const decoded = decodeMessage(dataView, uint8View, result2.dataLen);
+    expect((decoded.json as { found: boolean }).found).toBe(true);
   });
 });

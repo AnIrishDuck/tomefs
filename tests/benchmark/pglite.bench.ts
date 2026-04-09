@@ -14,6 +14,7 @@
 import { bench, describe, beforeAll, afterAll } from "vitest";
 import { createTomeFSPGlite } from "../../src/pglite-fs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
+import { createPGliteHarness, type PGliteHarness } from "../pglite/harness.js";
 
 // ---------------------------------------------------------------------------
 // Harness: PGlite on MemoryFS (baseline) vs tomefs
@@ -470,5 +471,123 @@ describe("Indexed Queries (500 rows, 3 indexes, 50 queries)", async () => {
   afterAll(async () => {
     await memfs.destroy();
     await tome.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Benchmark 9: Persistence Round-Trip (create → close → remount → query)
+//
+// The core value proposition of tomefs: data survives across process
+// restarts with bounded memory. This measures the end-to-end cost of
+// recreating PGlite against a pre-populated backend and querying data.
+// ---------------------------------------------------------------------------
+
+describe("Persistence Round-Trip (500-row DB remount + query)", async () => {
+  // Pre-populate a shared backend once
+  const backend = new SyncMemoryBackend();
+  const setup = await createPGliteHarness({ cacheSize: 4096, backend });
+  await setup.pg.query(`
+    CREATE TABLE persist_bench (
+      id SERIAL PRIMARY KEY,
+      category INT,
+      payload TEXT
+    )
+  `);
+  for (let i = 0; i < 500; i++) {
+    await setup.pg.query(
+      `INSERT INTO persist_bench (category, payload) VALUES ($1, $2)`,
+      [i % 10, `row-${i}-${"d".repeat(100)}`],
+    );
+  }
+  await setup.pg.query(`CREATE INDEX idx_persist_cat ON persist_bench (category)`);
+  await setup.pg.query(`ANALYZE persist_bench`);
+  await setup.syncToFs();
+  await setup.destroy();
+
+  bench("tomefs (4096 pages)", async () => {
+    const h = await createPGliteHarness({ cacheSize: 4096, backend });
+    // Verify data survived: point query + aggregation
+    const point = await h.pg.query(
+      `SELECT payload FROM persist_bench WHERE id = 250`,
+    );
+    if (point.rows.length !== 1) throw new Error("Point query failed");
+    const agg = await h.pg.query(
+      `SELECT category, COUNT(*)::int as cnt FROM persist_bench GROUP BY category`,
+    );
+    if (agg.rows.length !== 10) throw new Error("Aggregation failed");
+    await h.destroy();
+  });
+
+  bench("tomefs (128 pages, cache pressure)", async () => {
+    const h = await createPGliteHarness({ cacheSize: 128, backend });
+    const point = await h.pg.query(
+      `SELECT payload FROM persist_bench WHERE id = 250`,
+    );
+    if (point.rows.length !== 1) throw new Error("Point query failed");
+    const agg = await h.pg.query(
+      `SELECT category, COUNT(*)::int as cnt FROM persist_bench GROUP BY category`,
+    );
+    if (agg.rows.length !== 10) throw new Error("Aggregation failed");
+    await h.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Benchmark 10: Cache Pressure — Queries Under Eviction
+//
+// Measures the performance impact of cache eviction during SQL workloads.
+// Compares large cache (working set fits) vs small cache (heavy eviction).
+// Ethos §6: performance must be parity when working set fits in cache.
+// ---------------------------------------------------------------------------
+
+describe("Cache Pressure: Indexed Queries (500 rows)", async () => {
+  const large = await createTomeFSPGliteHarness(4096);
+  const small = await createTomeFSPGliteHarness(64); // 512 KB — eviction pressure
+
+  for (const h of [large, small]) {
+    await h.pg.query(`
+      CREATE TABLE pressure_bench (
+        id SERIAL PRIMARY KEY,
+        category INT,
+        status TEXT,
+        amount REAL
+      )
+    `);
+    for (let i = 0; i < 500; i++) {
+      await h.pg.query(
+        `INSERT INTO pressure_bench (category, status, amount) VALUES ($1, $2, $3)`,
+        [i % 10, ["active", "inactive", "pending"][i % 3], Math.random() * 10000],
+      );
+    }
+    await h.pg.query(`CREATE INDEX idx_pressure_cat ON pressure_bench (category)`);
+    await h.pg.query(`CREATE INDEX idx_pressure_status ON pressure_bench (status)`);
+    await h.pg.query(`ANALYZE pressure_bench`);
+  }
+
+  bench("tomefs (4096 pages, no eviction)", async () => {
+    for (let q = 0; q < 50; q++) {
+      const cat = q % 10;
+      const status = ["active", "inactive", "pending"][q % 3];
+      await large.pg.query(
+        `SELECT id, amount FROM pressure_bench WHERE category = $1 AND status = $2 ORDER BY amount DESC LIMIT 5`,
+        [cat, status],
+      );
+    }
+  });
+
+  bench("tomefs (64 pages, heavy eviction)", async () => {
+    for (let q = 0; q < 50; q++) {
+      const cat = q % 10;
+      const status = ["active", "inactive", "pending"][q % 3];
+      await small.pg.query(
+        `SELECT id, amount FROM pressure_bench WHERE category = $1 AND status = $2 ORDER BY amount DESC LIMIT 5`,
+        [cat, status],
+      );
+    }
+  });
+
+  afterAll(async () => {
+    await large.destroy();
+    await small.destroy();
   });
 });
