@@ -2,10 +2,10 @@
  * Adversarial tests for partial syncfs completion + restoreTree recovery.
  *
  * Simulates the process crashing at various points during a syncfs call:
- *   - After flushAll (pages flushed) but before metadata batch write
+ *   - During page writes (partial pages persisted, no metadata)
+ *   - After page writes but before metadata batch write
  *   - During the metadata batch write (partial metadata persisted)
  *   - After metadata write but before orphan cleanup
- *   - During orphan cleanup
  *
  * Verifies that remounting from the partially-written backend state always
  * produces a usable filesystem: files created before the last successful
@@ -244,7 +244,7 @@ describe("partial syncfs: crash during page flush", () => {
     inner = new SyncMemoryBackend();
   });
 
-  it("page data flushed on close survives crash during syncfs metadata write @fast", async () => {
+  it("page data written by syncfs survives crash during metadata write @fast", async () => {
     // Phase 1: establish baseline
     const { FS, tomefs } = await mountTome(inner);
     const s = FS.open(`${MOUNT}/base`, O.RDWR | O.CREAT, 0o666);
@@ -252,33 +252,34 @@ describe("partial syncfs: crash during page flush", () => {
     FS.close(s);
     syncAndUnmount(FS, tomefs);
 
-    // Phase 2: modify file. close() flushes dirty page to backend
-    // immediately (before syncfs). Crash during syncfs metadata write.
-    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 0);
+    // Phase 2: modify file. Dirty pages stay in cache until syncfs.
+    // syncfs writes pages first (via syncAll), then metadata.
+    // crashAfter=1 allows the page write but crashes on first metadata entry.
+    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 1);
     const { FS: FS2, tomefs: t2 } = await mountTome(crashBackend);
     const s2 = FS2.open(`${MOUNT}/base`, O.RDWR);
     FS2.write(s2, encode("MODIFIED"), 0, 8);
-    FS2.close(s2); // page data flushed to inner backend here
+    FS2.close(s2);
 
-    // Crash immediately on first write op in syncfs (metadata write)
+    // Crash after page write succeeds but before metadata write completes
     crashBackend.arm();
     const err = syncfs(FS2, t2);
     expect(err).not.toBeNull();
 
-    // Phase 3: remount — page data reflects the write (flushed on close),
-    // even though syncfs metadata write was interrupted. Since the file
-    // size didn't change (still 8 bytes), restoreTree trusts the stale
-    // metadata size and the page data has the latest content.
+    // Phase 3: remount — page data reflects the write (written by syncfs
+    // before the crash). Since the file size didn't change (still 8 bytes),
+    // restoreTree trusts the stale metadata and the page data has the
+    // latest content.
     const { FS: FS3 } = await remountAndVerify(inner);
     const buf = new Uint8Array(20);
     const s3 = FS3.open(`${MOUNT}/base`, O.RDONLY);
     const n = FS3.read(s3, buf, 0, 20);
     FS3.close(s3);
-    // Page was flushed on close(), so new content is in the backend
+    // Page was written by syncfs before crash, so new content is in the backend
     expect(decode(buf, n)).toBe("MODIFIED");
   });
 
-  it("file extension: pages flushed on close but stale metadata size is detected @fast", async () => {
+  it("file extension: pages written by syncfs but stale metadata size is detected @fast", async () => {
     // Phase 1: create a small file
     const { FS, tomefs } = await mountTome(inner);
     const s = FS.open(`${MOUNT}/grow`, O.RDWR | O.CREAT, 0o666);
@@ -287,23 +288,24 @@ describe("partial syncfs: crash during page flush", () => {
     syncAndUnmount(FS, tomefs);
     expect(inner.readMeta("/grow")!.size).toBe(5);
 
-    // Phase 2: extend file to multiple pages. close() flushes pages.
-    // syncfs crashes before metadata is updated.
-    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 0);
+    // Phase 2: extend file to multiple pages. Dirty pages stay in cache
+    // until syncfs. syncfs writes pages first (via syncAll), then metadata.
+    // crashAfter=2 allows both page writes but crashes on first metadata entry.
+    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 2);
     const { FS: FS2, tomefs: t2 } = await mountTome(crashBackend);
     const s2 = FS2.open(`${MOUNT}/grow`, O.RDWR);
     const bigData = new Uint8Array(PAGE_SIZE * 2);
     for (let i = 0; i < bigData.length; i++) bigData[i] = (i * 7) & 0xff;
     FS2.write(s2, bigData, 0, bigData.length);
-    FS2.close(s2); // pages flushed to inner backend
+    FS2.close(s2);
 
     crashBackend.arm();
-    syncfs(FS2, t2); // crashes — metadata not updated
+    syncfs(FS2, t2); // crashes after page writes, before metadata
 
-    // Backend has pages 0+1, but metadata still says size=5.
+    // Backend has pages 0+1 (written by syncfs), but metadata still says size=5.
     // restoreTree should detect extra pages and expand file size.
     expect(inner.readMeta("/grow")!.size).toBe(5); // stale metadata
-    expect(inner.countPages("/grow")).toBe(2); // pages flushed
+    expect(inner.countPages("/grow")).toBe(2); // pages written by syncfs
 
     // Phase 3: remount — restoreTree detects page count mismatch
     const { FS: FS3 } = await remountAndVerify(inner);
@@ -339,22 +341,22 @@ describe("partial syncfs: crash during metadata write", () => {
     FS.close(s);
     syncAndUnmount(FS, tomefs);
 
-    // Phase 2: extend the file significantly (new pages).
-    // close() flushes pages to backend. syncfs crashes on first
-    // metadata write op (crashAfter=0) so metadata stays stale.
-    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 0);
+    // Phase 2: extend the file significantly (new pages). Dirty pages
+    // stay in cache until syncfs. syncfs writes pages first via syncAll.
+    // crashAfter=3 allows all 3 page writes but crashes on first metadata entry.
+    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 3);
     const { FS: FS2, tomefs: t2 } = await mountTome(crashBackend);
     const s2 = FS2.open(`${MOUNT}/data`, O.RDWR);
     const bigData = new Uint8Array(PAGE_SIZE * 3);
     for (let i = 0; i < bigData.length; i++) bigData[i] = (i * 7) & 0xff;
     FS2.write(s2, bigData, 0, bigData.length);
-    FS2.close(s2); // pages flushed to inner backend here
+    FS2.close(s2);
 
     crashBackend.arm();
     const err = syncfs(FS2, t2);
     expect(err).not.toBeNull();
 
-    // Metadata is stale (size=2), but pages 0-2 are in the backend
+    // Metadata is stale (size=2), but pages 0-2 are in the backend (written by syncfs)
     expect(inner.readMeta("/data")!.size).toBe(2);
     expect(inner.countPages("/data")).toBe(3);
 
@@ -382,11 +384,11 @@ describe("partial syncfs: crash during metadata write", () => {
     syncAndUnmount(FS, tomefs);
 
     // Phase 2: modify all files (same size, so no page count mismatch).
-    // close() flushes pages. syncfs writes metadata via writeMetas.
-    // Crash after 2 metadata entries so only some files get updated metadata.
-    // (writeMetas is the first mutating call in syncfs since pages are already
-    // flushed on close. With 3 files, writeMetas has 3 entries.)
-    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 2);
+    // Dirty pages stay in cache until syncfs. syncfs writes pages first
+    // via syncAll (3 pages = ops 1-3), then metadata (3 files + clean
+    // marker = ops 4-7). crashAfter=5 allows all 3 page writes + 2
+    // metadata entries, crashing on the 3rd metadata entry.
+    const crashBackend = new CrashAfterNOpsSyncBackend(inner, 5);
     const { FS: FS2, tomefs: t2 } = await mountTome(crashBackend);
     for (const name of ["alpha", "beta", "gamma"]) {
       const s = FS2.open(`${MOUNT}/${name}`, O.RDWR);
@@ -399,7 +401,7 @@ describe("partial syncfs: crash during metadata write", () => {
     expect(err).not.toBeNull();
 
     // Phase 3: remount — all files should be readable (no corruption)
-    // Page data was flushed on close(), so all files have v2 page content.
+    // Page data was written by syncfs (all 3 pages before crash).
     // Metadata may be v1 or v2 depending on crash point — but since sizes
     // match (v1 and v2 have same length), restoreTree trusts metadata.
     const { FS: FS3 } = await remountAndVerify(inner);
@@ -409,7 +411,7 @@ describe("partial syncfs: crash during metadata write", () => {
       const n = FS3.read(s, buf, 0, 50);
       FS3.close(s);
       const content = decode(buf, n);
-      // Page data is v2 (flushed on close), regardless of metadata state
+      // Page data is v2 (written by syncfs before crash), regardless of metadata state
       expect(content).toBe(`v2-${name}`);
     }
   });

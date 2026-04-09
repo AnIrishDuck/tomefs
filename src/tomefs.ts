@@ -752,9 +752,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
-        } else {
-          pageCache.flushFile(node.storagePath);
         }
+        // Dirty pages stay in the page cache until syncfs (two-phase commit)
+        // or eviction. This matches Emscripten MEMFS semantics where close
+        // does not imply persistence, and avoids redundant data copies —
+        // close→unlink would otherwise flush pages only to immediately
+        // discard them. Eviction already handles dirty pages (batch-flush
+        // before eviction), and syncfs collects + commits dirty pages
+        // atomically via backend.syncAll().
       }
     },
 
