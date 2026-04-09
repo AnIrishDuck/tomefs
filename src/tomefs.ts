@@ -759,10 +759,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     },
 
     allocate(stream: any, offset: number, length: number) {
-      resizeFileStorage(
-        stream.node,
-        Math.max(stream.node.usedBytes, offset + length),
-      );
+      const node = stream.node;
+      const oldSize = node.usedBytes;
+      resizeFileStorage(node, Math.max(oldSize, offset + length));
+      if (node.usedBytes !== oldSize) {
+        markMetaDirty(node);
+      }
     },
 
     mmap(
