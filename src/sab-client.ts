@@ -389,7 +389,21 @@ export class SabClient implements SyncStorageBackend {
     // Fast path: everything fits in a single SAB call.
     // This is the common case — steady-state syncfs writes a handful of
     // dirty pages + their metadata, well within the 1 MB SAB buffer.
-    if (pages.length <= this.maxBatchPages) {
+    //
+    // Must check both pages AND metas against the buffer capacity. The
+    // previous check (pages.length <= maxBatchPages) ignored the metas
+    // JSON sharing the same buffer, which could overflow when many files
+    // have dirty metadata (e.g., VACUUM touching hundreds of tables).
+    //
+    // Budget: PAGE_SIZE + 256 bytes per page (binary data + JSON overhead),
+    // 512 bytes per metadata entry (JSON), plus 4096 bytes fixed overhead.
+    // These match the conservative estimates used by maxBatchPages and
+    // maxBatchMetas.
+    const dataRegionSize = this.sab.byteLength - CONTROL_BYTES;
+    const estimatedUsage =
+      pages.length * (PAGE_SIZE + 256) + metas.length * 512 + 4096;
+
+    if (estimatedUsage <= dataRegionSize) {
       const pageMeta = pages.map((p) => ({
         path: p.path,
         pageIndex: p.pageIndex,
@@ -400,9 +414,9 @@ export class SabClient implements SyncStorageBackend {
       return;
     }
 
-    // Fallback: too many pages for a single call. Use separate writePages
-    // + writeMetas calls. This loses single-transaction atomicity for the
-    // IDB backend, but is needed to avoid SAB buffer overflow.
+    // Fallback: combined payload too large for a single call. Use separate
+    // writePages + writeMetas calls. This loses single-transaction atomicity
+    // for the IDB backend, but is needed to avoid SAB buffer overflow.
     this.writePages(pages);
     if (metas.length > 0) {
       this.writeMetas(metas);

@@ -1579,3 +1579,169 @@ describe("SAB bridge: worker-side dataLen validation", () => {
     expect(page![0]).toBe(0x42);
   });
 });
+
+// ---------------------------------------------------------------
+// syncAll combined payload overflow and fallback
+// ---------------------------------------------------------------
+
+describe("SAB bridge: syncAll combined payload overflow", () => {
+  let backend: MemoryBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    backend = new MemoryBackend();
+    // Use a tiny 32KB buffer to force overflow at small counts.
+    // dataRegionSize = 32768 - 12 = 32756
+    // maxBatchPages = floor((32756 - 4096) / (8192 + 256)) = floor(28660 / 8448) = 3
+    // maxBatchMetas = floor((32756 - 4096) / 512) = floor(28660 / 512) = 55
+    // With the combined check: 3 pages use 3*(8192+256) = 25344 bytes + 4096 overhead
+    // = 29440. Remaining for metas: 32756 - 29440 = 3316 bytes / 512 = ~6 metas.
+    // So 3 pages + 7 metas should trigger fallback to separate calls.
+    sab = SabClient.createBuffer(CONTROL_BYTES + 32 * 1024);
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 5000 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("@fast syncAll with pages only (within limit) uses single call", async () => {
+    const pages = Array.from({ length: 2 }, (_, i) => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0x10 + i;
+      return { path: "/sa", pageIndex: i, data };
+    });
+    const metas = [
+      { path: "/sa", meta: { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 1000, mtime: 2000 } },
+    ];
+
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    // Verify pages
+    const p0 = await backend.readPage("/sa", 0);
+    expect(p0).not.toBeNull();
+    expect(p0![0]).toBe(0x10);
+    const p1 = await backend.readPage("/sa", 1);
+    expect(p1).not.toBeNull();
+    expect(p1![0]).toBe(0x11);
+    // Verify metadata
+    const meta = await backend.readMeta("/sa");
+    expect(meta).not.toBeNull();
+    expect(meta!.size).toBe(PAGE_SIZE * 2);
+  });
+
+  it("@fast syncAll falls back when metas overflow remaining buffer space", async () => {
+    // 3 pages nearly fill the 32KB buffer. Adding 20 metas (each ~150 bytes
+    // of JSON, budgeted at 512) would overflow. The fix detects this and
+    // falls back to separate writePages + writeMetas calls.
+    const pages = Array.from({ length: 3 }, (_, i) => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0x20 + i;
+      return { path: `/f${i}`, pageIndex: 0, data };
+    });
+
+    const metas = Array.from({ length: 20 }, (_, i) => ({
+      path: `/f${i}`,
+      meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 1000 + i, mtime: 2000 + i },
+    }));
+
+    // This should succeed via fallback (separate writePages + writeMetas).
+    // Before the fix, this would attempt a single syncAll call and throw
+    // "SAB buffer overflow".
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    // Verify all pages survived
+    for (let i = 0; i < 3; i++) {
+      const page = await backend.readPage(`/f${i}`, 0);
+      expect(page).not.toBeNull();
+      expect(page![0]).toBe(0x20 + i);
+    }
+
+    // Verify all metadata survived
+    for (let i = 0; i < 20; i++) {
+      const meta = await backend.readMeta(`/f${i}`);
+      expect(meta).not.toBeNull();
+      expect(meta!.ctime).toBe(1000 + i);
+      expect(meta!.mtime).toBe(2000 + i);
+    }
+  });
+
+  it("syncAll falls back when many metas with zero pages overflow buffer", async () => {
+    // No pages, but 60 metadata entries exceed maxBatchMetas (55) for the
+    // combined size estimate. The fallback uses chunked writeMetas.
+    const metas = Array.from({ length: 60 }, (_, i) => ({
+      path: `/meta${i}`,
+      meta: { size: 0, mode: 0o100644, ctime: 1000, mtime: 2000 },
+    }));
+
+    await callClient(clientWorker, "syncAll", [[], metas]);
+
+    // Verify all metadata entries
+    for (let i = 0; i < 60; i++) {
+      const meta = await backend.readMeta(`/meta${i}`);
+      expect(meta).not.toBeNull();
+      expect(meta!.mode).toBe(0o100644);
+    }
+  });
+
+  it("syncAll with empty pages and metas is a no-op", async () => {
+    await callClient(clientWorker, "syncAll", [[], []]);
+    const files = await backend.listFiles();
+    expect(files).toEqual([]);
+  });
+
+  it("syncAll preserves data integrity across fallback chunking boundaries", async () => {
+    // 2 pages + 15 metas with long paths to test chunk boundary handling.
+    // Long paths increase JSON size, making the combined estimate more likely
+    // to exceed the buffer.
+    const longPrefix = "/pglite/data/base/16384/pg_catalog/";
+    const pages = Array.from({ length: 2 }, (_, i) => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data.fill(0x30 + i);
+      return { path: `${longPrefix}file_${i}`, pageIndex: 0, data };
+    });
+
+    const metas = Array.from({ length: 15 }, (_, i) => ({
+      path: `${longPrefix}file_${i}`,
+      meta: {
+        size: i * 100,
+        mode: 0o100644,
+        ctime: 1712678400000 + i,
+        mtime: 1712678400000 + i * 2,
+        atime: 1712678400000 + i * 3,
+      },
+    }));
+
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    // Verify pages
+    for (let i = 0; i < 2; i++) {
+      const page = await backend.readPage(`${longPrefix}file_${i}`, 0);
+      expect(page).not.toBeNull();
+      expect(page![0]).toBe(0x30 + i);
+      expect(page![PAGE_SIZE - 1]).toBe(0x30 + i);
+    }
+
+    // Verify all metadata entries with correct values
+    for (let i = 0; i < 15; i++) {
+      const meta = await backend.readMeta(`${longPrefix}file_${i}`);
+      expect(meta).not.toBeNull();
+      expect(meta!.size).toBe(i * 100);
+      expect(meta!.ctime).toBe(1712678400000 + i);
+      expect(meta!.mtime).toBe(1712678400000 + i * 2);
+    }
+  });
+});
