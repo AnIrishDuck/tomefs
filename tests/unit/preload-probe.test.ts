@@ -138,6 +138,9 @@ class ReadCountingBackend implements StorageBackend {
     await this.writePages(pages);
     await this.writeMetas(metas);
   }
+  async deleteAll(paths: string[]): Promise<void> {
+    await this.inner.deleteAll(paths);
+  }
 }
 
 describe("PreloadBackend crash-recovery page discovery", () => {

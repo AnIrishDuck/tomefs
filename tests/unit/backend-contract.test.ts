@@ -61,6 +61,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     maxPageIndex: async (p) => sync.maxPageIndex(p),
     maxPageIndexBatch: async (ps) => sync.maxPageIndexBatch(ps),
     syncAll: async (pages, metas) => sync.syncAll(pages, metas),
+    deleteAll: async (ps) => sync.deleteAll(ps),
   };
 }
 
@@ -1114,6 +1115,97 @@ for (const factory of factories) {
 
         const files = await backend.listFiles();
         expect(files.sort()).toEqual(["/a", "/b"]);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // deleteAll
+    // ---------------------------------------------------------------
+
+    describe("deleteAll", () => {
+      it("deletes pages and metadata atomically @fast", async () => {
+        await backend.writePage("/f", 0, filledPage(0xaa));
+        await backend.writePage("/f", 1, filledPage(0xbb));
+        await backend.writeMeta("/f", meta);
+
+        await backend.deleteAll(["/f"]);
+
+        expect(await backend.readPage("/f", 0)).toBeNull();
+        expect(await backend.readPage("/f", 1)).toBeNull();
+        expect(await backend.readMeta("/f")).toBeNull();
+      });
+
+      it("empty paths is a no-op @fast", async () => {
+        await backend.deleteAll([]);
+      });
+
+      it("deletes multiple files @fast", async () => {
+        await backend.writePage("/a", 0, filledPage(0x01));
+        await backend.writeMeta("/a", { ...meta, size: 100 });
+        await backend.writePage("/b", 0, filledPage(0x02));
+        await backend.writePage("/b", 1, filledPage(0x03));
+        await backend.writeMeta("/b", { ...meta, size: 200 });
+
+        await backend.deleteAll(["/a", "/b"]);
+
+        expect(await backend.readPage("/a", 0)).toBeNull();
+        expect(await backend.readMeta("/a")).toBeNull();
+        expect(await backend.readPage("/b", 0)).toBeNull();
+        expect(await backend.readPage("/b", 1)).toBeNull();
+        expect(await backend.readMeta("/b")).toBeNull();
+      });
+
+      it("does not affect unrelated files", async () => {
+        await backend.writePage("/keep", 0, filledPage(0xdd));
+        await backend.writeMeta("/keep", meta);
+        await backend.writePage("/del", 0, filledPage(0xee));
+        await backend.writeMeta("/del", { ...meta, size: 999 });
+
+        await backend.deleteAll(["/del"]);
+
+        expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0xdd));
+        expect(await backend.readMeta("/keep")).toEqual(meta);
+      });
+
+      it("handles non-existent paths gracefully", async () => {
+        await backend.deleteAll(["/no-such-file"]);
+      });
+
+      it("countPages returns 0 after deleteAll", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 5, filledPage(0x05));
+        await backend.writeMeta("/f", meta);
+
+        await backend.deleteAll(["/f"]);
+
+        expect(await backend.countPages("/f")).toBe(0);
+        expect(await backend.maxPageIndex("/f")).toBe(-1);
+      });
+
+      it("listFiles excludes deleted paths", async () => {
+        await backend.writeMeta("/a", meta);
+        await backend.writeMeta("/b", meta);
+        await backend.writeMeta("/c", meta);
+
+        await backend.deleteAll(["/a", "/c"]);
+
+        expect(await backend.listFiles()).toEqual(["/b"]);
+      });
+
+      it("deletes pages written by syncAll", async () => {
+        await backend.syncAll(
+          [
+            { path: "/f", pageIndex: 0, data: filledPage(0xaa) },
+            { path: "/f", pageIndex: 1, data: filledPage(0xbb) },
+          ],
+          [{ path: "/f", meta }],
+        );
+
+        await backend.deleteAll(["/f"]);
+
+        expect(await backend.readPage("/f", 0)).toBeNull();
+        expect(await backend.readPage("/f", 1)).toBeNull();
+        expect(await backend.readMeta("/f")).toBeNull();
       });
     });
 

@@ -198,6 +198,11 @@ export class MemoryBackend implements StorageBackend {
     return Array.from(this.meta.keys());
   }
 
+  async deleteAll(paths: string[]): Promise<void> {
+    await this.deleteFiles(paths);
+    await this.deleteMetas(paths);
+  }
+
   async syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,

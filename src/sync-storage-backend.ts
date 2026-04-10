@@ -84,4 +84,15 @@ export interface SyncStorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): void;
+
+  /**
+   * Atomically delete all pages and metadata for multiple files.
+   *
+   * Through the SAB bridge, this combines what would be separate
+   * deleteFiles + deleteMetas calls into a single round-trip.
+   * For IDB, the worker executes both in one multi-store transaction,
+   * eliminating the crash window between separate deletes during
+   * orphan cleanup in syncfs.
+   */
+  deleteAll(paths: string[]): void;
 }

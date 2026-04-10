@@ -41,6 +41,7 @@ export const OpCode = {
   COUNT_PAGES_BATCH: 19,
   MAX_PAGE_INDEX_BATCH: 20,
   SYNC_ALL: 21,
+  DELETE_ALL: 22,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];

@@ -472,6 +472,29 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async deleteAll(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      // Single transaction spanning both stores — pages and metadata
+      // are deleted atomically. A crash can never leave orphan metadata
+      // without pages (or pages without metadata).
+      const tx = db.transaction([PAGES_STORE, META_STORE], "readwrite");
+      const pageStore = tx.objectStore(PAGES_STORE);
+      const metaStore = tx.objectStore(META_STORE);
+
+      for (const path of paths) {
+        const range = IDBKeyRange.bound([path, 0], [path, ""], false, true);
+        pageStore.delete(range);
+        metaStore.delete(path);
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,

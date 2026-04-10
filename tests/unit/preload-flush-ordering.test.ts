@@ -116,6 +116,10 @@ class OrderTrackingBackend implements StorageBackend {
     }]);
     return this.inner.syncAll(pages, metas);
   }
+  async deleteAll(paths: string[]) {
+    this.log.push(["deleteAll", [...paths]]);
+    return this.inner.deleteAll(paths);
+  }
 }
 
 /**
@@ -210,6 +214,10 @@ class CrashAfterNOpsBackend implements StorageBackend {
   ): Promise<void> {
     this.tick();
     return this.inner.syncAll(pages, metas);
+  }
+  async deleteAll(paths: string[]) {
+    this.tick();
+    return this.inner.deleteAll(paths);
   }
 }
 

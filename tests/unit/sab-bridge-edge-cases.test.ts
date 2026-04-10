@@ -199,6 +199,11 @@ class FailingBackend implements StorageBackend {
     await this.writePages(pages);
     await this.writeMetas(metas);
   }
+
+  async deleteAll(paths: string[]): Promise<void> {
+    this.maybeThrow("deleteAll");
+    return this.inner.deleteAll(paths);
+  }
 }
 
 /**
@@ -297,6 +302,10 @@ class SlowBackend implements StorageBackend {
   ): Promise<void> {
     await this.writePages(pages);
     await this.writeMetas(metas);
+  }
+
+  async deleteAll(paths: string[]): Promise<void> {
+    return this.inner.deleteAll(paths);
   }
 }
 

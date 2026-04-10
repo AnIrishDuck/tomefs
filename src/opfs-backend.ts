@@ -497,6 +497,12 @@ export class OpfsBackend implements StorageBackend {
     return paths;
   }
 
+  async deleteAll(paths: string[]): Promise<void> {
+    // OPFS has no multi-operation transactions, so execute sequentially.
+    await this.deleteFiles(paths);
+    await this.deleteMetas(paths);
+  }
+
   async syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,

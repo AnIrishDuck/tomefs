@@ -354,6 +354,11 @@ export class PreloadBackend implements SyncStorageBackend {
     return [...this.meta.keys()];
   }
 
+  deleteAll(paths: string[]): void {
+    this.deleteFiles(paths);
+    this.deleteMetas(paths);
+  }
+
   syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,

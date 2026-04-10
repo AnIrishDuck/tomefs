@@ -380,6 +380,23 @@ export class SabClient implements SyncStorageBackend {
     return allFiles;
   }
 
+  deleteAll(paths: string[]): void {
+    if (paths.length === 0) return;
+
+    // If the batch fits in a single call, use the fast path.
+    // Otherwise chunk to avoid overflowing the SAB request buffer.
+    if (paths.length <= this.maxBatchMetas) {
+      this.call(OpCode.DELETE_ALL, { paths });
+      return;
+    }
+
+    for (let i = 0; i < paths.length; i += this.maxBatchMetas) {
+      this.call(OpCode.DELETE_ALL, {
+        paths: paths.slice(i, i + this.maxBatchMetas),
+      });
+    }
+  }
+
   syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,

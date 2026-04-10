@@ -116,6 +116,10 @@ class CountingBackend implements StorageBackend {
     await this.writePages(pages);
     await this.writeMetas(metas);
   }
+  async deleteAll(paths: string[]): Promise<void> {
+    this.count("deleteAll");
+    await this.inner.deleteAll(paths);
+  }
 }
 
 describe("PreloadBackend", () => {
@@ -248,6 +252,7 @@ describe("PreloadBackend", () => {
         async maxPageIndex() { return -1; },
         async maxPageIndexBatch(paths: string[]) { return paths.map(() => -1); },
         async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await this.writePages(pages); await this.writeMetas(metas); },
+        async deleteAll(paths: string[]) { await this.deleteFiles(paths); await this.deleteMetas(paths); },
       };
 
       const backend = new PreloadBackend(failOnce);
@@ -305,6 +310,7 @@ describe("PreloadBackend", () => {
         async maxPageIndex(p: string) { return inner.maxPageIndex(p); },
         async maxPageIndexBatch(ps: string[]) { return inner.maxPageIndexBatch(ps); },
         async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await inner.writePages(pages); await inner.writeMetas(metas); },
+        async deleteAll(ps: string[]) { await inner.deleteAll(ps); },
       };
 
       const backend = new PreloadBackend(failFirstReadMetas);
@@ -346,6 +352,7 @@ describe("PreloadBackend", () => {
         async maxPageIndex() { return -1; },
         async maxPageIndexBatch(paths: string[]) { return paths.map(() => -1); },
         async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await this.writePages(pages); await this.writeMetas(metas); },
+        async deleteAll(paths: string[]) { await this.deleteFiles(paths); await this.deleteMetas(paths); },
       };
 
       const backend = new PreloadBackend(alwaysFails);
@@ -1309,6 +1316,7 @@ describe("PreloadBackend", () => {
       async maxPageIndexBatch(paths: string[]) { return this.inner.maxPageIndexBatch(paths); }
       async listFiles() { return this.inner.listFiles(); }
       async syncAll(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>, metas: Array<{ path: string; meta: FileMeta }>) { await this.writePages(pages); await this.writeMetas(metas); }
+      async deleteAll(paths: string[]) { await this.deleteFiles(paths); await this.deleteMetas(paths); }
     }
 
     it("retains dirty tracking when writePages fails so retry succeeds", async () => {

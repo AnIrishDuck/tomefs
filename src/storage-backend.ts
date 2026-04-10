@@ -83,4 +83,14 @@ export interface StorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void>;
+
+  /**
+   * Atomically delete all pages and metadata for multiple files.
+   *
+   * For IDB backends, this uses a single multi-store transaction spanning
+   * both the pages and metadata stores, ensuring page data and metadata
+   * are deleted together. This eliminates the crash window between
+   * separate deleteFiles + deleteMetas calls during orphan cleanup.
+   */
+  deleteAll(paths: string[]): Promise<void>;
 }
