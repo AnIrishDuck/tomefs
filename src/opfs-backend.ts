@@ -501,9 +501,10 @@ export class OpfsBackend implements StorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void> {
-    // OPFS has no multi-operation transactions, so execute sequentially.
-    await this.writePages(pages);
-    await this.writeMetas(metas);
+    // OPFS has no multi-operation transactions, so there's no atomicity
+    // regardless of ordering. Run page and metadata writes in parallel
+    // since they target different directories (pages/ vs meta/).
+    await Promise.all([this.writePages(pages), this.writeMetas(metas)]);
   }
 
   /**
