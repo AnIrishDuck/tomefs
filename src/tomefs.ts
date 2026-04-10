@@ -1160,7 +1160,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
                   },
                 });
               }
-              node._metaDirty = false;
             }
 
             // Include clean-shutdown marker in the same batch so it's
@@ -1170,8 +1169,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
             });
             backend.syncAll(dirtyPages, metaBatch);
+
+            // Two-phase commit: clear dirty flags only after the backend
+            // write succeeds. If syncAll throws, dirty flags are preserved
+            // so the next syncfs retries instead of silently losing data.
             pageCache.commitDirtyPages(dirtyPages);
             needsCleanMarker = false;
+            for (const node of dirtyMetaNodes) {
+              node._metaDirty = false;
+            }
             dirtyMetaNodes.clear();
           } else {
             // Full tree walk path: needed when orphan cleanup is required
