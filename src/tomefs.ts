@@ -421,13 +421,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Update storage path for file nodes
     if (FS.isFile(old_node.mode)) {
       const newStoragePath = computeStoragePath(new_dir, new_name);
-      pageCache.renameFile(oldStoragePath, newStoragePath);
-      old_node.storagePath = newStoragePath;
-      old_node._pages = undefined;
-      // Move metadata to new path. Construct from node state (no backend
-      // read needed) — the node tree is the source of truth. This also
-      // provides crash safety for files not yet synced (metadata gets
-      // written at the new path immediately).
+      // Write metadata at the new path BEFORE moving pages for crash safety.
+      // If the process dies after the page move (renameFile) but before
+      // the metadata write, pages are at newPath with no metadata —
+      // permanently unreachable and leaked. Writing metadata first ensures
+      // data is never lost: worst case is a stale duplicate entry at the
+      // old path that orphan cleanup removes on the next syncfs.
+      // This matches the ordering used in unlink() for the same reason.
       backend.writeMeta(newStoragePath, {
         size: old_node.usedBytes,
         mode: old_node.mode,
@@ -435,6 +435,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         mtime: old_node.mtime,
         atime: old_node.atime,
       });
+      pageCache.renameFile(oldStoragePath, newStoragePath);
+      old_node.storagePath = newStoragePath;
+      old_node._pages = undefined;
       backend.deleteMeta(oldStoragePath);
     } else if (FS.isDir(old_node.mode)) {
       // Move directory metadata to the new path before recursing into
@@ -448,12 +451,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         mtime: old_node.mtime,
         atime: old_node.atime,
       });
-      backend.deleteMeta(oldStoragePath);
       // Recursively update storagePaths for all file descendants.
       // Without this, pages remain keyed by old paths in the cache/backend,
       // causing data loss on syncfs → remount when metadata is persisted
       // under the new tree-computed paths but pages are under old paths.
       renameDescendantPaths(old_node, oldStoragePath, newDirPath);
+      // Delete old directory metadata LAST — after all descendant metadata
+      // is written at new paths and pages are moved. During a crash, the
+      // old directory must still exist so restoreTree can find it as a
+      // parent for children whose metadata hasn't been moved yet.
+      backend.deleteMeta(oldStoragePath);
     } else if (FS.isLink(old_node.mode)) {
       // Move symlink metadata eagerly for crash safety — same rationale
       // as file and directory renames. Without this, a crash between the
@@ -580,6 +587,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   ): void {
     const metaWrites: Array<{ path: string; meta: FileMeta }> = [];
     const metaDeletes: string[] = [];
+    const pageRenames: Array<{ child: any; oldPath: string; newPath: string }> = [];
 
     function collect(node: any, oldBase: string, newBase: string): void {
       for (const childName of Object.keys(node.contents)) {
@@ -587,9 +595,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         if (FS.isFile(child.mode)) {
           const oldPath = child.storagePath;
           const newPath = newBase + oldPath.substring(oldBase.length);
-          pageCache.renameFile(oldPath, newPath);
-          child.storagePath = newPath;
-          child._pages = undefined;
+          // Defer page rename — collect for batch execution after metadata
+          // is written. This ensures metadata at the new path exists before
+          // pages are moved, preventing data loss on mid-operation crashes.
+          pageRenames.push({ child, oldPath, newPath });
           metaWrites.push({
             path: newPath,
             meta: {
@@ -637,11 +646,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
     collect(dirNode, oldDirPath, newDirPath);
 
-    // Batch-write all metadata at new paths, then batch-delete old paths.
-    // Two backend calls instead of O(3n) individual calls.
+    // Write metadata at new paths FIRST for crash safety: if the process
+    // dies after a page rename but before its metadata write, pages at
+    // the new path are unreachable (no metadata) and permanently leaked.
+    // Writing all metadata before any page renames ensures data is never
+    // lost — worst case is stale duplicates cleaned up by orphan cleanup.
     if (metaWrites.length > 0) {
       backend.writeMetas(metaWrites);
     }
+
+    // Now move pages — metadata at new paths already exists.
+    for (const { child, oldPath, newPath } of pageRenames) {
+      pageCache.renameFile(oldPath, newPath);
+      child.storagePath = newPath;
+      child._pages = undefined;
+    }
+
+    // Delete old metadata last.
     if (metaDeletes.length > 0) {
       backend.deleteMetas(metaDeletes);
     }
