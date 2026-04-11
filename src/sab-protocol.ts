@@ -28,7 +28,8 @@ export const OpCode = {
   READ_META: 6,
   WRITE_META: 7,
   DELETE_META: 8,
-  LIST_FILES: 9,
+  // Opcode 9 was LIST_FILES, replaced by LIST_FILES_RANGE (18) which
+  // adds pagination to prevent SAB buffer overflow with many files.
   READ_PAGES: 10,
   RENAME_FILE: 11,
   WRITE_METAS: 12,

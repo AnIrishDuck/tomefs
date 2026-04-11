@@ -863,7 +863,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (FS.isFile(node.mode)) {
         currentPaths.add(path);
         // Only write metadata if it changed since last sync (or first sync).
-        // Page data is already flushed by flushAll() before persistTree().
+        // Page data is collected via collectDirtyPages() and written
+        // atomically with metadata via syncAll() after persistTree().
         if (node._metaDirty) {
           metaBatch.push({
             path,

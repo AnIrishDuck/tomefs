@@ -340,13 +340,6 @@ export class SabWorker {
         break;
       }
 
-      case OpCode.LIST_FILES: {
-        const files = await this.backend.listFiles();
-        const respLen = encodeMessage(this.dataView, this.uint8View, { files });
-        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
-        break;
-      }
-
       case OpCode.MAX_PAGE_INDEX: {
         const maxIdx = await this.backend.maxPageIndex(
           params.path as string,

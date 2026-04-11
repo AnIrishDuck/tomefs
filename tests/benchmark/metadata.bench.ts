@@ -4,7 +4,7 @@
  * Complements throughput.bench.ts (raw I/O) and pglite.bench.ts (SQL) by
  * measuring metadata-intensive operations and syncfs flush overhead.
  * These are the paths optimized by batch SAB bridge operations (readMetas,
- * writeMetas, deleteFiles, countPages) and syncfs orphan-skip logic.
+ * writeMetas, deleteFiles, maxPageIndexBatch) and syncfs orphan-skip logic.
  *
  * Run: npx vitest bench tests/benchmark/metadata.bench.ts
  */
