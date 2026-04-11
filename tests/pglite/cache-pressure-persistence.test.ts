@@ -58,7 +58,12 @@ describe("Persistence under cache pressure: bulk insert + remount", () => {
   for (const size of PRESSURE_CONFIGS) {
     const pages = CACHE_CONFIGS[size];
 
-    it(`cache=${size} (${pages} pages) @fast`, async () => {
+    // Tiny cache (4 pages) causes extreme thrashing during PGlite
+    // operations — every page access evicts a dirty page. This is
+    // inherently slow and cannot meet the @fast timeout. The tiny
+    // variant is still tested in the full suite.
+    const tag = size === "tiny" ? "" : " @fast";
+    it(`cache=${size} (${pages} pages)${tag}`, async () => {
       const backend = new SyncMemoryBackend();
 
       // Phase 1: populate

@@ -397,6 +397,52 @@ describe("adversarial: allocate + persistence", () => {
     }
   });
 
+  it("allocate after prior syncfs persists metadata in incremental path @fast", async () => {
+    // Regression test: allocate() didn't call markMetaDirty(), so if a file
+    // had already been persisted (dirty flags cleared by prior syncfs), a
+    // subsequent allocate + syncfs would NOT persist the new size. After
+    // crash + remount, restoreTree would recover a rounded-up size instead
+    // of the exact allocated size.
+    const backend = new SyncMemoryBackend();
+    const allocSize = 2 * PAGE_SIZE + 1234; // non-page-aligned to expose rounding
+
+    {
+      const { FS, tomefs } = await mountTome(backend);
+      const stream = FS.open(`${MOUNT}/wal_incr`, O.RDWR | O.CREAT, 0o666);
+
+      // Write some data and syncfs to persist + clear dirty flags
+      const data = fillPattern(PAGE_SIZE, 0xAA);
+      FS.write(stream, data, 0, PAGE_SIZE, 0);
+      FS.close(stream);
+      syncfs(FS, tomefs);
+
+      // Now re-open and allocate — this extends the file but (before fix)
+      // did not mark metadata dirty. The incremental syncfs path would
+      // skip persisting the new size.
+      const stream2 = FS.open(`${MOUNT}/wal_incr`, O.RDWR, 0o666);
+      stream2.stream_ops.allocate(stream2, 0, allocSize);
+      expect(FS.fstat(stream2.fd).size).toBe(allocSize);
+      FS.close(stream2);
+
+      // Second syncfs — must persist the updated size
+      syncfs(FS, tomefs);
+    }
+
+    // Remount and verify exact size (not rounded to page boundary)
+    {
+      const { FS } = await mountTome(backend);
+      const stat = FS.stat(`${MOUNT}/wal_incr`);
+      expect(stat.size).toBe(allocSize);
+
+      // Verify original data survived
+      const stream = FS.open(`${MOUNT}/wal_incr`, O.RDONLY);
+      const buf = new Uint8Array(PAGE_SIZE);
+      FS.read(stream, buf, 0, PAGE_SIZE, 0);
+      expect(verifyPattern(buf, PAGE_SIZE, 0xAA)).toBe(true);
+      FS.close(stream);
+    }
+  });
+
   it("WAL preallocation pattern: allocate → sequential write → syncfs", async () => {
     const backend = new SyncMemoryBackend();
     const WAL_SIZE = 6 * PAGE_SIZE; // pre-allocate 6 pages
