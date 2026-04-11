@@ -257,19 +257,22 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   function resizeFileStorage(node: any, newSize: number): void {
     if (node.usedBytes === newSize) return;
 
-    // Reset per-node page table — truncation/extension may invalidate
-    // or replace cached pages.
-    node._pages = undefined;
     const path = node.storagePath;
 
     if (newSize === 0) {
+      // Reset per-node page table — all pages are being deleted.
+      node._pages = undefined;
       pageCache.deleteFile(path);
       node.usedBytes = 0;
       return;
     }
 
     if (newSize < node.usedBytes) {
-      // Shrink: zero the tail of the last surviving page, then invalidate beyond
+      // Shrink: reset per-node page table — truncation invalidates pages
+      // beyond the new size, and zeroTailAfterTruncate may reload the
+      // last surviving page (replacing the cached CachedPage reference).
+      node._pages = undefined;
+      // Zero the tail of the last surviving page, then invalidate beyond
       const neededPages = Math.ceil(newSize / PAGE_SIZE);
       pageCache.zeroTailAfterTruncate(path, newSize);
       pageCache.invalidatePagesFrom(path, neededPages);
