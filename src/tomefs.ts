@@ -752,9 +752,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
-        } else {
-          pageCache.flushFile(node.storagePath);
         }
+        // Dirty pages remain in the cache and are flushed by syncfs or
+        // eviction. POSIX close() does not guarantee persistence — that
+        // is fsync's job. Deferring flush eliminates O(dirty) backend
+        // writes on every close, matching MEMFS behavior.
       }
     },
 

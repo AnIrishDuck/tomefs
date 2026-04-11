@@ -514,7 +514,7 @@ describe("adversarial: concurrent multi-fd writes under cache pressure with pers
   it("rapid open-write-close cycle simulating connection pool under pressure", async () => {
     // Simulates multiple short-lived connections (like a connection pool)
     // each opening, writing a small amount, and closing. Under cache pressure,
-    // the close → flushFile path must correctly persist all dirty pages.
+    // the page cache must correctly persist all dirty pages during syncfs.
     const { FS, tomefs } = await mountTome(backend);
 
     const connectionCount = 20;
