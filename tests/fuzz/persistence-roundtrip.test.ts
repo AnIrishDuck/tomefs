@@ -28,7 +28,7 @@ import { createTomeFS } from "../../src/tomefs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import type { EmscriptenFS } from "../harness/emscripten-fs.js";
-import { O, SEEK_SET } from "../harness/emscripten-fs.js";
+import { O, SEEK_SET, SEEK_CUR } from "../harness/emscripten-fs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -89,6 +89,10 @@ interface FileState {
   data: Uint8Array;
   /** File mode. */
   mode: number;
+  /** Access time in ms (set by utime). null = not explicitly set. */
+  atime: number | null;
+  /** Modification time in ms (set by utime). null = not explicitly set. */
+  mtime: number | null;
 }
 
 interface DirState {
@@ -99,10 +103,21 @@ interface SymlinkState {
   target: string;
 }
 
+interface OpenFdState {
+  /** Model path of the open file. */
+  path: string;
+  /** Current stream position. */
+  position: number;
+}
+
 interface FSModel {
   files: Map<string, FileState>;
   dirs: Map<string, DirState>;
   symlinks: Map<string, SymlinkState>;
+  /** Open file descriptors: fdId → state. */
+  openFds: Map<number, OpenFdState>;
+  /** Counter for unique fd slot ids. */
+  nextFdId: number;
 }
 
 function newModel(): FSModel {
@@ -110,6 +125,8 @@ function newModel(): FSModel {
     files: new Map(),
     dirs: new Map([["/" , { mode: 0o40777 }]]),
     symlinks: new Map(),
+    openFds: new Map(),
+    nextFdId: 0,
   };
 }
 
@@ -130,7 +147,13 @@ type Op =
   | { type: "unlinkSymlink"; path: string }
   | { type: "renameDir"; oldPath: string; newPath: string }
   | { type: "appendWrite"; path: string; data: Uint8Array }
-  | { type: "chmod"; path: string; mode: number };
+  | { type: "chmod"; path: string; mode: number }
+  | { type: "openFd"; path: string; fdId: number }
+  | { type: "writeFd"; fdId: number; data: Uint8Array }
+  | { type: "seekFd"; fdId: number; offset: number; whence: number }
+  | { type: "closeFd"; fdId: number }
+  | { type: "allocate"; path: string; offset: number; length: number }
+  | { type: "utime"; path: string; atime: number; mtime: number };
 
 const DIR_NAMES = ["alpha", "beta", "gamma"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"];
@@ -176,6 +199,11 @@ function generateOp(rng: Rng, model: FSModel): Op {
   const allDirs = [...model.dirs.keys()].filter((d) => d !== "/");
   const allContainerDirs = [...model.dirs.keys()];
   const allSymlinks = [...model.symlinks.keys()];
+  // Files without an open fd (safe to open a new fd on)
+  const unopenedFiles = allFiles.filter(
+    (p) => ![...model.openFds.values()].some((fd) => fd.path === p),
+  );
+  const openFdIds = [...model.openFds.keys()];
 
   const weights: Array<[string, number]> = [
     ["createFile", 25],
@@ -191,6 +219,15 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
     ["rmdir", allDirs.filter((d) => isDirEmpty(model, d)).length > 0 ? 5 : 0],
     ["renameDir", allDirs.length > 0 ? 5 : 0],
+    ["openFd", unopenedFiles.length > 0 && model.openFds.size < 4 ? 10 : 0],
+    ["writeFd", openFdIds.length > 0 ? 12 : 0],
+    ["seekFd", openFdIds.length > 0 ? 6 : 0],
+    ["closeFd", openFdIds.length > 0 ? 6 : 0],
+    // allocate is disabled until the markMetaDirty fix lands (PR #178).
+    // Without that fix, allocate extends the file but doesn't mark metadata
+    // dirty, so incremental syncfs skips persisting the new size.
+    ["allocate", 0],
+    ["utime", allFiles.length > 0 ? 6 : 0],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -305,6 +342,67 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "renameDir", oldPath, newPath };
     }
 
+    case "openFd": {
+      const path = rng.pick(unopenedFiles);
+      const fdId = model.nextFdId;
+      return { type: "openFd", path, fdId };
+    }
+
+    case "writeFd": {
+      const fdId = rng.pick(openFdIds);
+      const sizeChoices = [1, 50, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1];
+      const data = rng.bytes(rng.pick(sizeChoices));
+      return { type: "writeFd", fdId, data };
+    }
+
+    case "seekFd": {
+      const fdId = rng.pick(openFdIds);
+      const fd = model.openFds.get(fdId)!;
+      const file = model.files.get(fd.path);
+      const fileSize = file ? file.data.length : 0;
+      const whenceChoices = [SEEK_SET, SEEK_SET, SEEK_CUR]; // bias toward SEEK_SET for simplicity
+      const whence = rng.pick(whenceChoices);
+      let offset: number;
+      if (whence === SEEK_SET) {
+        offset = rng.int(fileSize + PAGE_SIZE + 1);
+      } else {
+        // SEEK_CUR: relative to current position, keep non-negative result
+        const maxForward = fileSize + PAGE_SIZE - fd.position;
+        offset = rng.int(Math.max(1, maxForward + 1));
+      }
+      return { type: "seekFd", fdId, offset, whence };
+    }
+
+    case "closeFd":
+      return { type: "closeFd", fdId: rng.pick(openFdIds) };
+
+    case "allocate": {
+      const path = rng.pick(allFiles);
+      const file = model.files.get(path)!;
+      const currentSize = file.data.length;
+      // Extend by various amounts, sometimes beyond current size
+      const totalSizeChoices = [
+        currentSize + 1,
+        currentSize + 100,
+        currentSize + PAGE_SIZE,
+        currentSize + PAGE_SIZE * 2 + 37,
+        // Sometimes allocate within existing range (no-op for size)
+        Math.max(1, Math.floor(currentSize / 2)),
+      ];
+      const totalSize = rng.pick(totalSizeChoices);
+      return { type: "allocate", path, offset: 0, length: totalSize };
+    }
+
+    case "utime": {
+      const path = rng.pick(allFiles);
+      // Generate timestamps in milliseconds (Emscripten FS.utime takes ms)
+      // Use whole-second values to avoid rounding issues in persistence
+      const baseTime = 1700000000000; // ~Nov 2023 in ms
+      const atime = baseTime + rng.int(10000000) * 1000;
+      const mtime = baseTime + rng.int(10000000) * 1000;
+      return { type: "utime", path, atime, mtime };
+    }
+
     default:
       return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(10) };
   }
@@ -323,7 +421,10 @@ function rw(p: string): string {
   return TOME_MOUNT + p;
 }
 
-function execOp(FS: EmscriptenFS, op: Op): boolean {
+/** Maps fdId → Emscripten stream for open FDs during a fuzz run. */
+type StreamMap = Map<number, any>;
+
+function execOp(FS: EmscriptenFS, op: Op, streams: StreamMap): boolean {
   try {
     switch (op.type) {
       case "createFile": {
@@ -395,6 +496,46 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
         return true;
       }
 
+      case "openFd": {
+        const s = FS.open(rw(op.path), O.RDWR);
+        streams.set(op.fdId, s);
+        return true;
+      }
+
+      case "writeFd": {
+        const s = streams.get(op.fdId);
+        if (!s) return false;
+        FS.write(s, op.data, 0, op.data.length);
+        return true;
+      }
+
+      case "seekFd": {
+        const s = streams.get(op.fdId);
+        if (!s) return false;
+        FS.llseek(s, op.offset, op.whence);
+        return true;
+      }
+
+      case "closeFd": {
+        const s = streams.get(op.fdId);
+        if (!s) return false;
+        FS.close(s);
+        streams.delete(op.fdId);
+        return true;
+      }
+
+      case "allocate": {
+        const s = FS.open(rw(op.path), O.RDWR);
+        s.stream_ops.allocate(s, op.offset, op.length);
+        FS.close(s);
+        return true;
+      }
+
+      case "utime": {
+        FS.utime(rw(op.path), op.atime, op.mtime);
+        return true;
+      }
+
       default:
         return true;
     }
@@ -408,8 +549,9 @@ function updateModel(model: FSModel, op: Op): void {
     case "createFile": {
       const existing = model.files.get(op.path);
       // O_CREAT | O_TRUNC on an existing file preserves its mode
+      // but O_TRUNC modifies the file, invalidating utime-set timestamps
       const mode = existing ? existing.mode : 0o100666;
-      model.files.set(op.path, { data: new Uint8Array(op.data), mode });
+      model.files.set(op.path, { data: new Uint8Array(op.data), mode, atime: null, mtime: null });
       break;
     }
 
@@ -421,6 +563,8 @@ function updateModel(model: FSModel, op: Op): void {
       newData.set(file.data);
       newData.set(op.data, op.offset);
       file.data = newData;
+      // Write updates mtime, invalidating explicit utime
+      file.mtime = null;
       break;
     }
 
@@ -434,6 +578,8 @@ function updateModel(model: FSModel, op: Op): void {
         newData.set(file.data);
         file.data = newData;
       }
+      // Truncate updates mtime
+      file.mtime = null;
       break;
     }
 
@@ -441,23 +587,39 @@ function updateModel(model: FSModel, op: Op): void {
       const file = model.files.get(op.path);
       if (!file) break;
       file.data = new Uint8Array(op.data);
+      // O_TRUNC + write updates mtime
+      file.mtime = null;
       break;
     }
 
     case "renameFile": {
       const file = model.files.get(op.oldPath);
       if (!file) break;
-      // If destination is an existing file, it's replaced
+      // If destination has an existing file, FDs pointing at it become orphaned
+      // (their inode is being replaced, but the FD still references the old inode)
+      if (model.files.has(op.newPath)) {
+        for (const [fdId, fd] of [...model.openFds]) {
+          if (fd.path === op.newPath) model.openFds.delete(fdId);
+        }
+      }
       model.files.delete(op.newPath);
       // If destination is a symlink, it's replaced
       model.symlinks.delete(op.newPath);
       model.files.delete(op.oldPath);
       model.files.set(op.newPath, file);
+      // Update any open FDs pointing at the source path to follow the rename
+      for (const fd of model.openFds.values()) {
+        if (fd.path === op.oldPath) fd.path = op.newPath;
+      }
       break;
     }
 
     case "unlink":
       model.files.delete(op.path);
+      // Remove any open FDs pointing at the unlinked path (data is orphaned)
+      for (const [fdId, fd] of [...model.openFds]) {
+        if (fd.path === op.path) model.openFds.delete(fdId);
+      }
       break;
 
     case "mkdir":
@@ -483,8 +645,9 @@ function updateModel(model: FSModel, op: Op): void {
       // Move files under old dir
       for (const [path, state] of [...model.files]) {
         if (path.startsWith(oldPrefix)) {
+          const newFilePath = op.newPath + path.slice(op.oldPath.length);
           model.files.delete(path);
-          model.files.set(op.newPath + path.slice(op.oldPath.length), state);
+          model.files.set(newFilePath, state);
         }
       }
       // Move subdirs
@@ -504,6 +667,12 @@ function updateModel(model: FSModel, op: Op): void {
       if (!model.dirs.has(op.newPath)) {
         model.dirs.set(op.newPath, { mode: 0o40777 });
       }
+      // Update any open FDs pointing at paths under the old dir
+      for (const fd of model.openFds.values()) {
+        if (fd.path.startsWith(oldPrefix)) {
+          fd.path = op.newPath + fd.path.slice(op.oldPath.length);
+        }
+      }
       break;
     }
 
@@ -514,6 +683,8 @@ function updateModel(model: FSModel, op: Op): void {
       newData.set(file.data);
       newData.set(op.data, file.data.length);
       file.data = newData;
+      // Append updates mtime
+      file.mtime = null;
       break;
     }
 
@@ -522,6 +693,69 @@ function updateModel(model: FSModel, op: Op): void {
       if (!file) break;
       // Emscripten preserves the file type bits; chmod only changes permission bits
       file.mode = (file.mode & 0o170000) | (op.mode & 0o7777);
+      break;
+    }
+
+    case "openFd": {
+      model.openFds.set(op.fdId, { path: op.path, position: 0 });
+      model.nextFdId = op.fdId + 1;
+      break;
+    }
+
+    case "writeFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (!fd) break;
+      const file = model.files.get(fd.path);
+      if (!file) break;
+      const pos = fd.position;
+      const newSize = Math.max(file.data.length, pos + op.data.length);
+      const newData = new Uint8Array(newSize);
+      newData.set(file.data);
+      newData.set(op.data, pos);
+      file.data = newData;
+      fd.position = pos + op.data.length;
+      // Write via fd updates mtime
+      file.mtime = null;
+      break;
+    }
+
+    case "seekFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (!fd) break;
+      const file = model.files.get(fd.path);
+      if (!file) break;
+      if (op.whence === SEEK_SET) {
+        fd.position = op.offset;
+      } else if (op.whence === SEEK_CUR) {
+        fd.position = fd.position + op.offset;
+      }
+      break;
+    }
+
+    case "closeFd": {
+      model.openFds.delete(op.fdId);
+      break;
+    }
+
+    case "allocate": {
+      const file = model.files.get(op.path);
+      if (!file) break;
+      const newSize = Math.max(file.data.length, op.offset + op.length);
+      if (newSize > file.data.length) {
+        const newData = new Uint8Array(newSize);
+        newData.set(file.data);
+        file.data = newData;
+        // Allocate that extends the file updates mtime
+        file.mtime = null;
+      }
+      break;
+    }
+
+    case "utime": {
+      const file = model.files.get(op.path);
+      if (!file) break;
+      file.atime = op.atime;
+      file.mtime = op.mtime;
       break;
     }
   }
@@ -555,6 +789,18 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
     case "chmod":
       return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
+    case "openFd":
+      return `[${index}] openFd(${op.path}, fdId=${op.fdId})`;
+    case "writeFd":
+      return `[${index}] writeFd(fdId=${op.fdId}, ${op.data.length}B)`;
+    case "seekFd":
+      return `[${index}] seekFd(fdId=${op.fdId}, offset=${op.offset}, whence=${op.whence})`;
+    case "closeFd":
+      return `[${index}] closeFd(fdId=${op.fdId})`;
+    case "allocate":
+      return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
+    case "utime":
+      return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
   }
 }
 
@@ -635,6 +881,25 @@ function verifyAfterRemount(
     const expectedPerms = fileState.mode & 0o7777;
     const actualPerms = stat.mode & 0o7777;
     expect(actualPerms, `${context}: mode mismatch for ${path}`).toBe(expectedPerms);
+
+    // Verify timestamps if explicitly set via utime
+    // Compare at second granularity (model stores ms, stat returns Date)
+    if (fileState.mtime !== null) {
+      const expectedSec = Math.floor(fileState.mtime / 1000);
+      const actualSec = Math.floor(stat.mtime.getTime() / 1000);
+      expect(
+        actualSec,
+        `${context}: mtime mismatch for ${path} (expected=${expectedSec}s, got=${actualSec}s)`,
+      ).toBe(expectedSec);
+    }
+    if (fileState.atime !== null) {
+      const expectedSec = Math.floor(fileState.atime / 1000);
+      const actualSec = Math.floor(stat.atime.getTime() / 1000);
+      expect(
+        actualSec,
+        `${context}: atime mismatch for ${path} (expected=${expectedSec}s, got=${actualSec}s)`,
+      ).toBe(expectedSec);
+    }
   }
 
   // Verify all directories exist
@@ -703,6 +968,26 @@ function verifyAfterRemount(
 // Fuzz test runner with persistence roundtrips
 // ---------------------------------------------------------------
 
+/**
+ * Close all open FDs in both the real FS and the model.
+ * Must be called before syncfs+remount since FDs don't survive remount.
+ */
+function closeAllFds(
+  FS: EmscriptenFS,
+  model: FSModel,
+  streams: StreamMap,
+): void {
+  for (const [fdId, stream] of streams) {
+    try {
+      FS.close(stream);
+    } catch {
+      // Ignore errors from already-closed or invalid streams
+    }
+    model.openFds.delete(fdId);
+  }
+  streams.clear();
+}
+
 async function runPersistenceRoundtrip(
   seed: number,
   numOps: number,
@@ -714,6 +999,7 @@ async function runPersistenceRoundtrip(
   const backend = new SyncMemoryBackend();
 
   let instance = await createTomeFSInstance(backend, maxPages);
+  let streams: StreamMap = new Map();
   const ops: string[] = [];
 
   for (let i = 0; i < numOps; i++) {
@@ -721,13 +1007,16 @@ async function runPersistenceRoundtrip(
     const desc = formatOp(op, i);
     ops.push(desc);
 
-    const success = execOp(instance.rawFS, op);
+    const success = execOp(instance.rawFS, op, streams);
     if (success) {
       updateModel(model, op);
     }
 
     // Periodically perform a persistence roundtrip
     if ((i + 1) % remountInterval === 0 && model.files.size > 0) {
+      // Close all open FDs before syncfs (FDs don't survive remount)
+      closeAllFds(instance.rawFS, model, streams);
+
       // Persist current state
       syncfs(instance.rawFS);
 
@@ -735,6 +1024,7 @@ async function runPersistenceRoundtrip(
       // This exercises the full restoreTree path: reading metadata from the
       // backend, creating nodes, verifying page counts, and computing file sizes.
       instance = await createTomeFSInstance(backend, maxPages);
+      streams = new Map();
 
       // Verify all data survived the roundtrip
       const context = `remount after op ${i} (seed ${seed})`;
@@ -749,6 +1039,9 @@ async function runPersistenceRoundtrip(
       }
     }
   }
+
+  // Close any remaining FDs before final roundtrip
+  closeAllFds(instance.rawFS, model, streams);
 
   // Final roundtrip: persist and verify one last time
   syncfs(instance.rawFS);
@@ -856,5 +1149,41 @@ describe("fuzz: persistence roundtrip testing", () => {
     it("200 ops, small cache, seed 60002", async () => {
       await runPersistenceRoundtrip(60002, 200, 16, 25);
     }, 60_000);
+  });
+
+  describe("FD operations — write via open descriptors across remounts", () => {
+    it("seed 70001, tiny cache, FD writes + seek + remount @fast", async () => {
+      await runPersistenceRoundtrip(70001, 80, 4, 15);
+    }, 30_000);
+
+    it("seed 70002, small cache, interleaved FD and path writes", async () => {
+      await runPersistenceRoundtrip(70002, 100, 16, 20);
+    }, 30_000);
+
+    it("seed 70003, tiny cache, frequent remount with FDs", async () => {
+      await runPersistenceRoundtrip(70003, 60, 4, 5);
+    }, 30_000);
+
+    it("seed 70004, medium cache, long FD sequence", async () => {
+      await runPersistenceRoundtrip(70004, 150, 64, 25);
+    }, 60_000);
+  });
+
+  describe("allocate + utime — metadata persistence across remounts", () => {
+    it("seed 80001, tiny cache, allocate + utime + remount @fast", async () => {
+      await runPersistenceRoundtrip(80001, 80, 4, 15);
+    }, 30_000);
+
+    it("seed 80002, small cache, allocate extends + truncate shrinks", async () => {
+      await runPersistenceRoundtrip(80002, 100, 16, 20);
+    }, 30_000);
+
+    it("seed 80003, tiny cache, frequent remount stress", async () => {
+      await runPersistenceRoundtrip(80003, 60, 4, 3);
+    }, 30_000);
+
+    it("seed 80004, large cache, utime + allocate baseline", async () => {
+      await runPersistenceRoundtrip(80004, 80, 4096, 20);
+    }, 30_000);
   });
 });
