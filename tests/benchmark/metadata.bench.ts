@@ -6,6 +6,10 @@
  * These are the paths optimized by batch SAB bridge operations (readMetas,
  * writeMetas, deleteFiles, maxPageIndexBatch) and syncfs orphan-skip logic.
  *
+ * Both harnesses use the same raw FS API — MEMFS uses root paths while
+ * tomefs uses mount-prefixed paths. No Proxy wrapper is involved, so
+ * measurements reflect true FS overhead without instrumentation bias.
+ *
  * Run: npx vitest bench tests/benchmark/metadata.bench.ts
  */
 
@@ -21,27 +25,22 @@ import { O } from "../harness/emscripten-fs.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
-// Harness setup (shared with throughput.bench.ts)
+// Harness setup
 // ---------------------------------------------------------------------------
 
 const TOME_MOUNT = "/tome";
 
-function isSystemPath(p: string): boolean {
-  return p.startsWith("/dev") || p.startsWith("/proc") || p.startsWith("/tmp");
-}
-
-function rewritePath(p: string): string {
-  if (!p.startsWith("/")) return p;
-  if (p.startsWith(TOME_MOUNT + "/") || p === TOME_MOUNT) return p;
-  if (isSystemPath(p)) return p;
-  if (p === "/") return TOME_MOUNT;
-  return TOME_MOUNT + p;
-}
-
 interface BenchHarness {
+  /** The raw Emscripten FS object (no wrappers). */
   FS: EmscriptenFS;
-  rawFS: EmscriptenFS;
+  /** Path prefix for this harness ("" for MEMFS, "/tome" for tomefs). */
+  prefix: string;
   label: string;
+}
+
+/** Resolve a benchmark path through the harness prefix. */
+function p(h: BenchHarness, path: string): string {
+  return h.prefix + path;
 }
 
 async function createMemFSHarness(): Promise<BenchHarness> {
@@ -49,8 +48,7 @@ async function createMemFSHarness(): Promise<BenchHarness> {
     join(__dirname, "../harness/emscripten_fs.mjs")
   );
   const Module = await createModule();
-  const fs = Module.FS as EmscriptenFS;
-  return { FS: fs, rawFS: fs, label: "memfs" };
+  return { FS: Module.FS as EmscriptenFS, prefix: "", label: "memfs" };
 }
 
 async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
@@ -66,37 +64,11 @@ async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
   rawFS.mkdir(TOME_MOUNT);
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
-  const methodCache = new Map<string, Function>();
-  const pathMethods = new Set([
-    "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
-    "readdir", "unlink", "writeFile", "readFile", "mknod",
-    "chmod", "utime", "syncfs",
-  ]);
-
-  const wrappedFS = new Proxy(rawFS, {
-    get(target: any, prop: string) {
-      const cached = methodCache.get(prop);
-      if (cached) return cached;
-
-      const val = target[prop];
-      if (typeof val !== "function") return val;
-
-      let wrapped: Function;
-      if (pathMethods.has(prop)) {
-        wrapped = (path: string, ...args: any[]) =>
-          val.call(target, rewritePath(path), ...args);
-      } else if (prop === "rename") {
-        wrapped = (oldPath: string, newPath: string) =>
-          val.call(target, rewritePath(oldPath), rewritePath(newPath));
-      } else {
-        wrapped = val.bind(target);
-      }
-      methodCache.set(prop, wrapped);
-      return wrapped;
-    },
-  }) as unknown as EmscriptenFS;
-
-  return { FS: wrappedFS, rawFS, label: `tomefs-${maxPages}` };
+  return {
+    FS: rawFS as EmscriptenFS,
+    prefix: TOME_MOUNT,
+    label: `tomefs-${maxPages}`,
+  };
 }
 
 // Reusable data buffer
@@ -116,9 +88,9 @@ describe("Stat Calls (200 stats across 20 files)", async () => {
 
   // Pre-populate files
   for (const h of [memfs, tome4096]) {
-    h.FS.mkdir("/bench_stat_dir");
+    h.FS.mkdir(p(h, "/bench_stat_dir"));
     for (let i = 0; i < STAT_FILES; i++) {
-      const s = h.FS.open(`/bench_stat_dir/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      const s = h.FS.open(p(h, `/bench_stat_dir/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
       h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
       h.FS.close(s);
     }
@@ -126,7 +98,7 @@ describe("Stat Calls (200 stats across 20 files)", async () => {
 
   function statCalls(h: BenchHarness) {
     for (let i = 0; i < STAT_CALLS; i++) {
-      h.FS.stat(`/bench_stat_dir/f${i % STAT_FILES}`);
+      h.FS.stat(p(h, `/bench_stat_dir/f${i % STAT_FILES}`));
     }
   }
 
@@ -146,9 +118,9 @@ describe("Readdir (50 calls on 50-entry directory)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   for (const h of [memfs, tome4096]) {
-    h.FS.mkdir("/bench_readdir");
+    h.FS.mkdir(p(h, "/bench_readdir"));
     for (let i = 0; i < READDIR_ENTRIES; i++) {
-      const s = h.FS.open(`/bench_readdir/file_${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      const s = h.FS.open(p(h, `/bench_readdir/file_${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
       h.FS.write(s, PAGE_DATA, 0, 64);
       h.FS.close(s);
     }
@@ -156,7 +128,7 @@ describe("Readdir (50 calls on 50-entry directory)", async () => {
 
   function readdirCalls(h: BenchHarness) {
     for (let i = 0; i < READDIR_CALLS; i++) {
-      h.FS.readdir("/bench_readdir");
+      h.FS.readdir(p(h, "/bench_readdir"));
     }
   }
 
@@ -175,9 +147,9 @@ describe("Rename (50 file renames, same directory)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   for (const h of [memfs, tome4096]) {
-    h.FS.mkdir("/bench_rename");
+    h.FS.mkdir(p(h, "/bench_rename"));
     for (let i = 0; i < RENAME_COUNT; i++) {
-      const s = h.FS.open(`/bench_rename/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      const s = h.FS.open(p(h, `/bench_rename/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
       h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
       h.FS.close(s);
     }
@@ -186,11 +158,11 @@ describe("Rename (50 file renames, same directory)", async () => {
   function renameCalls(h: BenchHarness) {
     // Rename f0→g0, f1→g1, ...
     for (let i = 0; i < RENAME_COUNT; i++) {
-      h.FS.rename(`/bench_rename/f${i}`, `/bench_rename/g${i}`);
+      h.FS.rename(p(h, `/bench_rename/f${i}`), p(h, `/bench_rename/g${i}`));
     }
     // Rename back: g0→f0, g1→f1, ...
     for (let i = 0; i < RENAME_COUNT; i++) {
-      h.FS.rename(`/bench_rename/g${i}`, `/bench_rename/f${i}`);
+      h.FS.rename(p(h, `/bench_rename/g${i}`), p(h, `/bench_rename/f${i}`));
     }
   }
 
@@ -212,10 +184,10 @@ describe("Truncate (10 rounds of truncate/extend on 20 files)", async () => {
   const tome32 = await createTomeFSHarness(32); // cache pressure
 
   for (const h of [memfs, tome4096, tome32]) {
-    h.FS.mkdir("/bench_trunc");
+    h.FS.mkdir(p(h, "/bench_trunc"));
     for (let i = 0; i < TRUNC_FILES; i++) {
-      const s = h.FS.open(`/bench_trunc/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
-      for (let p = 0; p < TRUNC_PAGES; p++) {
+      const s = h.FS.open(p(h, `/bench_trunc/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      for (let pg = 0; pg < TRUNC_PAGES; pg++) {
         h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
       }
       h.FS.close(s);
@@ -226,11 +198,11 @@ describe("Truncate (10 rounds of truncate/extend on 20 files)", async () => {
     for (let r = 0; r < TRUNC_ROUNDS; r++) {
       for (let i = 0; i < TRUNC_FILES; i++) {
         // Truncate to half size
-        h.FS.truncate(`/bench_trunc/f${i}`, TRUNC_PAGES * PAGE_SIZE / 2);
+        h.FS.truncate(p(h, `/bench_trunc/f${i}`), TRUNC_PAGES * PAGE_SIZE / 2);
       }
       for (let i = 0; i < TRUNC_FILES; i++) {
         // Extend back to full size (sparse)
-        h.FS.truncate(`/bench_trunc/f${i}`, TRUNC_PAGES * PAGE_SIZE);
+        h.FS.truncate(p(h, `/bench_trunc/f${i}`), TRUNC_PAGES * PAGE_SIZE);
       }
     }
   }
@@ -252,9 +224,9 @@ describe("Chmod (100 rounds on 20 files)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   for (const h of [memfs, tome4096]) {
-    h.FS.mkdir("/bench_chmod");
+    h.FS.mkdir(p(h, "/bench_chmod"));
     for (let i = 0; i < CHMOD_FILES; i++) {
-      const s = h.FS.open(`/bench_chmod/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      const s = h.FS.open(p(h, `/bench_chmod/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
       h.FS.write(s, PAGE_DATA, 0, 64);
       h.FS.close(s);
     }
@@ -264,7 +236,7 @@ describe("Chmod (100 rounds on 20 files)", async () => {
     for (let r = 0; r < CHMOD_ROUNDS; r++) {
       const mode = r % 2 === 0 ? 0o644 : 0o755;
       for (let i = 0; i < CHMOD_FILES; i++) {
-        h.FS.chmod(`/bench_chmod/f${i}`, mode);
+        h.FS.chmod(p(h, `/bench_chmod/f${i}`), mode);
       }
     }
   }
@@ -284,15 +256,15 @@ describe("Mkdir/Rmdir Churn (100 directories)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   for (const h of [memfs, tome4096]) {
-    h.FS.mkdir("/bench_dirchurn");
+    h.FS.mkdir(p(h, "/bench_dirchurn"));
   }
 
   function dirChurn(h: BenchHarness) {
     for (let i = 0; i < DIR_CHURN_COUNT; i++) {
-      h.FS.mkdir(`/bench_dirchurn/d${i}`);
+      h.FS.mkdir(p(h, `/bench_dirchurn/d${i}`));
     }
     for (let i = 0; i < DIR_CHURN_COUNT; i++) {
-      h.FS.rmdir(`/bench_dirchurn/d${i}`);
+      h.FS.rmdir(p(h, `/bench_dirchurn/d${i}`));
     }
   }
 
@@ -312,10 +284,10 @@ describe("Directory Rename (20 renames of 10-file directories)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   for (const h of [memfs, tome4096]) {
-    h.FS.mkdir("/bench_dirren");
-    h.FS.mkdir("/bench_dirren/src");
+    h.FS.mkdir(p(h, "/bench_dirren"));
+    h.FS.mkdir(p(h, "/bench_dirren/src"));
     for (let i = 0; i < DIR_RENAME_FILES_PER_DIR; i++) {
-      const s = h.FS.open(`/bench_dirren/src/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      const s = h.FS.open(p(h, `/bench_dirren/src/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
       h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
       h.FS.close(s);
     }
@@ -324,9 +296,9 @@ describe("Directory Rename (20 renames of 10-file directories)", async () => {
   function dirRename(h: BenchHarness) {
     for (let r = 0; r < DIR_RENAME_ROUNDS; r++) {
       if (r % 2 === 0) {
-        h.FS.rename("/bench_dirren/src", "/bench_dirren/dst");
+        h.FS.rename(p(h, "/bench_dirren/src"), p(h, "/bench_dirren/dst"));
       } else {
-        h.FS.rename("/bench_dirren/dst", "/bench_dirren/src");
+        h.FS.rename(p(h, "/bench_dirren/dst"), p(h, "/bench_dirren/src"));
       }
     }
   }
@@ -348,10 +320,10 @@ describe("Syncfs Flush (20 files x 4 pages, all dirty)", async () => {
 
   // Pre-populate for both harnesses
   for (const h of [tome4096, tome32]) {
-    h.FS.mkdir("/bench_syncfs");
+    h.FS.mkdir(p(h, "/bench_syncfs"));
     for (let i = 0; i < SYNCFS_FILES; i++) {
-      const s = h.FS.open(`/bench_syncfs/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
-      for (let p = 0; p < SYNCFS_PAGES_PER_FILE; p++) {
+      const s = h.FS.open(p(h, `/bench_syncfs/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      for (let pg = 0; pg < SYNCFS_PAGES_PER_FILE; pg++) {
         h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
       }
       h.FS.close(s);
@@ -362,12 +334,12 @@ describe("Syncfs Flush (20 files x 4 pages, all dirty)", async () => {
     // Dirty all files by writing 1 byte to each
     const oneByte = new Uint8Array([0x42]);
     for (let i = 0; i < SYNCFS_FILES; i++) {
-      const s = h.FS.open(`/bench_syncfs/f${i}`, O.WRONLY, 0o666);
+      const s = h.FS.open(p(h, `/bench_syncfs/f${i}`), O.WRONLY, 0o666);
       h.FS.write(s, oneByte, 0, 1);
       h.FS.close(s);
     }
     // Flush
-    h.rawFS.syncfs(false, (err: Error | null) => {
+    h.FS.syncfs(false, (err: Error | null) => {
       if (err) throw err;
     });
   }
@@ -384,21 +356,21 @@ describe("Syncfs No-Op (no dirty pages, no tree mutations)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   // Create files and do initial sync
-  tome4096.FS.mkdir("/bench_syncnoop");
+  tome4096.FS.mkdir(p(tome4096, "/bench_syncnoop"));
   for (let i = 0; i < SYNCFS_FILES; i++) {
-    const s = tome4096.FS.open(`/bench_syncnoop/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
-    for (let p = 0; p < SYNCFS_PAGES_PER_FILE; p++) {
+    const s = tome4096.FS.open(p(tome4096, `/bench_syncnoop/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    for (let pg = 0; pg < SYNCFS_PAGES_PER_FILE; pg++) {
       tome4096.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
     }
     tome4096.FS.close(s);
   }
   // Initial sync to persist everything
-  tome4096.rawFS.syncfs(false, (err: Error | null) => {
+  tome4096.FS.syncfs(false, (err: Error | null) => {
     if (err) throw err;
   });
 
   bench("tomefs (4096 pages)", () => {
-    tome4096.rawFS.syncfs(false, (err: Error | null) => {
+    tome4096.FS.syncfs(false, (err: Error | null) => {
       if (err) throw err;
     });
   });
@@ -417,12 +389,12 @@ describe("Mixed Metadata Workload (PGlite-like startup pattern)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   for (const h of [memfs, tome4096]) {
-    h.FS.mkdir("/bench_mixmeta");
-    h.FS.mkdir("/bench_mixmeta/base");
-    h.FS.mkdir("/bench_mixmeta/pg_wal");
+    h.FS.mkdir(p(h, "/bench_mixmeta"));
+    h.FS.mkdir(p(h, "/bench_mixmeta/base"));
+    h.FS.mkdir(p(h, "/bench_mixmeta/pg_wal"));
     for (let i = 0; i < MIX_META_FILES; i++) {
       const dir = i < 10 ? "/bench_mixmeta/base" : "/bench_mixmeta/pg_wal";
-      const s = h.FS.open(`${dir}/f${i}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      const s = h.FS.open(p(h, `${dir}/f${i}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
       h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE * 2); // 2 pages each
       h.FS.close(s);
     }
@@ -431,26 +403,26 @@ describe("Mixed Metadata Workload (PGlite-like startup pattern)", async () => {
   function mixedMeta(h: BenchHarness) {
     for (let r = 0; r < MIX_META_ROUNDS; r++) {
       // readdir (catalog scan)
-      h.FS.readdir("/bench_mixmeta/base");
-      h.FS.readdir("/bench_mixmeta/pg_wal");
+      h.FS.readdir(p(h, "/bench_mixmeta/base"));
+      h.FS.readdir(p(h, "/bench_mixmeta/pg_wal"));
 
       // stat each file (metadata lookup)
       for (let i = 0; i < MIX_META_FILES; i++) {
         const dir = i < 10 ? "/bench_mixmeta/base" : "/bench_mixmeta/pg_wal";
-        h.FS.stat(`${dir}/f${i}`);
+        h.FS.stat(p(h, `${dir}/f${i}`));
       }
 
       // open+close cycle (simulating Postgres probing files)
       for (let i = 0; i < 5; i++) {
-        const s = h.FS.open(`/bench_mixmeta/base/f${i}`, O.RDONLY);
+        const s = h.FS.open(p(h, `/bench_mixmeta/base/f${i}`), O.RDONLY);
         h.FS.close(s);
       }
 
       // truncate one WAL file
-      h.FS.truncate(`/bench_mixmeta/pg_wal/f${10 + (r % 5)}`, PAGE_SIZE);
+      h.FS.truncate(p(h, `/bench_mixmeta/pg_wal/f${10 + (r % 5)}`), PAGE_SIZE);
 
       // chmod (simulating permission adjustments)
-      h.FS.chmod(`/bench_mixmeta/base/f${r % 10}`, 0o600);
+      h.FS.chmod(p(h, `/bench_mixmeta/base/f${r % 10}`), 0o600);
     }
   }
 

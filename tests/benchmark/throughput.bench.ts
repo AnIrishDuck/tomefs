@@ -6,10 +6,14 @@
  * by comparing tomefs (SyncMemoryBackend) against raw MEMFS for core I/O
  * operations.
  *
+ * Both harnesses use the same raw FS API — MEMFS uses root paths while
+ * tomefs uses mount-prefixed paths. No Proxy wrapper is involved, so
+ * measurements reflect true FS overhead without instrumentation bias.
+ *
  * Run: npx vitest bench
  */
 
-import { bench, describe, beforeEach } from "vitest";
+import { bench, describe } from "vitest";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { createTomeFS } from "../../src/tomefs.js";
@@ -26,21 +30,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const TOME_MOUNT = "/tome";
 
-function isSystemPath(p: string): boolean {
-  return p.startsWith("/dev") || p.startsWith("/proc") || p.startsWith("/tmp");
-}
-
-function rewritePath(p: string): string {
-  if (!p.startsWith("/")) return p;
-  if (p.startsWith(TOME_MOUNT + "/") || p === TOME_MOUNT) return p;
-  if (isSystemPath(p)) return p;
-  if (p === "/") return TOME_MOUNT;
-  return TOME_MOUNT + p;
-}
-
 interface BenchHarness {
+  /** The raw Emscripten FS object (no wrappers). */
   FS: EmscriptenFS;
+  /** Path prefix for this harness ("" for MEMFS, "/tome" for tomefs). */
+  prefix: string;
   label: string;
+}
+
+/** Resolve a benchmark path through the harness prefix. */
+function p(h: BenchHarness, path: string): string {
+  return h.prefix + path;
 }
 
 async function createMemFSHarness(): Promise<BenchHarness> {
@@ -48,7 +48,7 @@ async function createMemFSHarness(): Promise<BenchHarness> {
     join(__dirname, "../harness/emscripten_fs.mjs")
   );
   const Module = await createModule();
-  return { FS: Module.FS as EmscriptenFS, label: "memfs" };
+  return { FS: Module.FS as EmscriptenFS, prefix: "", label: "memfs" };
 }
 
 async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
@@ -64,41 +64,11 @@ async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
   rawFS.mkdir(TOME_MOUNT);
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
-  // Wrap FS with path rewriting so benchmarks use clean paths.
-  // Pre-bind methods to avoid Proxy overhead on the hot path —
-  // a Proxy get-trap calling val.bind(target) on every access creates
-  // a new Function object per call, unfairly penalizing tomefs benchmarks.
-  const methodCache = new Map<string, Function>();
-  const pathMethods = new Set([
-    "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
-    "readdir", "unlink", "writeFile", "readFile", "mknod",
-    "chmod", "utime",
-  ]);
-
-  const wrappedFS = new Proxy(rawFS, {
-    get(target: any, prop: string) {
-      const cached = methodCache.get(prop);
-      if (cached) return cached;
-
-      const val = target[prop];
-      if (typeof val !== "function") return val;
-
-      let wrapped: Function;
-      if (pathMethods.has(prop)) {
-        wrapped = (path: string, ...args: any[]) =>
-          val.call(target, rewritePath(path), ...args);
-      } else if (prop === "rename") {
-        wrapped = (oldPath: string, newPath: string) =>
-          val.call(target, rewritePath(oldPath), rewritePath(newPath));
-      } else {
-        wrapped = val.bind(target);
-      }
-      methodCache.set(prop, wrapped);
-      return wrapped;
-    },
-  }) as unknown as EmscriptenFS;
-
-  return { FS: wrappedFS, label: `tomefs-${maxPages}` };
+  return {
+    FS: rawFS as EmscriptenFS,
+    prefix: TOME_MOUNT,
+    label: `tomefs-${maxPages}`,
+  };
 }
 
 // Reusable data buffers
@@ -119,12 +89,12 @@ describe("Sequential Write (64 pages = 512 KB)", async () => {
   const tome64 = await createTomeFSHarness(64); // cache fits exactly
 
   function seqWrite(h: BenchHarness) {
-    const stream = h.FS.open("/bench_seqw", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    const stream = h.FS.open(p(h, "/bench_seqw"), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
     for (let i = 0; i < SEQ_PAGES; i++) {
       h.FS.write(stream, PAGE_DATA, 0, PAGE_SIZE);
     }
     h.FS.close(stream);
-    h.FS.unlink("/bench_seqw");
+    h.FS.unlink(p(h, "/bench_seqw"));
   }
 
   bench("MEMFS", () => seqWrite(memfs));
@@ -143,7 +113,7 @@ describe("Sequential Read (64 pages = 512 KB)", async () => {
 
   // Pre-populate files
   for (const h of [memfs, tome4096, tome64]) {
-    const s = h.FS.open("/bench_seqr", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    const s = h.FS.open(p(h, "/bench_seqr"), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
     for (let i = 0; i < SEQ_PAGES; i++) {
       h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
     }
@@ -151,7 +121,7 @@ describe("Sequential Read (64 pages = 512 KB)", async () => {
   }
 
   function seqRead(h: BenchHarness) {
-    const stream = h.FS.open("/bench_seqr", O.RDONLY);
+    const stream = h.FS.open(p(h, "/bench_seqr"), O.RDONLY);
     for (let i = 0; i < SEQ_PAGES; i++) {
       h.FS.read(stream, READ_BUF, 0, PAGE_SIZE);
     }
@@ -182,7 +152,7 @@ describe("Random Read (100 reads from 128-page file)", async () => {
 
   // Pre-populate
   for (const h of [memfs, tome4096, tome128, tome16]) {
-    const s = h.FS.open("/bench_rand", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    const s = h.FS.open(p(h, "/bench_rand"), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
     for (let i = 0; i < RANDOM_FILE_PAGES; i++) {
       h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
     }
@@ -190,7 +160,7 @@ describe("Random Read (100 reads from 128-page file)", async () => {
   }
 
   function randRead(h: BenchHarness) {
-    const stream = h.FS.open("/bench_rand", O.RDONLY);
+    const stream = h.FS.open(p(h, "/bench_rand"), O.RDONLY);
     for (const idx of RANDOM_INDICES) {
       h.FS.llseek(stream, idx * PAGE_SIZE, SEEK_SET);
       h.FS.read(stream, READ_BUF, 0, PAGE_SIZE);
@@ -218,12 +188,12 @@ describe("Small Writes (500 x 128B appends)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   function smallWrites(h: BenchHarness) {
-    const stream = h.FS.open("/bench_small", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    const stream = h.FS.open(p(h, "/bench_small"), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
     for (let i = 0; i < SMALL_WRITE_COUNT; i++) {
       h.FS.write(stream, SMALL_DATA, 0, SMALL_WRITE_SIZE);
     }
     h.FS.close(stream);
-    h.FS.unlink("/bench_small");
+    h.FS.unlink(p(h, "/bench_small"));
   }
 
   bench("MEMFS", () => smallWrites(memfs));
@@ -243,7 +213,7 @@ describe("File Create/Delete Churn (100 files)", async () => {
 
   function churn(h: BenchHarness) {
     for (let i = 0; i < CHURN_COUNT; i++) {
-      const path = `/bench_churn_${i}`;
+      const path = p(h, `/bench_churn_${i}`);
       const s = h.FS.open(path, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
       h.FS.write(s, CHURN_DATA, 0, PAGE_SIZE);
       h.FS.close(s);
@@ -270,7 +240,7 @@ describe("Cross-Page Boundary Writes (200 writes)", async () => {
   const tome4096 = await createTomeFSHarness(4096);
 
   function crossPageWrites(h: BenchHarness) {
-    const stream = h.FS.open("/bench_cross", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    const stream = h.FS.open(p(h, "/bench_cross"), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
     for (let i = 0; i < CROSS_PAGE_WRITES; i++) {
       // Position at PAGE_SIZE - 128, so each write straddles the boundary
       const pos = i * PAGE_SIZE + (PAGE_SIZE - 128);
@@ -278,7 +248,7 @@ describe("Cross-Page Boundary Writes (200 writes)", async () => {
       h.FS.write(stream, CROSS_DATA, 0, CROSS_SIZE);
     }
     h.FS.close(stream);
-    h.FS.unlink("/bench_cross");
+    h.FS.unlink(p(h, "/bench_cross"));
   }
 
   bench("MEMFS", () => crossPageWrites(memfs));
@@ -301,8 +271,8 @@ describe("Mixed Multi-File Read/Write (8 files, 50 rounds)", async () => {
   // Pre-populate
   for (const h of [memfs, tome4096, tome16]) {
     for (let f = 0; f < MIX_FILES; f++) {
-      const s = h.FS.open(`/bench_mix_${f}`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
-      for (let p = 0; p < MIX_PAGES_PER_FILE; p++) {
+      const s = h.FS.open(p(h, `/bench_mix_${f}`), O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      for (let pg = 0; pg < MIX_PAGES_PER_FILE; pg++) {
         h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
       }
       h.FS.close(s);
@@ -316,13 +286,13 @@ describe("Mixed Multi-File Read/Write (8 files, 50 rounds)", async () => {
       const pageIdx = (r * 7) % MIX_PAGES_PER_FILE;
 
       // Read a page from one file
-      const rs = h.FS.open(`/bench_mix_${fRead}`, O.RDONLY);
+      const rs = h.FS.open(p(h, `/bench_mix_${fRead}`), O.RDONLY);
       h.FS.llseek(rs, pageIdx * PAGE_SIZE, SEEK_SET);
       h.FS.read(rs, READ_BUF, 0, PAGE_SIZE);
       h.FS.close(rs);
 
       // Append to another file
-      const ws = h.FS.open(`/bench_mix_${fWrite}`, O.WRONLY | O.APPEND);
+      const ws = h.FS.open(p(h, `/bench_mix_${fWrite}`), O.WRONLY | O.APPEND);
       h.FS.write(ws, SMALL_DATA, 0, SMALL_WRITE_SIZE);
       h.FS.close(ws);
     }
