@@ -271,4 +271,280 @@ describe("full-stack: tomefs → SAB bridge → MemoryBackend", () => {
       expect(content).toBe("preserved");
     });
   });
+
+  // -------------------------------------------------------------------
+  // Persistence across remount: destroy FS worker, start a new one,
+  // verify data survives restoreTree through the full SAB bridge chain.
+  //
+  // This is the actual production restart path: PGlite tab closes →
+  // Emscripten module destroyed → tab reopens → new Emscripten module
+  // mounts tomefs → restoreTree reads from backend through SAB bridge.
+  //
+  // All other persistence tests (adversarial, workload, fuzz) use
+  // SyncMemoryBackend directly, bypassing the SAB bridge. These tests
+  // are the only ones exercising the full production persistence path.
+  // -------------------------------------------------------------------
+
+  describe("persistence across remount (full SAB bridge roundtrip)", () => {
+    /**
+     * Terminate the current FS worker and start a fresh one with the same
+     * SAB + backend. The new worker creates a new Emscripten module, mounts
+     * tomefs, and restoreTree rebuilds the filesystem from backend metadata
+     * through the SabClient → SabWorker → MemoryBackend chain.
+     */
+    async function remount(maxPages?: number): Promise<void> {
+      await fsWorker.terminate();
+      fsWorker = new Worker(WORKER_BUNDLE, {
+        workerData: { sab, maxPages: maxPages ?? 64 },
+      });
+      await waitReady(fsWorker);
+    }
+
+    it("@fast basic file persists across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/persist.txt", "survives restart"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const content = await callWorker(fsWorker, "readFile", ["/persist.txt"]);
+      expect(content).toBe("survives restart");
+    });
+
+    it("@fast multi-page file persists across remount", async () => {
+      await callWorker(fsWorker, "writeMultiPage", ["/large.dat", 8, 42]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const result = await callWorker(fsWorker, "verifyMultiPage", ["/large.dat", 8, 42]);
+      expect(result).toEqual({ ok: true });
+
+      const stat = await callWorker(fsWorker, "stat", ["/large.dat"]);
+      expect(stat.size).toBe(8 * PAGE_SIZE);
+    });
+
+    it("@fast directory tree persists across remount", async () => {
+      await callWorker(fsWorker, "mkdir", ["/db"]);
+      await callWorker(fsWorker, "mkdir", ["/db/base"]);
+      await callWorker(fsWorker, "mkdir", ["/db/base/1"]);
+      await callWorker(fsWorker, "writeFile", ["/db/base/1/pg_class", "catalog data"]);
+      await callWorker(fsWorker, "writeFile", ["/db/base/1/pg_type", "type data"]);
+      await callWorker(fsWorker, "writeFile", ["/db/wal.log", "wal content"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Verify directory structure
+      const dbEntries = await callWorker(fsWorker, "readdir", ["/db"]);
+      expect(dbEntries).toContain("base");
+      expect(dbEntries).toContain("wal.log");
+
+      const baseEntries = await callWorker(fsWorker, "readdir", ["/db/base/1"]);
+      expect(baseEntries).toContain("pg_class");
+      expect(baseEntries).toContain("pg_type");
+
+      // Verify file contents
+      expect(await callWorker(fsWorker, "readFile", ["/db/base/1/pg_class"])).toBe("catalog data");
+      expect(await callWorker(fsWorker, "readFile", ["/db/base/1/pg_type"])).toBe("type data");
+      expect(await callWorker(fsWorker, "readFile", ["/db/wal.log"])).toBe("wal content");
+    });
+
+    it("@fast many files under cache pressure persist across remount", async () => {
+      // Write 100 files — total pages exceed the 64-page cache
+      for (let i = 0; i < 100; i++) {
+        await callWorker(fsWorker, "writeFile", [`/f${i}.txt`, `value-${i}`]);
+      }
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Every file must survive the full roundtrip
+      for (let i = 0; i < 100; i++) {
+        const content = await callWorker(fsWorker, "readFile", [`/f${i}.txt`]);
+        expect(content).toBe(`value-${i}`);
+      }
+    });
+
+    it("rename persists across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/original.txt", "moved data"]);
+      await callWorker(fsWorker, "rename", ["/original.txt", "/renamed.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const content = await callWorker(fsWorker, "readFile", ["/renamed.txt"]);
+      expect(content).toBe("moved data");
+
+      // Original path must not exist
+      await expect(
+        callWorker(fsWorker, "readFile", ["/original.txt"]),
+      ).rejects.toThrow();
+    });
+
+    it("unlink + create at same path persists across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/reuse.txt", "old data"]);
+      await callWorker(fsWorker, "syncfs", []);
+
+      await callWorker(fsWorker, "unlink", ["/reuse.txt"]);
+      await callWorker(fsWorker, "writeFile", ["/reuse.txt", "new data"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const content = await callWorker(fsWorker, "readFile", ["/reuse.txt"]);
+      expect(content).toBe("new data");
+    });
+
+    it("truncate persists across remount", async () => {
+      await callWorker(fsWorker, "writeMultiPage", ["/trunc.dat", 8, 0]);
+      await callWorker(fsWorker, "truncate", ["/trunc.dat", PAGE_SIZE * 3]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const stat = await callWorker(fsWorker, "stat", ["/trunc.dat"]);
+      expect(stat.size).toBe(PAGE_SIZE * 3);
+
+      // First 3 pages should have original data
+      const result = await callWorker(fsWorker, "verifyMultiPage", ["/trunc.dat", 3, 0]);
+      expect(result).toEqual({ ok: true });
+    });
+
+    it("multiple syncfs cycles then remount preserves final state", async () => {
+      // Cycle 1: create files
+      await callWorker(fsWorker, "writeFile", ["/a.txt", "alpha"]);
+      await callWorker(fsWorker, "writeFile", ["/b.txt", "beta"]);
+      await callWorker(fsWorker, "syncfs", []);
+
+      // Cycle 2: modify one, delete another, add new
+      await callWorker(fsWorker, "writeFile", ["/a.txt", "alpha-v2"]);
+      await callWorker(fsWorker, "unlink", ["/b.txt"]);
+      await callWorker(fsWorker, "writeFile", ["/c.txt", "gamma"]);
+      await callWorker(fsWorker, "syncfs", []);
+
+      // Cycle 3: rename
+      await callWorker(fsWorker, "rename", ["/c.txt", "/d.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+
+      await remount();
+
+      expect(await callWorker(fsWorker, "readFile", ["/a.txt"])).toBe("alpha-v2");
+      expect(await callWorker(fsWorker, "readFile", ["/d.txt"])).toBe("gamma");
+      await expect(callWorker(fsWorker, "readFile", ["/b.txt"])).rejects.toThrow();
+      await expect(callWorker(fsWorker, "readFile", ["/c.txt"])).rejects.toThrow();
+    });
+
+    it("multi-page files under cache pressure persist across remount", async () => {
+      // 4 files × 32 pages = 128 pages, cache holds 64
+      for (let i = 0; i < 4; i++) {
+        await callWorker(fsWorker, "writeMultiPage", [`/big${i}.dat`, 32, i * 10]);
+      }
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      for (let i = 0; i < 4; i++) {
+        const result = await callWorker(fsWorker, "verifyMultiPage", [`/big${i}.dat`, 32, i * 10]);
+        expect(result).toEqual({ ok: true });
+      }
+    });
+
+    it("incremental modifications between sync cycles persist", async () => {
+      // Create 10 multi-page files
+      for (let i = 0; i < 10; i++) {
+        await callWorker(fsWorker, "writeMultiPage", [`/file${i}.dat`, 4, i]);
+      }
+      await callWorker(fsWorker, "syncfs", []);
+
+      // Modify only files 3, 5, 7 with different patterns
+      await callWorker(fsWorker, "writeMultiPage", ["/file3.dat", 4, 30]);
+      await callWorker(fsWorker, "writeMultiPage", ["/file5.dat", 4, 50]);
+      await callWorker(fsWorker, "writeMultiPage", ["/file7.dat", 4, 70]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Unmodified files keep original patterns
+      for (const i of [0, 1, 2, 4, 6, 8, 9]) {
+        const result = await callWorker(fsWorker, "verifyMultiPage", [`/file${i}.dat`, 4, i]);
+        expect(result).toEqual({ ok: true });
+      }
+      // Modified files have new patterns
+      expect(await callWorker(fsWorker, "verifyMultiPage", ["/file3.dat", 4, 30])).toEqual({ ok: true });
+      expect(await callWorker(fsWorker, "verifyMultiPage", ["/file5.dat", 4, 50])).toEqual({ ok: true });
+      expect(await callWorker(fsWorker, "verifyMultiPage", ["/file7.dat", 4, 70])).toEqual({ ok: true });
+    });
+
+    it("remount with smaller cache still serves all data", async () => {
+      // Write files with total pages >> small cache
+      for (let i = 0; i < 5; i++) {
+        await callWorker(fsWorker, "writeMultiPage", [`/data${i}.dat`, 8, i * 5]);
+      }
+      await callWorker(fsWorker, "syncfs", []);
+
+      // Remount with 4-page cache — extreme eviction pressure
+      await remount(4);
+
+      for (let i = 0; i < 5; i++) {
+        const result = await callWorker(fsWorker, "verifyMultiPage", [`/data${i}.dat`, 8, i * 5]);
+        expect(result).toEqual({ ok: true });
+      }
+    });
+
+    it("rename overwrite persists correctly across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/src.txt", "source content"]);
+      await callWorker(fsWorker, "writeFile", ["/dst.txt", "destination content"]);
+      await callWorker(fsWorker, "rename", ["/src.txt", "/dst.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // dst.txt should have source's content
+      expect(await callWorker(fsWorker, "readFile", ["/dst.txt"])).toBe("source content");
+      // src.txt should not exist
+      await expect(callWorker(fsWorker, "readFile", ["/src.txt"])).rejects.toThrow();
+    });
+
+    it("directory rename persists across remount", async () => {
+      await callWorker(fsWorker, "mkdir", ["/olddir"]);
+      await callWorker(fsWorker, "writeFile", ["/olddir/child.txt", "child data"]);
+      await callWorker(fsWorker, "rename", ["/olddir", "/newdir"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const entries = await callWorker(fsWorker, "readdir", ["/newdir"]);
+      expect(entries).toContain("child.txt");
+      expect(await callWorker(fsWorker, "readFile", ["/newdir/child.txt"])).toBe("child data");
+      await expect(callWorker(fsWorker, "readdir", ["/olddir"])).rejects.toThrow();
+    });
+
+    it("file size metadata survives remount", async () => {
+      // Write a file with a non-page-aligned size
+      const content = "x".repeat(PAGE_SIZE + 100);
+      await callWorker(fsWorker, "writeFile", ["/sized.txt", content]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const stat = await callWorker(fsWorker, "stat", ["/sized.txt"]);
+      expect(stat.size).toBe(PAGE_SIZE + 100);
+
+      const readBack = await callWorker(fsWorker, "readFile", ["/sized.txt"]);
+      expect(readBack).toBe(content);
+    });
+
+    it("multiple remount cycles preserve data integrity", async () => {
+      // Build up data across 3 remount cycles
+      await callWorker(fsWorker, "writeFile", ["/cycle1.txt", "first"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Verify cycle 1 data, add cycle 2 data
+      expect(await callWorker(fsWorker, "readFile", ["/cycle1.txt"])).toBe("first");
+      await callWorker(fsWorker, "writeFile", ["/cycle2.txt", "second"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Verify both, add cycle 3 data
+      expect(await callWorker(fsWorker, "readFile", ["/cycle1.txt"])).toBe("first");
+      expect(await callWorker(fsWorker, "readFile", ["/cycle2.txt"])).toBe("second");
+      await callWorker(fsWorker, "writeFile", ["/cycle3.txt", "third"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // All three must survive
+      expect(await callWorker(fsWorker, "readFile", ["/cycle1.txt"])).toBe("first");
+      expect(await callWorker(fsWorker, "readFile", ["/cycle2.txt"])).toBe("second");
+      expect(await callWorker(fsWorker, "readFile", ["/cycle3.txt"])).toBe("third");
+    });
+  });
 });
