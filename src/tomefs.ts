@@ -72,6 +72,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   const maxPages = options?.maxPages ?? 4096;
   const pageCache = new SyncPageCache(backend, maxPages);
 
+  // Mount prefix for normalizing storage paths. Set in mount() and used by
+  // computeStoragePath to strip the mount prefix from paths that traverse
+  // MEMFS parent nodes (detached nodes). Without this, detached nodes get
+  // storagePaths like "/data/base/1/1234" instead of "/base/1/1234",
+  // causing page data and metadata to be stored under different paths.
+  let mountPrefix = "";
+
   /**
    * Registry of all live tomefs file nodes.
    *
@@ -557,7 +564,17 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     markMetaDirty(parent);
   }
 
-  /** Compute a storage path for a node given its parent and name. */
+  /**
+   * Compute a mount-relative storage path for a node given its parent and name.
+   *
+   * For nodes in the tomefs mount tree, the parent chain terminates at the
+   * mount root (where parent === node), producing a mount-relative path like
+   * "/base/1/1234". For "detached" nodes whose parent chain goes through
+   * MEMFS, the walk reaches the MEMFS root, producing an absolute path like
+   * "/data/base/1/1234" (where "/data" is the mount point). We strip the
+   * mount prefix to normalize both cases to mount-relative paths, ensuring
+   * page cache keys and metadata paths are always consistent.
+   */
   function computeStoragePath(parent: any, name: string): string {
     const parts: string[] = [name];
     let n = parent;
@@ -565,7 +582,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       parts.unshift(n.name);
       n = n.parent;
     }
-    return "/" + parts.join("/");
+    const raw = "/" + parts.join("/");
+    if (mountPrefix && raw.startsWith(mountPrefix + "/")) {
+      return raw.substring(mountPrefix.length);
+    }
+    return raw;
   }
 
   /**
@@ -1092,6 +1113,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     backend,
 
     mount(_mount: any) {
+      mountPrefix = _mount.mountpoint || "";
       const root = TOMEFS.createNode(null, "/", 0o40000 | 0o777, 0);
       // Restore directory tree from backend if data exists
       restoreTree(root);
