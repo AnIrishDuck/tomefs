@@ -361,11 +361,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (new_name.length > NAME_MAX) {
       throw new FS.ErrnoError(ENAMETOOLONG);
     }
-    // Rename writes metadata directly to the backend (for both source
-    // and target paths). A crash between these writes could leave
-    // orphaned metadata, so flag that orphan cleanup is needed.
-    needsOrphanCleanup = true;
-
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
@@ -412,6 +407,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         if (new_node.openCount === 0) {
           allFileNodes.delete(new_node);
         }
+      }
+      // Remove target from dirty tracking. Without this, the incremental
+      // syncfs path would re-persist the target's metadata at its old
+      // storage path — re-creating metadata that was just deleted or
+      // overwritten, producing a ghost entry in the backend.
+      if (new_node._metaDirty) {
+        new_node._metaDirty = false;
+        dirtyMetaNodes.delete(new_node);
       }
       FS.hashRemoveNode(new_node);
     }
@@ -494,9 +497,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   }
 
   function unlink(parent: any, name: string) {
-    // Unlink modifies backend metadata directly (deletes or writes
-    // /__deleted_* markers). A crash could leave orphaned entries.
-    needsOrphanCleanup = true;
     const node = parent.contents[name];
     if (node && FS.isFile(node.mode)) {
       node.unlinked = true;
@@ -533,10 +533,24 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // preserve /__deleted_* paths for nodes with live fds.
       if (node.openCount === 0) {
         allFileNodes.delete(node);
+        // Remove from dirty tracking. The 'unlinked && openCount === 0'
+        // check in incremental syncfs already skips this node, but
+        // cleaning it up avoids scanning a dead node on every sync.
+        if (node._metaDirty) {
+          node._metaDirty = false;
+          dirtyMetaNodes.delete(node);
+        }
       }
     } else if (node && FS.isLink(node.mode)) {
       const sp = computeStoragePath(parent, name);
       backend.deleteMeta(sp);
+      // Remove from dirty tracking. Without this, the incremental syncfs
+      // path would re-persist the symlink's metadata — re-creating an
+      // entry that was just deleted from the backend.
+      if (node._metaDirty) {
+        node._metaDirty = false;
+        dirtyMetaNodes.delete(node);
+      }
     }
     delete parent.contents[name];
     parent.ctime = parent.mtime = Date.now();
@@ -548,11 +562,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     for (const _i in node.contents) {
       throw new FS.ErrnoError(55); // ENOTEMPTY
     }
-    // rmdir deletes directory metadata from backend directly.
-    needsOrphanCleanup = true;
     const sp = computeStoragePath(parent, name);
     backend.deleteMeta(sp);
     delete parent.contents[name];
+    // Remove from dirty tracking. Without this, the incremental syncfs
+    // path would re-persist the directory's metadata — re-creating an
+    // entry that was just deleted from the backend.
+    if (node._metaDirty) {
+      node._metaDirty = false;
+      dirtyMetaNodes.delete(node);
+    }
     parent.ctime = parent.mtime = Date.now();
     markMetaDirty(parent);
   }
