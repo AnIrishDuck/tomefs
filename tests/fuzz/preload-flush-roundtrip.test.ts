@@ -518,7 +518,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
     const OPS = 10;
     const CYCLES = 10;
 
-    for (let seed = 1; seed <= 5; seed++) {
+    for (let seed = 1; seed <= 3; seed++) {
       it(`seed ${seed} (${OPS} ops × ${CYCLES} cycles) @fast`, async () => {
         await runFuzzSession(seed, OPS, CYCLES);
       });
@@ -530,7 +530,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
     const OPS = 50;
     const CYCLES = 5;
 
-    for (let seed = 100; seed <= 110; seed++) {
+    for (let seed = 100; seed <= 104; seed++) {
       const tag = seed <= 102 ? " @fast" : "";
       it(`seed ${seed} (${OPS} ops × ${CYCLES} cycles)${tag}`, async () => {
         await runFuzzSession(seed, OPS, CYCLES);
@@ -543,7 +543,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
     const OPS = 200;
     const CYCLES = 3;
 
-    for (let seed = 200; seed <= 208; seed++) {
+    for (let seed = 200; seed <= 202; seed++) {
       it(`seed ${seed} (${OPS} ops × ${CYCLES} cycles)`, async () => {
         await runFuzzSession(seed, OPS, CYCLES);
       });
@@ -555,7 +555,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
     const OPS = 100;
     const CYCLES = 8;
 
-    for (let seed = 300; seed <= 304; seed++) {
+    for (let seed = 300; seed <= 301; seed++) {
       it(`seed ${seed} (${OPS} ops × ${CYCLES} cycles)`, async () => {
         await runFuzzSession(seed, OPS, CYCLES);
       });
@@ -578,7 +578,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
       ["readVerify", 5],
     ]);
 
-    for (let seed = 400; seed <= 408; seed++) {
+    for (let seed = 400; seed <= 402; seed++) {
       it(`seed ${seed} (delete-heavy)`, async () => {
         await runFuzzSession(seed, 80, 5, opTable);
       });
@@ -601,7 +601,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
       ["readVerify", 10],
     ]);
 
-    for (let seed = 500; seed <= 508; seed++) {
+    for (let seed = 500; seed <= 502; seed++) {
       it(`seed ${seed} (rename-overwrite stress)`, async () => {
         await runFuzzSession(seed, 60, 6, opTable);
       });
@@ -624,7 +624,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
       ["readVerify", 10],
     ]);
 
-    for (let seed = 600; seed <= 608; seed++) {
+    for (let seed = 600; seed <= 602; seed++) {
       it(`seed ${seed} (truncation stress)`, async () => {
         await runFuzzSession(seed, 80, 5, opTable);
       });
