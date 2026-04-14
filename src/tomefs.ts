@@ -341,16 +341,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   }
 
   function setattr(node: any, attr: any) {
-    for (const key of ["mode", "atime", "mtime", "ctime"] as const) {
-      if (attr[key] != null) {
-        node[key] = attr[key];
-        markMetaDirty(node);
-      }
-    }
-    if (attr.size !== undefined) {
-      resizeFileStorage(node, attr.size);
-      markMetaDirty(node);
-    }
+    if (attr.mode != null) node.mode = attr.mode;
+    if (attr.atime != null) node.atime = attr.atime;
+    if (attr.mtime != null) node.mtime = attr.mtime;
+    if (attr.ctime != null) node.ctime = attr.ctime;
+    if (attr.size !== undefined) resizeFileStorage(node, attr.size);
+    markMetaDirty(node);
   }
 
   function lookup(parent: any, name: string) {
