@@ -245,16 +245,11 @@ export class PreloadBackend implements SyncStorageBackend {
   renameFile(oldPath: string, newPath: string): void {
     this.assertInitialized();
     if (oldPath === newPath) return;
-    const oldIndices = this.filePageIndices.get(oldPath);
-    if (!oldIndices) {
-      // No pages to move — still track the deletion for flush
-      this.deletedFiles.add(oldPath);
-      this.truncations.delete(oldPath);
-      return;
-    }
 
     // Clear any pre-existing destination pages to prevent orphans when the
     // destination has more pages than the source (matches IDB/OPFS behavior).
+    // This must happen BEFORE the source-empty check: renaming an empty file
+    // over a file with data must still clear the destination's pages.
     const destKeys = this.filePageKeys.get(newPath);
     if (destKeys) {
       for (const key of destKeys) {
@@ -265,6 +260,14 @@ export class PreloadBackend implements SyncStorageBackend {
       this.filePageIndices.delete(newPath);
       this.deletedFiles.add(newPath);
       this.truncations.delete(newPath);
+    }
+
+    const oldIndices = this.filePageIndices.get(oldPath);
+    if (!oldIndices) {
+      // No pages to move — still track the deletion for flush
+      this.deletedFiles.add(oldPath);
+      this.truncations.delete(oldPath);
+      return;
     }
 
     const toAdd: Array<[number, string, Uint8Array]> = [];
