@@ -387,17 +387,21 @@ function generateOp(rng: Rng, model: FSModel): Op {
       const path = rng.pick(allFiles);
       const file = model.files.get(path)!;
       const currentSize = file.data.length;
-      // Extend by various amounts, sometimes beyond current size
-      const totalSizeChoices = [
-        currentSize + 1,
-        currentSize + 100,
-        currentSize + PAGE_SIZE,
-        currentSize + PAGE_SIZE * 2 + 37,
+      // Vary the offset — Postgres sometimes allocates from the current
+      // end (offset=currentSize) or from zero (full pre-allocation).
+      const offsetChoices = [0, 0, 0, currentSize, Math.max(0, currentSize - PAGE_SIZE)];
+      const offset = rng.pick(offsetChoices);
+      // Length relative to offset to extend by various amounts
+      const lengthChoices = [
+        1,
+        100,
+        PAGE_SIZE,
+        PAGE_SIZE * 2 + 37,
         // Sometimes allocate within existing range (no-op for size)
         Math.max(1, Math.floor(currentSize / 2)),
       ];
-      const totalSize = rng.pick(totalSizeChoices);
-      return { type: "allocate", path, offset: 0, length: totalSize };
+      const length = rng.pick(lengthChoices);
+      return { type: "allocate", path, offset, length };
     }
 
     case "utime": {
@@ -651,7 +655,12 @@ function updateModel(model: FSModel, op: Op): void {
     case "renameSymlink": {
       const symlink = model.symlinks.get(op.oldPath);
       if (!symlink) break;
-      // Destination could be an existing file, symlink, or empty dir
+      // If destination has an existing file, FDs pointing at it become orphaned
+      if (model.files.has(op.newPath)) {
+        for (const [fdId, fd] of [...model.openFds]) {
+          if (fd.path === op.newPath) model.openFds.delete(fdId);
+        }
+      }
       model.files.delete(op.newPath);
       model.symlinks.delete(op.newPath);
       model.symlinks.delete(op.oldPath);
