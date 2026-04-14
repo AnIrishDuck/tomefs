@@ -150,7 +150,12 @@ describe("syncfs safety", () => {
     FS.close(s);
     syncAndUnmount(FS, tomefs);
 
-    // Remount, modify one file and delete the other, then record during syncfs
+    // Simulate a crash: remove the clean-shutdown marker and leave stale
+    // metadata in the backend. On remount, the missing marker triggers
+    // needsOrphanCleanup = true and the first syncfs does a full tree walk.
+    backend.deleteMeta("/__tomefs_clean");
+
+    // Remount — restoreTree sees no clean marker, sets needsOrphanCleanup
     const { FS: FS2, tomefs: t2 } = await mountTome(backend);
     // Modify "keep" so its metadata is dirty and will be written during sync
     const s2 = FS2.open(`${MOUNT}/keep`, O.RDWR);
@@ -291,15 +296,19 @@ describe("syncfs safety", () => {
     const s = FS.open(`${MOUNT}/orphan`, O.RDWR | O.CREAT, 0o666);
     FS.write(s, encode("data that will be orphaned"), 0, 26);
     FS.close(s);
-    syncfs(FS, tomefs);
+    syncAndUnmount(FS, tomefs);
 
-    // Verify pages exist in backend
-    expect(backend.readPage("/orphan", 0)).not.toBeNull();
+    // Simulate crash: remove clean-shutdown marker. Orphan data for
+    // /orphan stays in backend (as if the prior session crashed before
+    // cleanup completed). Remove the file's metadata from the tree by
+    // re-injecting it after unmount so it appears as an orphan.
+    backend.deleteMeta("/__tomefs_clean");
 
-    // Simulate a crash scenario: unlink the file (cleans pages from cache +
-    // backend), then manually re-add stale metadata AND stale page data as
-    // if the crash interrupted the cleanup.
-    FS.unlink(`${MOUNT}/orphan`);
+    // Remount — restoreTree sees orphan data, missing clean marker
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+    FS2.unlink(`${MOUNT}/orphan`);
+
+    // Re-inject stale metadata + pages as if crash left them behind
     backend.writeMeta("/orphan", {
       size: 26,
       mode: 0o100666,
@@ -308,9 +317,10 @@ describe("syncfs safety", () => {
     });
     backend.writePage("/orphan", 0, new Uint8Array(8192));
 
-    // syncfs should clean up both metadata AND page data
+    // syncfs should clean up both metadata AND page data via full tree walk
+    // (needsOrphanCleanup is true from mount with missing clean marker)
     backend.startRecording();
-    syncfs(FS, tomefs);
+    syncfs(FS2, t2);
     backend.stopRecording();
 
     expect(backend.readMeta("/orphan")).toBeNull();
@@ -322,7 +332,7 @@ describe("syncfs safety", () => {
     );
     expect(fileDeletes.length).toBe(1);
 
-    FS.unmount(MOUNT);
+    FS2.unmount(MOUNT);
   });
 
   it("syncfs orphan cleanup deletes multi-page stale data", async () => {
@@ -334,15 +344,14 @@ describe("syncfs safety", () => {
     const s = FS.open(`${MOUNT}/big`, O.RDWR | O.CREAT, 0o666);
     FS.write(s, bigData, 0, bigData.length);
     FS.close(s);
-    syncfs(FS, tomefs);
+    syncAndUnmount(FS, tomefs);
 
-    // Verify all 3 pages exist
-    expect(backend.readPage("/big", 0)).not.toBeNull();
-    expect(backend.readPage("/big", 1)).not.toBeNull();
-    expect(backend.readPage("/big", 2)).not.toBeNull();
+    // Simulate crash: remove clean marker
+    backend.deleteMeta("/__tomefs_clean");
 
-    // Delete the file, then simulate crash by re-adding stale data
-    FS.unlink(`${MOUNT}/big`);
+    // Remount, delete the file, then re-inject stale data
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+    FS2.unlink(`${MOUNT}/big`);
     backend.writeMeta("/big", {
       size: bigData.length,
       mode: 0o100666,
@@ -353,7 +362,8 @@ describe("syncfs safety", () => {
       backend.writePage("/big", i, new Uint8Array(8192));
     }
 
-    syncfs(FS, tomefs);
+    // Full tree walk triggered by missing clean marker on mount
+    syncfs(FS2, t2);
 
     // All pages and metadata should be gone
     expect(backend.readMeta("/big")).toBeNull();
@@ -361,7 +371,7 @@ describe("syncfs safety", () => {
       expect(backend.readPage("/big", i)).toBeNull();
     }
 
-    FS.unmount(MOUNT);
+    FS2.unmount(MOUNT);
   });
 
   it("syncfs orphan cleanup does not affect current files", async () => {
@@ -374,10 +384,14 @@ describe("syncfs safety", () => {
     s = FS.open(`${MOUNT}/stale`, O.RDWR | O.CREAT, 0o666);
     FS.write(s, encode("dead data"), 0, 9);
     FS.close(s);
-    syncfs(FS, tomefs);
+    syncAndUnmount(FS, tomefs);
 
-    // Delete the stale file, simulate crash with leftover data
-    FS.unlink(`${MOUNT}/stale`);
+    // Simulate crash: remove clean marker
+    backend.deleteMeta("/__tomefs_clean");
+
+    // Remount, delete the stale file, re-inject stale data
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+    FS2.unlink(`${MOUNT}/stale`);
     backend.writeMeta("/stale", {
       size: 9,
       mode: 0o100666,
@@ -387,7 +401,7 @@ describe("syncfs safety", () => {
     backend.writePage("/stale", 0, new Uint8Array(8192));
 
     backend.startRecording();
-    syncfs(FS, tomefs);
+    syncfs(FS2, t2);
     backend.stopRecording();
 
     // Stale file cleaned up
@@ -405,13 +419,13 @@ describe("syncfs safety", () => {
     expect(currentDeletes.length).toBe(0);
 
     // Data integrity
-    s = FS.open(`${MOUNT}/current`, O.RDONLY);
+    s = FS2.open(`${MOUNT}/current`, O.RDONLY);
     const buf = new Uint8Array(20);
-    const n = FS.read(s, buf, 0, 20);
-    FS.close(s);
+    const n = FS2.read(s, buf, 0, 20);
+    FS2.close(s);
     expect(decode(buf, n)).toBe("live data");
 
-    FS.unmount(MOUNT);
+    FS2.unmount(MOUNT);
   });
 
   it("multiple sync cycles correctly track current paths", async () => {
@@ -651,7 +665,7 @@ describe("syncfs detached node handling", () => {
     FS.unmount(MOUNT);
   });
 
-  it("re-enables orphan cleanup after unlink @fast", async () => {
+  it("uses incremental path after unlink (no open fds) @fast", async () => {
     const { FS, tomefs } = await mountTome(backend);
 
     // Create and sync
@@ -660,15 +674,16 @@ describe("syncfs detached node handling", () => {
     FS.close(s);
     syncfs(FS, tomefs);
 
-    // Unlink triggers needsOrphanCleanup
+    // Unlink with no open fds cleans up backend directly — no orphan
+    // risk, so incremental path is used (no listFiles call).
     FS.unlink(`${MOUNT}/a`);
 
     backend.startRecording();
     syncfs(FS, tomefs);
     backend.stopRecording();
-    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(false);
 
-    // After cleanup, subsequent sync without mutations skips listFiles
+    // Subsequent sync without mutations also skips listFiles
     backend.startRecording();
     syncfs(FS, tomefs);
     backend.stopRecording();
@@ -677,7 +692,7 @@ describe("syncfs detached node handling", () => {
     FS.unmount(MOUNT);
   });
 
-  it("re-enables orphan cleanup after rename", async () => {
+  it("uses incremental path after rename", async () => {
     const { FS, tomefs } = await mountTome(backend);
 
     const s = FS.open(`${MOUNT}/old`, O.RDWR | O.CREAT, 0o666);
@@ -685,29 +700,31 @@ describe("syncfs detached node handling", () => {
     FS.close(s);
     syncfs(FS, tomefs);
 
-    // Rename triggers needsOrphanCleanup
+    // Rename completes its own backend cleanup — no orphan risk,
+    // so incremental path is used (no listFiles call).
     FS.rename(`${MOUNT}/old`, `${MOUNT}/new`);
 
     backend.startRecording();
     syncfs(FS, tomefs);
     backend.stopRecording();
-    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(false);
 
     FS.unmount(MOUNT);
   });
 
-  it("re-enables orphan cleanup after rmdir", async () => {
+  it("uses incremental path after rmdir", async () => {
     const { FS, tomefs } = await mountTome(backend);
 
     FS.mkdir(`${MOUNT}/dir`);
     syncfs(FS, tomefs);
 
+    // rmdir deletes metadata directly — no orphan risk.
     FS.rmdir(`${MOUNT}/dir`);
 
     backend.startRecording();
     syncfs(FS, tomefs);
     backend.stopRecording();
-    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(true);
+    expect(backend.operations.some((o) => o.op === "listFiles")).toBe(false);
 
     FS.unmount(MOUNT);
   });
