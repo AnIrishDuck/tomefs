@@ -274,6 +274,39 @@ describe("SAB+Atomics Bridge", () => {
     });
   });
 
+  describe("maxPageIndex", () => {
+    it("@fast returns -1 for non-existent file", async () => {
+      const result = await callClient(clientWorker, "maxPageIndex", ["/missing"]);
+      expect(result).toBe(-1);
+    });
+
+    it("@fast returns highest page index after writes", async () => {
+      await callClient(clientWorker, "writePage", ["/test", 0, new Uint8Array(PAGE_SIZE)]);
+      await callClient(clientWorker, "writePage", ["/test", 3, new Uint8Array(PAGE_SIZE)]);
+
+      const result = await callClient(clientWorker, "maxPageIndex", ["/test"]);
+      expect(result).toBe(3);
+    });
+
+    it("returns 0 for file with only page 0", async () => {
+      await callClient(clientWorker, "writePage", ["/test", 0, new Uint8Array(PAGE_SIZE)]);
+
+      const result = await callClient(clientWorker, "maxPageIndex", ["/test"]);
+      expect(result).toBe(0);
+    });
+
+    it("reflects deletePagesFrom", async () => {
+      await callClient(clientWorker, "writePage", ["/test", 0, new Uint8Array(PAGE_SIZE)]);
+      await callClient(clientWorker, "writePage", ["/test", 1, new Uint8Array(PAGE_SIZE)]);
+      await callClient(clientWorker, "writePage", ["/test", 5, new Uint8Array(PAGE_SIZE)]);
+
+      await callClient(clientWorker, "deletePagesFrom", ["/test", 2]);
+
+      const result = await callClient(clientWorker, "maxPageIndex", ["/test"]);
+      expect(result).toBe(1);
+    });
+  });
+
   describe("maxPageIndexBatch", () => {
     it("@fast returns empty array for empty input", async () => {
       const result = await callClient(clientWorker, "maxPageIndexBatch", [[]]);
@@ -433,6 +466,166 @@ describe("SAB+Atomics Bridge", () => {
 
       const files = (await callClient(clientWorker, "listFiles", [])) as string[];
       expect(files.length).toBe(50);
+    });
+  });
+
+  describe("syncAll", () => {
+    it("@fast writes pages and metadata atomically", async () => {
+      const page0 = new Uint8Array(PAGE_SIZE);
+      page0[0] = 0xde;
+      page0[PAGE_SIZE - 1] = 0xad;
+      const page1 = new Uint8Array(PAGE_SIZE);
+      page1[0] = 0xbe;
+      page1[PAGE_SIZE - 1] = 0xef;
+
+      await callClient(clientWorker, "syncAll", [
+        [
+          { path: "/file", pageIndex: 0, data: page0 },
+          { path: "/file", pageIndex: 1, data: page1 },
+        ],
+        [
+          { path: "/file", meta: { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 100, mtime: 200 } },
+        ],
+      ]);
+
+      // Verify pages
+      const r0 = await callClient(clientWorker, "readPage", ["/file", 0]);
+      const r1 = await callClient(clientWorker, "readPage", ["/file", 1]);
+      expect(toUint8Array(r0)[0]).toBe(0xde);
+      expect(toUint8Array(r0)[PAGE_SIZE - 1]).toBe(0xad);
+      expect(toUint8Array(r1)[0]).toBe(0xbe);
+      expect(toUint8Array(r1)[PAGE_SIZE - 1]).toBe(0xef);
+
+      // Verify metadata
+      const meta = await callClient(clientWorker, "readMeta", ["/file"]);
+      expect(meta).toEqual({ size: PAGE_SIZE * 2, mode: 0o100644, ctime: 100, mtime: 200 });
+    });
+
+    it("@fast empty call is a no-op", async () => {
+      // Pre-populate some data
+      const data = new Uint8Array(PAGE_SIZE);
+      data[0] = 0x42;
+      await callClient(clientWorker, "writePage", ["/existing", 0, data]);
+      await callClient(clientWorker, "writeMeta", ["/existing", { size: PAGE_SIZE, mode: 0o644, ctime: 1, mtime: 2 }]);
+
+      // Empty syncAll should not modify anything
+      await callClient(clientWorker, "syncAll", [[], []]);
+
+      const r = await callClient(clientWorker, "readPage", ["/existing", 0]);
+      expect(toUint8Array(r)[0]).toBe(0x42);
+      const m = await callClient(clientWorker, "readMeta", ["/existing"]);
+      expect(m).toEqual({ size: PAGE_SIZE, mode: 0o644, ctime: 1, mtime: 2 });
+    });
+
+    it("writes pages only (no metadata)", async () => {
+      const page = new Uint8Array(PAGE_SIZE);
+      page[0] = 0xaa;
+
+      await callClient(clientWorker, "syncAll", [
+        [{ path: "/file", pageIndex: 0, data: page }],
+        [],
+      ]);
+
+      const r = await callClient(clientWorker, "readPage", ["/file", 0]);
+      expect(toUint8Array(r)[0]).toBe(0xaa);
+
+      // No metadata was written
+      const m = await callClient(clientWorker, "readMeta", ["/file"]);
+      expect(m).toBeNull();
+    });
+
+    it("writes metadata only (no pages)", async () => {
+      await callClient(clientWorker, "syncAll", [
+        [],
+        [
+          { path: "/dir", meta: { size: 0, mode: 0o40755, ctime: 10, mtime: 20 } },
+          { path: "/link", meta: { size: 0, mode: 0o120777, ctime: 30, mtime: 40, link: "/target" } },
+        ],
+      ]);
+
+      const dir = await callClient(clientWorker, "readMeta", ["/dir"]);
+      expect(dir).toEqual({ size: 0, mode: 0o40755, ctime: 10, mtime: 20 });
+
+      const link = await callClient(clientWorker, "readMeta", ["/link"]);
+      expect(link).toEqual({ size: 0, mode: 0o120777, ctime: 30, mtime: 40, link: "/target" });
+    });
+
+    it("writes pages across multiple files with their metadata", async () => {
+      const pageA = new Uint8Array(PAGE_SIZE);
+      pageA[0] = 0x11;
+      const pageB0 = new Uint8Array(PAGE_SIZE);
+      pageB0[0] = 0x22;
+      const pageB1 = new Uint8Array(PAGE_SIZE);
+      pageB1[0] = 0x33;
+
+      await callClient(clientWorker, "syncAll", [
+        [
+          { path: "/a", pageIndex: 0, data: pageA },
+          { path: "/b", pageIndex: 0, data: pageB0 },
+          { path: "/b", pageIndex: 1, data: pageB1 },
+        ],
+        [
+          { path: "/a", meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 2 } },
+          { path: "/b", meta: { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 3, mtime: 4 } },
+        ],
+      ]);
+
+      // Verify all pages
+      expect(toUint8Array(await callClient(clientWorker, "readPage", ["/a", 0]))[0]).toBe(0x11);
+      expect(toUint8Array(await callClient(clientWorker, "readPage", ["/b", 0]))[0]).toBe(0x22);
+      expect(toUint8Array(await callClient(clientWorker, "readPage", ["/b", 1]))[0]).toBe(0x33);
+
+      // Verify all metadata
+      expect(await callClient(clientWorker, "readMeta", ["/a"])).toEqual(
+        { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 2 }
+      );
+      expect(await callClient(clientWorker, "readMeta", ["/b"])).toEqual(
+        { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 3, mtime: 4 }
+      );
+    });
+
+    it("syncAll overwrites existing pages and metadata", async () => {
+      // Write initial data
+      const oldPage = new Uint8Array(PAGE_SIZE);
+      oldPage[0] = 0x01;
+      await callClient(clientWorker, "writePage", ["/file", 0, oldPage]);
+      await callClient(clientWorker, "writeMeta", ["/file", { size: PAGE_SIZE, mode: 0o644, ctime: 1, mtime: 1 }]);
+
+      // Overwrite via syncAll
+      const newPage = new Uint8Array(PAGE_SIZE);
+      newPage[0] = 0x02;
+      await callClient(clientWorker, "syncAll", [
+        [{ path: "/file", pageIndex: 0, data: newPage }],
+        [{ path: "/file", meta: { size: PAGE_SIZE, mode: 0o755, ctime: 1, mtime: 99 } }],
+      ]);
+
+      const r = await callClient(clientWorker, "readPage", ["/file", 0]);
+      expect(toUint8Array(r)[0]).toBe(0x02);
+      const m = await callClient(clientWorker, "readMeta", ["/file"]) as { mtime: number; mode: number };
+      expect(m.mtime).toBe(99);
+      expect(m.mode).toBe(0o755);
+    });
+
+    it("page data integrity with full-size pages", async () => {
+      // Write a page with a known pattern to verify all 8192 bytes survive the SAB bridge
+      const page = new Uint8Array(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        page[i] = i & 0xff;
+      }
+
+      await callClient(clientWorker, "syncAll", [
+        [{ path: "/pattern", pageIndex: 0, data: page }],
+        [{ path: "/pattern", meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 } }],
+      ]);
+
+      const result = await callClient(clientWorker, "readPage", ["/pattern", 0]);
+      const buf = toUint8Array(result);
+      expect(buf.length).toBe(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        if (buf[i] !== (i & 0xff)) {
+          throw new Error(`Byte mismatch at offset ${i}: expected ${i & 0xff}, got ${buf[i]}`);
+        }
+      }
     });
   });
 
