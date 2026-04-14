@@ -154,7 +154,8 @@ type Op =
   | { type: "seekFd"; fdId: number; offset: number; whence: number }
   | { type: "closeFd"; fdId: number }
   | { type: "allocate"; path: string; offset: number; length: number }
-  | { type: "utime"; path: string; atime: number; mtime: number };
+  | { type: "utime"; path: string; atime: number; mtime: number }
+  | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array };
 
 const DIR_NAMES = ["alpha", "beta", "gamma"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"];
@@ -227,6 +228,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["closeFd", openFdIds.length > 0 ? 6 : 0],
     ["allocate", allFiles.length > 0 ? 8 : 0],
     ["utime", allFiles.length > 0 ? 6 : 0],
+    ["mmapWriteAt", allFiles.length > 0 ? 6 : 0],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -414,6 +416,22 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "utime", path, atime, mtime };
     }
 
+    case "mmapWriteAt": {
+      const path = rng.pick(allFiles);
+      const fileState = model.files.get(path)!;
+      const fileSize = fileState.data.length;
+      if (fileSize === 0) {
+        // Can't mmap an empty file; fall back to a createFile
+        return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(100) };
+      }
+      // Write within existing file bounds via mmap+msync
+      const maxLen = Math.min(fileSize, PAGE_SIZE * 2);
+      const length = Math.max(1, rng.int(maxLen + 1));
+      const position = rng.int(Math.max(1, fileSize - length + 1));
+      const data = rng.bytes(length);
+      return { type: "mmapWriteAt", path, position, data };
+    }
+
     default:
       return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(10) };
   }
@@ -545,6 +563,16 @@ function execOp(FS: EmscriptenFS, op: Op, streams: StreamMap): boolean {
 
       case "utime": {
         FS.utime(rw(op.path), op.atime, op.mtime);
+        return true;
+      }
+
+      case "mmapWriteAt": {
+        const s = FS.open(rw(op.path), O.RDWR);
+        const mmapResult = s.stream_ops.mmap(s, op.data.length, op.position, 0, 0);
+        const buf = mmapResult.ptr instanceof Uint8Array ? mmapResult.ptr : new Uint8Array(mmapResult.ptr);
+        buf.set(op.data);
+        s.stream_ops.msync(s, buf, op.position, op.data.length, 0);
+        FS.close(s);
         return true;
       }
 
@@ -786,6 +814,15 @@ function updateModel(model: FSModel, op: Op): void {
       file.mtime = op.mtime;
       break;
     }
+
+    case "mmapWriteAt": {
+      const file = model.files.get(op.path);
+      if (!file) break;
+      file.data.set(op.data, op.position);
+      // msync modifies file content but doesn't change size
+      file.mtime = null;
+      break;
+    }
   }
 }
 
@@ -831,6 +868,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
     case "utime":
       return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
+    case "mmapWriteAt":
+      return `[${index}] mmapWriteAt(${op.path}, @${op.position}, ${op.data.length}B)`;
   }
 }
 
@@ -1214,6 +1253,24 @@ describe("fuzz: persistence roundtrip testing", () => {
 
     it("seed 80004, large cache, utime + allocate baseline", async () => {
       await runPersistenceRoundtrip(80004, 80, 4096, 20);
+    }, 30_000);
+  });
+
+  describe("mmapWriteAt (msync) — mmap writes persisted across remounts", () => {
+    it("seed 90001, tiny cache, msync writes between remounts @fast", async () => {
+      await runPersistenceRoundtrip(90001, 80, 4, 15);
+    }, 30_000);
+
+    it("seed 90002, small cache, msync + rename + remount", async () => {
+      await runPersistenceRoundtrip(90002, 100, 16, 20);
+    }, 30_000);
+
+    it("seed 90003, tiny cache, msync interleaved with fd writes", async () => {
+      await runPersistenceRoundtrip(90003, 60, 4, 5);
+    }, 30_000);
+
+    it("seed 90004, large cache, msync + truncate + allocate", async () => {
+      await runPersistenceRoundtrip(90004, 80, 4096, 20);
     }, 30_000);
   });
 });
