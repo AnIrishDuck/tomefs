@@ -142,12 +142,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   /**
    * Read bytes from a node's file data via the page cache.
    *
-   * Includes a per-node page table optimization: each file node maintains
-   * a sparse array of CachedPage references indexed by page number. For
+   * Uses a per-node page table optimization: each file node maintains a
+   * sparse array of CachedPage references indexed by page number. For
    * pages already in the table, this provides O(1) direct access — no
    * string key construction, no Map lookup, no LRU reordering. The
    * CachedPage.evicted flag ensures stale references are lazily detected
    * and cleaned up.
+   *
+   * Both single-page and multi-page reads use the per-node page table,
+   * falling back to pageCache.getPage() on miss. This avoids delegating
+   * to pageCache.read() for multi-page ops, eliminating its miss-check
+   * loop overhead (pageKeyStr + Map.has per page, array allocations,
+   * batchEvict).
    */
   function readPages(
     node: any,
@@ -182,22 +188,49 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       return toRead;
     }
 
-    // Multi-page reads: delegate to page cache
-    return pageCache.read(
-      node.storagePath,
-      buffer,
-      offset,
-      toRead,
-      position,
-      size,
-    );
+    // Multi-page path: resolve pages inline using per-node page table,
+    // falling back to pageCache.getPage() on miss. This avoids the
+    // overhead of pageCache.read() (miss-check loop with pageKeyStr +
+    // Map.has per page, array allocations, batchEvict) while populating
+    // the page table for future accesses.
+    if (!node._pages) node._pages = [];
+    let bytesRead = 0;
+    let pos = position;
+
+    while (bytesRead < toRead) {
+      const pi = (pos / PAGE_SIZE) | 0;
+      const po = pos - pi * PAGE_SIZE;
+      const bytesInPage = Math.min(PAGE_SIZE - po, toRead - bytesRead);
+
+      let page = node._pages[pi];
+      if (page && page.evicted) {
+        node._pages[pi] = undefined;
+        page = undefined;
+      }
+      if (!page) {
+        page = pageCache.getPage(node.storagePath, pi);
+        node._pages[pi] = page;
+      }
+
+      buffer.set(
+        page.data.subarray(po, po + bytesInPage),
+        offset + bytesRead,
+      );
+      bytesRead += bytesInPage;
+      pos += bytesInPage;
+    }
+
+    return bytesRead;
   }
 
   /**
    * Write bytes to a node's file data via the page cache.
    *
-   * Single-page writes use a per-node page table for O(1) page lookup,
-   * while maintaining dirty tracking through the cache's dirtyKeys index.
+   * Both single-page and multi-page writes use a per-node page table for
+   * O(1) page lookup, falling back to pageCache.getPage()/getPageNoRead()
+   * on miss. Dirty tracking is maintained through the cache's dirtyKeys
+   * index via addDirtyKey(). This avoids delegating to pageCache.write()
+   * for multi-page ops, eliminating its miss-check loop overhead.
    */
   function writePages(
     node: any,
@@ -246,18 +279,56 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       return length;
     }
 
-    // Multi-page writes: delegate to page cache
-    const result = pageCache.write(
-      node.storagePath,
-      buffer,
-      offset,
-      length,
-      position,
-      node.usedBytes,
-    );
+    // Multi-page path: resolve pages inline using per-node page table,
+    // falling back to pageCache.getPage()/getPageNoRead() on miss. This
+    // avoids the overhead of pageCache.write() (miss-check loop with
+    // pageKeyStr + Map.has per page, array allocations, batchEvict) while
+    // populating the page table for future accesses.
+    const firstNewPage = node.usedBytes > 0
+      ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
+    if (!node._pages) node._pages = [];
 
-    node.usedBytes = result.newFileSize;
-    return result.bytesWritten;
+    let bytesWritten = 0;
+    let pos = position;
+
+    while (bytesWritten < length) {
+      const pi = (pos / PAGE_SIZE) | 0;
+      const po = pos - pi * PAGE_SIZE;
+      const bytesInPage = Math.min(PAGE_SIZE - po, length - bytesWritten);
+
+      let page = node._pages[pi];
+      if (page && page.evicted) {
+        node._pages[pi] = undefined;
+        page = undefined;
+      }
+      if (!page) {
+        // Skip backend read for pages beyond file extent or fully overwritten
+        const needsRead = pi < firstNewPage
+          && !(po === 0 && bytesInPage >= PAGE_SIZE);
+        page = needsRead
+          ? pageCache.getPage(node.storagePath, pi)
+          : pageCache.getPageNoRead(node.storagePath, pi);
+        node._pages[pi] = page;
+      }
+
+      page.data.set(
+        buffer.subarray(
+          offset + bytesWritten,
+          offset + bytesWritten + bytesInPage,
+        ),
+        po,
+      );
+      if (!page.dirty) {
+        page.dirty = true;
+        pageCache.addDirtyKey(page.key, node.storagePath);
+      }
+
+      bytesWritten += bytesInPage;
+      pos += bytesInPage;
+    }
+
+    node.usedBytes = Math.max(node.usedBytes, position + length);
+    return bytesWritten;
   }
 
   /** Resize a file's storage (truncate or extend). */
