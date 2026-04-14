@@ -145,6 +145,7 @@ type Op =
   | { type: "rmdir"; path: string }
   | { type: "symlink"; target: string; path: string }
   | { type: "unlinkSymlink"; path: string }
+  | { type: "renameSymlink"; oldPath: string; newPath: string }
   | { type: "renameDir"; oldPath: string; newPath: string }
   | { type: "appendWrite"; path: string; data: Uint8Array }
   | { type: "chmod"; path: string; mode: number }
@@ -217,16 +218,14 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["chmod", allFiles.length > 0 ? 5 : 0],
     ["symlink", allFiles.length > 0 ? 8 : 0],
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
+    ["renameSymlink", allSymlinks.length > 0 ? 5 : 0],
     ["rmdir", allDirs.filter((d) => isDirEmpty(model, d)).length > 0 ? 5 : 0],
     ["renameDir", allDirs.length > 0 ? 5 : 0],
     ["openFd", unopenedFiles.length > 0 && model.openFds.size < 4 ? 10 : 0],
     ["writeFd", openFdIds.length > 0 ? 12 : 0],
     ["seekFd", openFdIds.length > 0 ? 6 : 0],
     ["closeFd", openFdIds.length > 0 ? 6 : 0],
-    // allocate is disabled until the markMetaDirty fix lands (PR #178).
-    // Without that fix, allocate extends the file but doesn't mark metadata
-    // dirty, so incremental syncfs skips persisting the new size.
-    ["allocate", 0],
+    ["allocate", allFiles.length > 0 ? 8 : 0],
     ["utime", allFiles.length > 0 ? 6 : 0],
   ];
 
@@ -323,6 +322,14 @@ function generateOp(rng: Rng, model: FSModel): Op {
 
     case "unlinkSymlink":
       return { type: "unlinkSymlink", path: rng.pick(allSymlinks) };
+
+    case "renameSymlink": {
+      const oldPath = rng.pick(allSymlinks);
+      const dir = rng.pick(allContainerDirs);
+      const name = rng.pick(LINK_NAMES);
+      const newPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+      return { type: "renameSymlink", oldPath, newPath };
+    }
 
     case "rmdir": {
       const emptyDirs = allDirs.filter((d) => isDirEmpty(model, d));
@@ -458,7 +465,8 @@ function execOp(FS: EmscriptenFS, op: Op, streams: StreamMap): boolean {
       }
 
       case "renameFile":
-      case "renameDir": {
+      case "renameDir":
+      case "renameSymlink": {
         FS.rename(rw(op.oldPath), rw(op.newPath));
         return true;
       }
@@ -640,6 +648,17 @@ function updateModel(model: FSModel, op: Op): void {
       model.symlinks.delete(op.path);
       break;
 
+    case "renameSymlink": {
+      const symlink = model.symlinks.get(op.oldPath);
+      if (!symlink) break;
+      // Destination could be an existing file, symlink, or empty dir
+      model.files.delete(op.newPath);
+      model.symlinks.delete(op.newPath);
+      model.symlinks.delete(op.oldPath);
+      model.symlinks.set(op.newPath, symlink);
+      break;
+    }
+
     case "renameDir": {
       const oldPrefix = op.oldPath + "/";
       // Move files under old dir
@@ -783,6 +802,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] symlink(${op.target} -> ${op.path})`;
     case "unlinkSymlink":
       return `[${index}] unlinkSymlink(${op.path})`;
+    case "renameSymlink":
+      return `[${index}] renameSymlink(${op.oldPath} -> ${op.newPath})`;
     case "renameDir":
       return `[${index}] renameDir(${op.oldPath} -> ${op.newPath})`;
     case "appendWrite":
