@@ -100,7 +100,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   // Set on mount (crash recovery may have left orphans) and cleared after
   // a successful orphan cleanup pass in syncfs. Operations that directly
   // modify backend metadata (rename, unlink-with-open-fds) re-set this
-  // flag since a crash between their backend writes could leave orphans.
+  // flag via invalidateCleanMarker() since a crash between their backend
+  // writes could leave orphans.
   //
   // On mount, this is set to true by default. If the backend has a clean-
   // shutdown marker (written at the end of a successful syncfs), we know
@@ -114,6 +115,34 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    *  Set when the marker is consumed during mount (restoreTree) and
    *  cleared after a successful syncfs writes it back. */
   let needsCleanMarker = false;
+
+  /**
+   * Invalidate the clean-shutdown marker before a multi-step backend
+   * operation (rename, unlink-with-open-fds). These operations perform
+   * multiple non-atomic backend writes — if the process crashes between
+   * them, stale metadata may remain. Without invalidation, the clean
+   * marker from the previous syncfs would tell the next mount that the
+   * backend is consistent when it isn't.
+   *
+   * Only deletes the marker from the backend — does NOT set
+   * needsOrphanCleanup. If the operation completes successfully, no
+   * orphan cleanup is needed for the current session (the operation
+   * handles its own cleanup). The marker deletion only matters if a
+   * crash occurs mid-operation: the next mount won't find a marker
+   * and will force orphan cleanup.
+   *
+   * The next syncfs re-writes the marker as part of its metadata batch,
+   * restoring the clean state. Cost: 1 deleteMeta call per rename/unlink
+   * cycle (amortized — subsequent calls before the next syncfs are no-ops
+   * because needsCleanMarker is already true).
+   */
+  function invalidateCleanMarker(): void {
+    if (!needsCleanMarker) {
+      // Marker is in the backend — delete it for crash safety.
+      backend.deleteMeta(CLEAN_MARKER_PATH);
+      needsCleanMarker = true;
+    }
+  }
 
   /**
    * Set of nodes with dirty metadata (not yet persisted to the backend).
@@ -459,6 +488,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // Target doesn't exist — that's fine
     }
 
+    // Invalidate the clean-shutdown marker before performing multi-step
+    // backend operations. All rename code paths (file, directory, symlink)
+    // involve at least two backend writes — if the process crashes between
+    // them, stale metadata at the old path could persist. Invalidating the
+    // marker ensures orphan cleanup runs on the next mount.
+    invalidateCleanMarker();
+
     if (new_node) {
       if (FS.isDir(old_node.mode)) {
         for (const _i in new_node.contents) {
@@ -599,6 +635,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // original storagePath is free for reuse by new files or renames.
         // Without this, a new file at the same path would share page cache
         // entries with the unlinked node, causing data corruption.
+        invalidateCleanMarker();
         const originalPath = node.storagePath;
         const tempPath = `/__deleted_${nextPathId++}`;
         // Write marker metadata BEFORE renaming pages. This ensures that
