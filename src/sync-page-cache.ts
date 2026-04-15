@@ -519,6 +519,7 @@ export class SyncPageCache {
   commitDirtyPages(
     pages: Array<{ path: string; pageIndex: number }>,
   ): void {
+    let committed = 0;
     for (const { path, pageIndex } of pages) {
       const key = pageKeyStr(path, pageIndex);
       const page = this.cache.get(key);
@@ -530,9 +531,10 @@ export class SyncPageCache {
           fileSet.delete(key);
           if (fileSet.size === 0) this.dirtyFileKeys.delete(path);
         }
+        committed++;
       }
     }
-    this._flushes += pages.length;
+    this._flushes += committed;
   }
 
   /**
