@@ -750,6 +750,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const metaWrites: Array<{ path: string; meta: FileMeta }> = [];
     const metaDeletes: string[] = [];
     const pageRenames: Array<{ child: any; oldPath: string; newPath: string }> = [];
+    const visitedNodes: any[] = [];
 
     function collect(node: any, oldBase: string, newBase: string): void {
       for (const childName of Object.keys(node.contents)) {
@@ -772,6 +773,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             },
           });
           metaDeletes.push(oldPath);
+          visitedNodes.push(child);
         } else if (FS.isLink(child.mode)) {
           const oldPath = oldBase + "/" + childName;
           const newPath = newBase + "/" + childName;
@@ -787,6 +789,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             },
           });
           metaDeletes.push(oldPath);
+          visitedNodes.push(child);
         } else if (FS.isDir(child.mode)) {
           const oldChildPath = oldBase + "/" + childName;
           const newChildPath = newBase + "/" + childName;
@@ -801,6 +804,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             },
           });
           metaDeletes.push(oldChildPath);
+          visitedNodes.push(child);
           collect(child, oldChildPath, newChildPath);
         }
       }
@@ -827,6 +831,20 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Delete old metadata last.
     if (metaDeletes.length > 0) {
       backend.deleteMetas(metaDeletes);
+    }
+
+    // Clear dirty flags on all descendants whose metadata was just written
+    // to the backend. Without this, the incremental syncfs path re-persists
+    // their metadata redundantly — up to O(descendants) wasted backend
+    // writes for directory renames in PGlite workloads with many files.
+    // Safe because: (1) metadata was just written from node state, so the
+    // backend is up-to-date; (2) any subsequent write to these nodes will
+    // re-set _metaDirty via markMetaDirty.
+    for (const node of visitedNodes) {
+      if (node._metaDirty) {
+        node._metaDirty = false;
+        dirtyMetaNodes.delete(node);
+      }
     }
   }
 
