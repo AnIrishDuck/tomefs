@@ -900,6 +900,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
+          // Clean up dirty tracking. If the file was written to via fd after
+          // unlinking (valid POSIX pattern for temp files), markMetaDirty
+          // re-added it to dirtyMetaNodes. Without cleanup, the dead node
+          // lingers in the set — never persisted (incremental syncfs skips
+          // unlinked+closed nodes) but iterated on every sync, leaking
+          // memory and wasting cycles in long-running sessions.
+          if (node._metaDirty) {
+            node._metaDirty = false;
+            dirtyMetaNodes.delete(node);
+          }
         }
         // Dirty pages remain in the cache and are flushed by syncfs or
         // eviction. POSIX close() does not guarantee persistence — that
@@ -913,6 +923,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const oldSize = node.usedBytes;
       resizeFileStorage(node, Math.max(oldSize, offset + length));
       if (node.usedBytes !== oldSize) {
+        node.mtime = node.ctime = Date.now();
         markMetaDirty(node);
       }
     },
