@@ -116,13 +116,13 @@ export class PageCache {
     const existing = this.cache.get(key);
     if (existing) {
       this._hits++;
-      // Only reorder for LRU when cache is at capacity (eviction could happen).
-      // Below capacity, nothing will be evicted, so strict LRU order is unnecessary.
-      // This eliminates the expensive Map delete+set on every cache hit.
-      if (this.cache.size >= this.maxPages) {
-        this.cache.delete(key);
-        this.cache.set(key, existing);
-      }
+      // Reorder for LRU on every cache hit. Pages accessed below capacity
+      // must still be reordered — otherwise they retain their insertion-time
+      // position, and when the cache later fills, they're evicted first
+      // despite being recently accessed. The MRU fast path above already
+      // skips this for repeated accesses to the exact same page.
+      this.cache.delete(key);
+      this.cache.set(key, existing);
       this.mruPage = existing;
       return existing;
     }

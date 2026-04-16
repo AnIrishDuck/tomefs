@@ -73,35 +73,26 @@ async function createTomeFSHarness(maxPages: number): Promise<BenchHarness> {
   rawFS.mkdir(TOME_MOUNT);
   rawFS.mount(tomefs, {}, TOME_MOUNT);
 
-  const methodCache = new Map<string, Function>();
-  const pathMethods = new Set([
-    "open", "stat", "lstat", "truncate", "mkdir", "rmdir",
-    "readdir", "unlink", "writeFile", "readFile", "mknod",
-    "chmod", "utime", "syncfs",
-  ]);
-
-  const wrappedFS = new Proxy(rawFS, {
-    get(target: any, prop: string) {
-      const cached = methodCache.get(prop);
-      if (cached) return cached;
-
-      const val = target[prop];
-      if (typeof val !== "function") return val;
-
-      let wrapped: Function;
-      if (pathMethods.has(prop)) {
-        wrapped = (path: string, ...args: any[]) =>
-          val.call(target, rewritePath(path), ...args);
-      } else if (prop === "rename") {
-        wrapped = (oldPath: string, newPath: string) =>
-          val.call(target, rewritePath(oldPath), rewritePath(newPath));
-      } else {
-        wrapped = val.bind(target);
-      }
-      methodCache.set(prop, wrapped);
-      return wrapped;
-    },
-  }) as unknown as EmscriptenFS;
+  // Build a plain wrapper object instead of a Proxy. V8 can inline-cache
+  // property access on plain objects but not on Proxies, eliminating the
+  // ~200-500ns per-access get-trap overhead that unfairly penalizes tomefs
+  // in benchmarks. This more accurately reflects real-world performance
+  // where Emscripten calls node_ops directly without any interception.
+  const rp = rewritePath;
+  const fs = rawFS as any;
+  const wrappedFS = Object.create(rawFS);
+  wrappedFS.open = (path: string, ...args: any[]) => fs.open(rp(path), ...args);
+  wrappedFS.stat = (path: string, ...args: any[]) => fs.stat(rp(path), ...args);
+  wrappedFS.lstat = (path: string, ...args: any[]) => fs.lstat(rp(path), ...args);
+  wrappedFS.truncate = (path: string, ...args: any[]) => fs.truncate(rp(path), ...args);
+  wrappedFS.mkdir = (path: string, ...args: any[]) => fs.mkdir(rp(path), ...args);
+  wrappedFS.rmdir = (path: string) => fs.rmdir(rp(path));
+  wrappedFS.readdir = (path: string) => fs.readdir(rp(path));
+  wrappedFS.unlink = (path: string) => fs.unlink(rp(path));
+  wrappedFS.chmod = (path: string, ...args: any[]) => fs.chmod(rp(path), ...args);
+  wrappedFS.utime = (path: string, ...args: any[]) => fs.utime(rp(path), ...args);
+  wrappedFS.rename = (oldPath: string, newPath: string) => fs.rename(rp(oldPath), rp(newPath));
+  wrappedFS.syncfs = (populate: boolean, cb: Function) => fs.syncfs(populate, cb);
 
   return { FS: wrappedFS, rawFS, label: `tomefs-${maxPages}` };
 }

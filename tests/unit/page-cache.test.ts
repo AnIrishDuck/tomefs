@@ -112,6 +112,30 @@ describe("PageCache", () => {
       expect(small.has("/a", 2)).toBe(true);
     });
 
+    it("accesses below capacity preserve LRU order for later eviction @fast", async () => {
+      const cache = new PageCache(backend, 4);
+
+      // Fill cache to 3/4 capacity (below maxPages)
+      await cache.getPage("/a", 0);
+      await cache.getPage("/a", 1);
+      await cache.getPage("/a", 2);
+
+      // Re-access page 0 while below capacity — must update LRU position
+      await cache.getPage("/a", 0);
+
+      // Fill to capacity
+      await cache.getPage("/a", 3);
+      expect(cache.size).toBe(4);
+
+      // Trigger eviction — page 1 should be evicted (true LRU), not page 0
+      await cache.getPage("/a", 4);
+      expect(cache.has("/a", 0)).toBe(true); // accessed after page 1
+      expect(cache.has("/a", 1)).toBe(false); // oldest access = LRU victim
+      expect(cache.has("/a", 2)).toBe(true);
+      expect(cache.has("/a", 3)).toBe(true);
+      expect(cache.has("/a", 4)).toBe(true);
+    });
+
     it("flushes dirty page before eviction", async () => {
       const small = new PageCache(backend, 1);
 

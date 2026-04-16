@@ -101,6 +101,30 @@ describe("SyncPageCache", () => {
       expect(cache.has("/file", 2)).toBe(true);
     });
 
+    it("accesses below capacity preserve LRU order for later eviction @fast", () => {
+      const cache = new SyncPageCache(backend, 4);
+
+      // Fill cache to 3/4 capacity (below maxPages)
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 1);
+      cache.getPage("/file", 2);
+
+      // Re-access page 0 while below capacity — must update LRU position
+      cache.getPage("/file", 0);
+
+      // Fill to capacity
+      cache.getPage("/file", 3);
+      expect(cache.size).toBe(4);
+
+      // Trigger eviction — page 1 should be evicted (true LRU), not page 0
+      cache.getPage("/file", 4);
+      expect(cache.has("/file", 0)).toBe(true); // accessed after page 1
+      expect(cache.has("/file", 1)).toBe(false); // oldest access = LRU victim
+      expect(cache.has("/file", 2)).toBe(true);
+      expect(cache.has("/file", 3)).toBe(true);
+      expect(cache.has("/file", 4)).toBe(true);
+    });
+
     it("dirty pages are flushed to backend before eviction", () => {
       const cache = new SyncPageCache(backend, 1);
       const data = new Uint8Array([42]);
