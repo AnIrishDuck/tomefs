@@ -9,12 +9,12 @@ tomefs is a bounded, page-cached Emscripten filesystem for PGlite. It replaces I
 ```bash
 npm install
 npm run build          # TypeScript compilation (tsconfig.build.json)
-npm test               # Full test suite (755+ tests, ~90s)
+npm test               # Full test suite (2300+ tests)
 npm run test:fast      # Smoke tests tagged @fast (~15s)
 npm run bench          # Performance benchmarks
 ```
 
-CI runs three stages: build/type-check, smoke tests, full suite (see `.github/workflows/ci.yml`).
+CI runs four stages: build/type-check, smoke tests, full suite, and small-cache stress tests (see `.github/workflows/ci.yml`).
 
 The `TOMEFS_BACKEND=tomefs` env var switches conformance tests to run against tomefs instead of MEMFS.
 

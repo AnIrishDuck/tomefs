@@ -182,8 +182,38 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       return toRead;
     }
 
-    // Multi-page reads: delegate to page cache
-    return pageCache.read(
+    // Multi-page fast path: check per-node page table for all pages.
+    // If every page is cached and not evicted, copy directly without
+    // key construction, Map lookups, or LRU reordering overhead.
+    const lastPage = ((position + toRead - 1) / PAGE_SIZE) | 0;
+    const pages = node._pages;
+    if (pages) {
+      let allCached = true;
+      for (let p = firstPage; p <= lastPage; p++) {
+        const pg = pages[p];
+        if (!pg || pg.evicted) {
+          allCached = false;
+          break;
+        }
+      }
+      if (allCached) {
+        let bytesRead = 0;
+        let pos = position;
+        while (bytesRead < toRead) {
+          const pi = (pos / PAGE_SIZE) | 0;
+          const po = pos - pi * PAGE_SIZE;
+          const n = Math.min(PAGE_SIZE - po, toRead - bytesRead);
+          buffer.set(pages[pi].data.subarray(po, po + n), offset + bytesRead);
+          bytesRead += n;
+          pos += n;
+        }
+        return bytesRead;
+      }
+    }
+
+    // Multi-page cold path: delegate to page cache (handles batch loading
+    // of missing pages via backend.readPages in a single SAB round-trip)
+    const bytesRead = pageCache.read(
       node.storagePath,
       buffer,
       offset,
@@ -191,6 +221,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       position,
       size,
     );
+
+    // Populate per-node page table from pages now in cache, so subsequent
+    // reads at the same positions use the fast path above.
+    if (!node._pages) node._pages = [];
+    for (let p = firstPage; p <= lastPage; p++) {
+      if (!node._pages[p]) {
+        node._pages[p] = pageCache.getPage(node.storagePath, p);
+      }
+    }
+    return bytesRead;
   }
 
   /**
@@ -246,7 +286,46 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       return length;
     }
 
-    // Multi-page writes: delegate to page cache
+    // Multi-page warm path: check per-node page table for all pages.
+    // If every page is cached and not evicted, write directly without
+    // key construction, Map lookups, or LRU reordering overhead.
+    const lastPage = ((position + length - 1) / PAGE_SIZE) | 0;
+    const pages = node._pages;
+    if (pages) {
+      let allCached = true;
+      for (let p = firstPage; p <= lastPage; p++) {
+        const pg = pages[p];
+        if (!pg || pg.evicted) {
+          allCached = false;
+          break;
+        }
+      }
+      if (allCached) {
+        let bytesWritten = 0;
+        let pos = position;
+        while (bytesWritten < length) {
+          const pi = (pos / PAGE_SIZE) | 0;
+          const po = pos - pi * PAGE_SIZE;
+          const n = Math.min(PAGE_SIZE - po, length - bytesWritten);
+          const page = pages[pi];
+          page.data.set(
+            buffer.subarray(offset + bytesWritten, offset + bytesWritten + n),
+            po,
+          );
+          if (!page.dirty) {
+            page.dirty = true;
+            pageCache.addDirtyKey(page.key, node.storagePath);
+          }
+          bytesWritten += n;
+          pos += n;
+        }
+        node.usedBytes = Math.max(node.usedBytes, position + length);
+        return length;
+      }
+    }
+
+    // Multi-page cold path: delegate to page cache (handles batch loading,
+    // skip-read for new/overwritten pages, and eviction)
     const result = pageCache.write(
       node.storagePath,
       buffer,
@@ -255,6 +334,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       position,
       node.usedBytes,
     );
+
+    // Populate per-node page table from pages now in cache, so subsequent
+    // writes at the same positions use the fast path above.
+    if (!node._pages) node._pages = [];
+    for (let p = firstPage; p <= lastPage; p++) {
+      if (!node._pages[p]) {
+        node._pages[p] = pageCache.getPage(node.storagePath, p);
+      }
+    }
 
     node.usedBytes = result.newFileSize;
     return result.bytesWritten;

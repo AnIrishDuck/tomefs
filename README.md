@@ -55,7 +55,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 
 ## Status
 
-**Core complete.** The filesystem, page cache, IDB backend, SAB bridge, and full-stack integration are tested and working. See [plans/](plans/) for architecture and design rationale.
+**Core complete.** The filesystem, page cache, IDB backend, SAB bridge, and full-stack integration are tested and working (2300+ tests). See [plans/](plans/) for architecture and design rationale.
 
 ### Roadmap
 

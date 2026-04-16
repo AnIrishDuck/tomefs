@@ -272,6 +272,76 @@ describe("Cross-Page Boundary Writes (200 writes)", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Cross-Page Boundary Reads (matching write benchmark above)
+// ---------------------------------------------------------------------------
+
+const CROSS_PAGE_READS = 200;
+const CROSS_READ_BUF = new Uint8Array(CROSS_SIZE);
+
+describe("Cross-Page Boundary Reads (200 reads)", async () => {
+  const memfs = await createMemFSHarness();
+  const tome4096 = await createTomeFSHarness(4096);
+
+  // Pre-populate with cross-page data
+  for (const h of [memfs, tome4096]) {
+    const s = h.FS.open("/bench_cross_r", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    for (let i = 0; i < CROSS_PAGE_READS; i++) {
+      const pos = i * PAGE_SIZE + (PAGE_SIZE - 128);
+      h.FS.llseek(s, pos, SEEK_SET);
+      h.FS.write(s, CROSS_DATA, 0, CROSS_SIZE);
+    }
+    h.FS.close(s);
+  }
+
+  function crossPageReads(h: BenchHarness) {
+    const stream = h.FS.open("/bench_cross_r", O.RDONLY);
+    for (let i = 0; i < CROSS_PAGE_READS; i++) {
+      const pos = i * PAGE_SIZE + (PAGE_SIZE - 128);
+      h.FS.llseek(stream, pos, SEEK_SET);
+      h.FS.read(stream, CROSS_READ_BUF, 0, CROSS_SIZE);
+    }
+    h.FS.close(stream);
+  }
+
+  bench("MEMFS", () => crossPageReads(memfs));
+  bench("tomefs (4096 pages)", () => crossPageReads(tome4096));
+});
+
+// ---------------------------------------------------------------------------
+// Bulk Multi-Page Reads (4 pages per FS.read call)
+// ---------------------------------------------------------------------------
+
+const BULK_PAGES = 4;
+const BULK_SIZE = BULK_PAGES * PAGE_SIZE;
+const BULK_READ_BUF = new Uint8Array(BULK_SIZE);
+const BULK_READS = 16; // 16 x 4-page reads = 64 pages total
+
+describe("Bulk Multi-Page Reads (16 x 4-page reads = 512 KB)", async () => {
+  const memfs = await createMemFSHarness();
+  const tome4096 = await createTomeFSHarness(4096);
+
+  // Pre-populate with 64 pages
+  for (const h of [memfs, tome4096]) {
+    const s = h.FS.open("/bench_bulk_r", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    for (let i = 0; i < SEQ_PAGES; i++) {
+      h.FS.write(s, PAGE_DATA, 0, PAGE_SIZE);
+    }
+    h.FS.close(s);
+  }
+
+  function bulkReads(h: BenchHarness) {
+    const stream = h.FS.open("/bench_bulk_r", O.RDONLY);
+    for (let i = 0; i < BULK_READS; i++) {
+      h.FS.read(stream, BULK_READ_BUF, 0, BULK_SIZE);
+    }
+    h.FS.close(stream);
+  }
+
+  bench("MEMFS", () => bulkReads(memfs));
+  bench("tomefs (4096 pages)", () => bulkReads(tome4096));
+});
+
+// ---------------------------------------------------------------------------
 // Mixed Read/Write on Multiple Files
 // ---------------------------------------------------------------------------
 
