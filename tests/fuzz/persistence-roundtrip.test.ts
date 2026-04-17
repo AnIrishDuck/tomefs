@@ -154,6 +154,7 @@ type Op =
   | { type: "seekFd"; fdId: number; offset: number; whence: number }
   | { type: "closeFd"; fdId: number }
   | { type: "dupFd"; srcFdId: number; newFdId: number }
+  | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "allocate"; path: string; offset: number; length: number }
   | { type: "utime"; path: string; atime: number; mtime: number }
   | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array };
@@ -228,6 +229,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["seekFd", openFdIds.length > 0 ? 6 : 0],
     ["closeFd", openFdIds.length > 0 ? 6 : 0],
     ["dupFd", openFdIds.length > 0 && model.openFds.size < 6 ? 6 : 0],
+    ["ftruncateFd", openFdIds.length > 0 ? 5 : 0],
     ["allocate", allFiles.length > 0 ? 8 : 0],
     ["utime", allFiles.length > 0 ? 6 : 0],
     ["mmapWriteAt", allFiles.length > 0 ? 6 : 0],
@@ -391,6 +393,22 @@ function generateOp(rng: Rng, model: FSModel): Op {
       const srcFdId = rng.pick(openFdIds);
       const newFdId = model.nextFdId;
       return { type: "dupFd", srcFdId, newFdId };
+    }
+
+    case "ftruncateFd": {
+      const fdId = rng.pick(openFdIds);
+      const fd = model.openFds.get(fdId)!;
+      const file = model.files.get(fd.path);
+      const currentSize = file ? file.data.length : 0;
+      const sizeChoices = [
+        0,
+        Math.max(0, currentSize - PAGE_SIZE),
+        Math.max(0, currentSize - 1),
+        currentSize,
+        currentSize + 1,
+        currentSize + PAGE_SIZE,
+      ];
+      return { type: "ftruncateFd", fdId, size: rng.pick(sizeChoices) };
     }
 
     case "allocate": {
@@ -567,6 +585,13 @@ function execOp(FS: EmscriptenFS, op: Op, streams: StreamMap): boolean {
         if (!srcStream) return false;
         const dupStream = FS.dupStream(srcStream);
         streams.set(op.newFdId, dupStream);
+        return true;
+      }
+
+      case "ftruncateFd": {
+        const s = streams.get(op.fdId);
+        if (!s) return false;
+        FS.ftruncate(s.fd, op.size);
         return true;
       }
 
@@ -817,6 +842,22 @@ function updateModel(model: FSModel, op: Op): void {
       break;
     }
 
+    case "ftruncateFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (!fd) break;
+      const file = model.files.get(fd.path);
+      if (!file) break;
+      if (op.size < file.data.length) {
+        file.data = new Uint8Array(file.data.slice(0, op.size));
+      } else if (op.size > file.data.length) {
+        const newData = new Uint8Array(op.size);
+        newData.set(file.data);
+        file.data = newData;
+      }
+      file.mtime = null;
+      break;
+    }
+
     case "allocate": {
       const file = model.files.get(op.path);
       if (!file) break;
@@ -890,6 +931,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] closeFd(fdId=${op.fdId})`;
     case "dupFd":
       return `[${index}] dupFd(src=${op.srcFdId}, new=${op.newFdId})`;
+    case "ftruncateFd":
+      return `[${index}] ftruncateFd(fdId=${op.fdId}, size=${op.size})`;
     case "allocate":
       return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
     case "utime":
