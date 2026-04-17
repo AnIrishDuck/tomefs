@@ -389,24 +389,37 @@ export class SabClient implements SyncStorageBackend {
     // Fast path: everything fits in a single SAB call.
     // This is the common case — steady-state syncfs writes a handful of
     // dirty pages + their metadata, well within the 1 MB SAB buffer.
-    // Check both pages AND metas fit within their respective limits —
-    // each limit is computed assuming the full buffer is available for
-    // that payload type, so combining both in one message could overflow
-    // if either is near its limit.
+    //
+    // maxBatchPages and maxBatchMetas are each computed assuming the full
+    // buffer is available for that payload type alone. When combined in a
+    // single syncAll message, the actual capacity is shared. If the
+    // combined payload overflows, encodeMessage throws — catch that and
+    // fall back to separate calls instead of surfacing the error to the
+    // caller (which would abort syncfs and leave dirty flags in place for
+    // retry, but is avoidable).
     if (pages.length <= this.maxBatchPages && metas.length <= this.maxBatchMetas) {
-      const pageMeta = pages.map((p) => ({
-        path: p.path,
-        pageIndex: p.pageIndex,
-        dataLen: p.data.length,
-      }));
-      const chunks = pages.map((p) => p.data);
-      this.call(OpCode.SYNC_ALL, { pages: pageMeta, metas }, chunks);
-      return;
+      try {
+        const pageMeta = pages.map((p) => ({
+          path: p.path,
+          pageIndex: p.pageIndex,
+          dataLen: p.data.length,
+        }));
+        const chunks = pages.map((p) => p.data);
+        this.call(OpCode.SYNC_ALL, { pages: pageMeta, metas }, chunks);
+        return;
+      } catch (e) {
+        if (e instanceof Error && e.message.includes("SAB buffer overflow")) {
+          // Combined message too large — fall through to separate calls
+        } else {
+          throw e;
+        }
+      }
     }
 
-    // Fallback: too many pages for a single call. Use separate writePages
-    // + writeMetas calls. This loses single-transaction atomicity for the
-    // IDB backend, but is needed to avoid SAB buffer overflow.
+    // Fallback: too many pages/metas for a single call, or the combined
+    // message overflowed. Use separate writePages + writeMetas calls.
+    // This loses single-transaction atomicity for the IDB backend, but
+    // is needed to avoid SAB buffer overflow.
     this.writePages(pages);
     if (metas.length > 0) {
       this.writeMetas(metas);
