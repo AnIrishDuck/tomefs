@@ -16,7 +16,7 @@
  *   FS.mount(tomefs, {}, '/data');
  */
 
-import { PAGE_SIZE } from "./types.js";
+import { PAGE_SIZE, PAGE_SHIFT, PAGE_MASK } from "./types.js";
 import type { FileMeta } from "./types.js";
 import { SyncPageCache } from "./sync-page-cache.js";
 import { SyncMemoryBackend } from "./sync-memory-backend.js";
@@ -162,8 +162,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (toRead === 0) return 0;
 
     // Single-page fast path with per-node page table (avoids pageCache overhead)
-    const firstPage = (position / PAGE_SIZE) | 0;
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
     if (pageOffset + toRead <= PAGE_SIZE) {
       let page = node._pages?.[firstPage];
       if (page && page.evicted) {
@@ -185,7 +185,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Multi-page fast path: check per-node page table for all pages.
     // If every page is cached and not evicted, copy directly without
     // key construction, Map lookups, or LRU reordering overhead.
-    const lastPage = ((position + toRead - 1) / PAGE_SIZE) | 0;
+    const lastPage = (position + toRead - 1) >>> PAGE_SHIFT;
     const pages = node._pages;
     if (pages) {
       let allCached = true;
@@ -197,17 +197,25 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         }
       }
       if (allCached) {
-        let bytesRead = 0;
-        let pos = position;
-        while (bytesRead < toRead) {
-          const pi = (pos / PAGE_SIZE) | 0;
-          const po = pos - pi * PAGE_SIZE;
-          const n = Math.min(PAGE_SIZE - po, toRead - bytesRead);
-          buffer.set(pages[pi].data.subarray(po, po + n), offset + bytesRead);
-          bytesRead += n;
-          pos += n;
+        // First page (partial — starts at pageOffset)
+        const firstLen = PAGE_SIZE - pageOffset;
+        buffer.set(
+          pages[firstPage].data.subarray(pageOffset, PAGE_SIZE),
+          offset,
+        );
+        let bytesRead = firstLen;
+        // Middle full pages (no subarray needed — copy entire page)
+        for (let p = firstPage + 1; p < lastPage; p++) {
+          buffer.set(pages[p].data, offset + bytesRead);
+          bytesRead += PAGE_SIZE;
         }
-        return bytesRead;
+        // Last page (partial — copy remaining bytes from start)
+        const lastLen = toRead - bytesRead;
+        buffer.set(
+          pages[lastPage].data.subarray(0, lastLen),
+          offset + bytesRead,
+        );
+        return toRead;
       }
     }
 
@@ -249,8 +257,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (length === 0) return 0;
 
     // Single-page fast path with per-node page table
-    const firstPage = (position / PAGE_SIZE) | 0;
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
     if (pageOffset + length <= PAGE_SIZE) {
       let page = node._pages?.[firstPage];
       if (page && page.evicted) {
@@ -258,14 +266,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         page = undefined;
       }
       if (!page) {
-        // Skip backend read for pages beyond the current file extent —
-        // they don't exist in the backend, so readPage would be a wasted
-        // SAB bridge round-trip returning null.
         const firstNewPage = node.usedBytes > 0
           ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
-        // Skip backend read when the entire page will be overwritten —
-        // every byte is about to be replaced, so reading the old data
-        // is a wasted SAB bridge round-trip.
         const needsRead = firstPage < firstNewPage
           && !(pageOffset === 0 && length >= PAGE_SIZE);
         page = needsRead
@@ -289,7 +291,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Multi-page warm path: check per-node page table for all pages.
     // If every page is cached and not evicted, write directly without
     // key construction, Map lookups, or LRU reordering overhead.
-    const lastPage = ((position + length - 1) / PAGE_SIZE) | 0;
+    const lastPage = (position + length - 1) >>> PAGE_SHIFT;
     const pages = node._pages;
     if (pages) {
       let allCached = true;
@@ -301,23 +303,39 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         }
       }
       if (allCached) {
-        let bytesWritten = 0;
-        let pos = position;
-        while (bytesWritten < length) {
-          const pi = (pos / PAGE_SIZE) | 0;
-          const po = pos - pi * PAGE_SIZE;
-          const n = Math.min(PAGE_SIZE - po, length - bytesWritten);
-          const page = pages[pi];
-          page.data.set(
-            buffer.subarray(offset + bytesWritten, offset + bytesWritten + n),
-            po,
+        // First page (partial — starts at pageOffset)
+        let firstLen = PAGE_SIZE - pageOffset;
+        let pg = pages[firstPage];
+        pg.data.set(
+          buffer.subarray(offset, offset + firstLen),
+          pageOffset,
+        );
+        if (!pg.dirty) {
+          pg.dirty = true;
+          pageCache.addDirtyKey(pg.key, node.storagePath);
+        }
+        let bytesWritten = firstLen;
+        // Middle full pages
+        for (let p = firstPage + 1; p < lastPage; p++) {
+          pg = pages[p];
+          pg.data.set(
+            buffer.subarray(offset + bytesWritten, offset + bytesWritten + PAGE_SIZE),
           );
-          if (!page.dirty) {
-            page.dirty = true;
-            pageCache.addDirtyKey(page.key, node.storagePath);
+          if (!pg.dirty) {
+            pg.dirty = true;
+            pageCache.addDirtyKey(pg.key, node.storagePath);
           }
-          bytesWritten += n;
-          pos += n;
+          bytesWritten += PAGE_SIZE;
+        }
+        // Last page (partial — copy remaining bytes from start)
+        const lastLen = length - bytesWritten;
+        pg = pages[lastPage];
+        pg.data.set(
+          buffer.subarray(offset + bytesWritten, offset + bytesWritten + lastLen),
+        );
+        if (!pg.dirty) {
+          pg.dirty = true;
+          pageCache.addDirtyKey(pg.key, node.storagePath);
         }
         node.usedBytes = Math.max(node.usedBytes, position + length);
         return length;

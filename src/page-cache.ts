@@ -1,5 +1,5 @@
 import type { StorageBackend } from "./storage-backend.js";
-import { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
+import { PAGE_SIZE, PAGE_SHIFT, PAGE_MASK, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
 import type { CachedPage, CacheStats } from "./types.js";
 
 /**
@@ -171,8 +171,8 @@ export class PageCache {
     const toRead = Math.min(length, available);
     if (toRead === 0) return 0;
 
-    const firstPage = Math.floor(position / PAGE_SIZE);
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
 
     // Fast path: entire read fits within a single page (common case for
     // page-aligned I/O). Skips multi-page setup, loop, and per-iteration
@@ -187,7 +187,7 @@ export class PageCache {
     }
 
     // Multi-page path
-    const lastPage = Math.floor((position + toRead - 1) / PAGE_SIZE);
+    const lastPage = (position + toRead - 1) >>> PAGE_SHIFT;
 
     // Find cache misses — only batch when there are multiple misses
     let batchLoadedRead = 0;
@@ -226,24 +226,29 @@ export class PageCache {
       }
     }
 
-    // Read from cache (all multi-miss pages are pre-loaded; single misses use getPage)
-    let bytesRead = 0;
-    let pos = position;
-
-    while (bytesRead < toRead) {
-      const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
-      const bytesInPage = Math.min(PAGE_SIZE - pageOffset, toRead - bytesRead);
-
-      const page = await this.getPage(path, pageIndex);
-      buffer.set(
-        page.data.subarray(pageOffset, pageOffset + bytesInPage),
-        offset + bytesRead,
-      );
-
-      bytesRead += bytesInPage;
-      pos += bytesInPage;
+    // Read from cache: structured first/middle/last to avoid per-iteration
+    // page-index division.
+    // First page (partial)
+    const firstLen = PAGE_SIZE - pageOffset;
+    const firstPageObj = await this.getPage(path, firstPage);
+    buffer.set(
+      firstPageObj.data.subarray(pageOffset, PAGE_SIZE),
+      offset,
+    );
+    let bytesRead = firstLen;
+    // Middle full pages
+    for (let p = firstPage + 1; p < lastPage; p++) {
+      const page = await this.getPage(path, p);
+      buffer.set(page.data, offset + bytesRead);
+      bytesRead += PAGE_SIZE;
     }
+    // Last page (partial)
+    const lastLen = toRead - bytesRead;
+    const lastPageObj = await this.getPage(path, lastPage);
+    buffer.set(
+      lastPageObj.data.subarray(0, lastLen),
+      offset + bytesRead,
+    );
 
     // Compensate for false hits: batch-loaded pages were counted as misses
     // above, but getPage() also counted them as hits when it found them
@@ -252,7 +257,7 @@ export class PageCache {
       this._hits -= batchLoadedRead;
     }
 
-    return bytesRead;
+    return toRead;
   }
 
   /**
@@ -275,8 +280,8 @@ export class PageCache {
   ): Promise<{ bytesWritten: number; newFileSize: number }> {
     if (length === 0) return { bytesWritten: 0, newFileSize: currentFileSize };
 
-    const firstPage = Math.floor(position / PAGE_SIZE);
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
 
     // Pages at or beyond this index don't exist in the backend, so we can
     // skip the readPage call and create zero-filled pages directly. This
@@ -286,8 +291,6 @@ export class PageCache {
 
     // Fast path: entire write fits within a single page
     if (pageOffset + length <= PAGE_SIZE) {
-      // Skip backend read when the entire page will be overwritten —
-      // every byte is about to be replaced, so reading old data is wasted.
       const needsRead =
         firstPage < firstNewPage &&
         !(pageOffset === 0 && length >= PAGE_SIZE);
@@ -305,7 +308,7 @@ export class PageCache {
     }
 
     // Multi-page path
-    const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
+    const lastPage = (position + length - 1) >>> PAGE_SHIFT;
 
     // For multi-page writes, batch eviction and pre-loading of cache misses.
     // Separate cache misses into pages that need backend reads vs pages
@@ -318,8 +321,6 @@ export class PageCache {
         if (!this.cache.has(pageKeyStr(path, p))) {
           totalMissing++;
           if (p < firstNewPage) {
-            // Skip preloading pages that will be completely overwritten —
-            // every byte will be replaced, so the backend read is wasted.
             const fullyOverwritten =
               position <= p * PAGE_SIZE &&
               writeEnd >= (p + 1) * PAGE_SIZE;
@@ -331,10 +332,8 @@ export class PageCache {
       }
 
       if (totalMissing > 0) {
-        // Batch-evict space for all missing pages at once
         await this.batchEvict(totalMissing);
 
-        // Batch-load only pages that exist in the backend
         if (existingMissing.length > 1) {
           this._misses += existingMissing.length;
           const results = await this.backend.readPages(
@@ -359,45 +358,45 @@ export class PageCache {
             this.trackPage(path, key);
           }
         }
-        // Single existing misses and all new pages are handled by
-        // getPageInternal in the write loop below.
       }
     }
 
-    // Write data into pages (pre-loaded existing pages are cache hits;
-    // new pages beyond file extent skip the backend read)
-    let bytesWritten = 0;
-    let pos = position;
-
-    while (bytesWritten < length) {
-      const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
-      const bytesInPage = Math.min(
-        PAGE_SIZE - pageOffset,
-        length - bytesWritten,
-      );
-
-      // Skip backend read for fully-overwritten pages (pageOffset === 0
-      // means write starts at page boundary; bytesInPage === PAGE_SIZE
-      // means the entire page is covered).
-      const needsRead =
-        pageIndex < firstNewPage &&
-        !(pageOffset === 0 && bytesInPage === PAGE_SIZE);
-      const page = await this.getPageInternal(path, pageIndex, needsRead);
+    // Write data into pages: structured first/middle/last to avoid
+    // per-iteration page-index division.
+    // First page (starts at pageOffset; fully overwritten when pageOffset === 0)
+    const firstLen = PAGE_SIZE - pageOffset;
+    let page = await this.getPageInternal(
+      path, firstPage, firstPage < firstNewPage && pageOffset !== 0,
+    );
+    page.data.set(buffer.subarray(offset, offset + firstLen), pageOffset);
+    if (!page.dirty) {
+      page.dirty = true;
+      this.trackDirty(path, page.key);
+    }
+    let bytesWritten = firstLen;
+    // Middle full pages (always fully overwritten — skip backend read)
+    for (let p = firstPage + 1; p < lastPage; p++) {
+      page = await this.getPageInternal(path, p, false);
       page.data.set(
-        buffer.subarray(
-          offset + bytesWritten,
-          offset + bytesWritten + bytesInPage,
-        ),
-        pageOffset,
+        buffer.subarray(offset + bytesWritten, offset + bytesWritten + PAGE_SIZE),
       );
       if (!page.dirty) {
         page.dirty = true;
         this.trackDirty(path, page.key);
       }
-
-      bytesWritten += bytesInPage;
-      pos += bytesInPage;
+      bytesWritten += PAGE_SIZE;
+    }
+    // Last page (copy remaining bytes; fully overwritten when lastLen === PAGE_SIZE)
+    const lastLen = length - bytesWritten;
+    page = await this.getPageInternal(
+      path, lastPage, lastPage < firstNewPage && lastLen < PAGE_SIZE,
+    );
+    page.data.set(
+      buffer.subarray(offset + bytesWritten, offset + bytesWritten + lastLen),
+    );
+    if (!page.dirty) {
+      page.dirty = true;
+      this.trackDirty(path, page.key);
     }
 
     // Compensate for false hits: batch-loaded pages were counted as misses
@@ -408,7 +407,7 @@ export class PageCache {
     }
 
     const newFileSize = Math.max(currentFileSize, position + length);
-    return { bytesWritten, newFileSize };
+    return { bytesWritten: length, newFileSize };
   }
 
   /**
@@ -597,8 +596,8 @@ export class PageCache {
    * later extended without writing to the truncated region.
    */
   async zeroTailAfterTruncate(path: string, newSize: number): Promise<void> {
-    const lastPageIndex = Math.floor(newSize / PAGE_SIZE);
-    const tailOffset = newSize % PAGE_SIZE;
+    const lastPageIndex = newSize >>> PAGE_SHIFT;
+    const tailOffset = newSize & PAGE_MASK;
     if (tailOffset === 0) return;
 
     // Load the page through the cache (from backend if not cached).

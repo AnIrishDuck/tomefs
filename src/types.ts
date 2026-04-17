@@ -1,6 +1,12 @@
 /** Page size in bytes — matches Postgres's internal page size. */
 export const PAGE_SIZE = 8192;
 
+/** Right-shift count for page-index extraction: pageIndex = position >>> PAGE_SHIFT. */
+export const PAGE_SHIFT = 13; // log2(PAGE_SIZE)
+
+/** Bitmask for page-offset extraction: pageOffset = position & PAGE_MASK. */
+export const PAGE_MASK = PAGE_SIZE - 1; // 0x1FFF
+
 /** Default maximum number of pages in the LRU cache (4096 * 8KB = 32MB). */
 export const DEFAULT_MAX_PAGES = 4096;
 
