@@ -153,6 +153,7 @@ type Op =
   | { type: "writeFd"; fdId: number; data: Uint8Array }
   | { type: "seekFd"; fdId: number; offset: number; whence: number }
   | { type: "closeFd"; fdId: number }
+  | { type: "dupFd"; srcFdId: number; newFdId: number }
   | { type: "allocate"; path: string; offset: number; length: number }
   | { type: "utime"; path: string; atime: number; mtime: number }
   | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array };
@@ -226,6 +227,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["writeFd", openFdIds.length > 0 ? 12 : 0],
     ["seekFd", openFdIds.length > 0 ? 6 : 0],
     ["closeFd", openFdIds.length > 0 ? 6 : 0],
+    ["dupFd", openFdIds.length > 0 && model.openFds.size < 6 ? 6 : 0],
     ["allocate", allFiles.length > 0 ? 8 : 0],
     ["utime", allFiles.length > 0 ? 6 : 0],
     ["mmapWriteAt", allFiles.length > 0 ? 6 : 0],
@@ -384,6 +386,12 @@ function generateOp(rng: Rng, model: FSModel): Op {
 
     case "closeFd":
       return { type: "closeFd", fdId: rng.pick(openFdIds) };
+
+    case "dupFd": {
+      const srcFdId = rng.pick(openFdIds);
+      const newFdId = model.nextFdId;
+      return { type: "dupFd", srcFdId, newFdId };
+    }
 
     case "allocate": {
       const path = rng.pick(allFiles);
@@ -551,6 +559,14 @@ function execOp(FS: EmscriptenFS, op: Op, streams: StreamMap): boolean {
         if (!s) return false;
         FS.close(s);
         streams.delete(op.fdId);
+        return true;
+      }
+
+      case "dupFd": {
+        const srcStream = streams.get(op.srcFdId);
+        if (!srcStream) return false;
+        const dupStream = FS.dupStream(srcStream);
+        streams.set(op.newFdId, dupStream);
         return true;
       }
 
@@ -793,6 +809,14 @@ function updateModel(model: FSModel, op: Op): void {
       break;
     }
 
+    case "dupFd": {
+      const srcFd = model.openFds.get(op.srcFdId);
+      if (!srcFd) break;
+      model.openFds.set(op.newFdId, { path: srcFd.path, position: srcFd.position });
+      model.nextFdId = op.newFdId + 1;
+      break;
+    }
+
     case "allocate": {
       const file = model.files.get(op.path);
       if (!file) break;
@@ -864,6 +888,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] seekFd(fdId=${op.fdId}, offset=${op.offset}, whence=${op.whence})`;
     case "closeFd":
       return `[${index}] closeFd(fdId=${op.fdId})`;
+    case "dupFd":
+      return `[${index}] dupFd(src=${op.srcFdId}, new=${op.newFdId})`;
     case "allocate":
       return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
     case "utime":
@@ -1062,10 +1088,12 @@ async function runPersistenceRoundtrip(
   numOps: number,
   maxPages: number,
   remountInterval: number,
+  options?: { midSyncInterval?: number },
 ): Promise<void> {
   const rng = new Rng(seed);
   const model = newModel();
   const backend = new SyncMemoryBackend();
+  const midSyncInterval = options?.midSyncInterval ?? 0;
 
   let instance = await createTomeFSInstance(backend, maxPages);
   let streams: StreamMap = new Map();
@@ -1079,6 +1107,18 @@ async function runPersistenceRoundtrip(
     const success = execOp(instance.rawFS, op, streams);
     if (success) {
       updateModel(model, op);
+    }
+
+    // Intermediate syncfs WITHOUT closing FDs or remounting. This exercises
+    // the syncfs path with open (possibly dup'd) file descriptors, including
+    // unlinked files with /__deleted_* marker metadata. Postgres calls
+    // checkpoint/syncfs while WAL fds are still open — this simulates that.
+    if (
+      midSyncInterval > 0 &&
+      (i + 1) % midSyncInterval === 0 &&
+      (i + 1) % remountInterval !== 0
+    ) {
+      syncfs(instance.rawFS);
     }
 
     // Periodically perform a persistence roundtrip
@@ -1272,5 +1312,41 @@ describe("fuzz: persistence roundtrip testing", () => {
     it("seed 90004, large cache, msync + truncate + allocate", async () => {
       await runPersistenceRoundtrip(90004, 80, 4096, 20);
     }, 30_000);
+  });
+
+  describe("dupFd — dup'd file descriptors across persistence roundtrips", () => {
+    it("seed 100001, tiny cache, dup + write + remount @fast", async () => {
+      await runPersistenceRoundtrip(100001, 80, 4, 15);
+    }, 30_000);
+
+    it("seed 100002, small cache, dup + unlink + remount", async () => {
+      await runPersistenceRoundtrip(100002, 100, 16, 20);
+    }, 30_000);
+
+    it("seed 100003, tiny cache, frequent remount with dups", async () => {
+      await runPersistenceRoundtrip(100003, 60, 4, 5);
+    }, 30_000);
+
+    it("seed 100004, medium cache, long dup + write sequence", async () => {
+      await runPersistenceRoundtrip(100004, 150, 64, 25);
+    }, 60_000);
+  });
+
+  describe("intermediate syncfs — sync with open FDs between remounts", () => {
+    it("seed 110001, tiny cache, mid-sync every 5 ops @fast", async () => {
+      await runPersistenceRoundtrip(110001, 80, 4, 20, { midSyncInterval: 5 });
+    }, 30_000);
+
+    it("seed 110002, small cache, mid-sync every 3 ops", async () => {
+      await runPersistenceRoundtrip(110002, 100, 16, 25, { midSyncInterval: 3 });
+    }, 30_000);
+
+    it("seed 110003, tiny cache, frequent mid-sync + remount", async () => {
+      await runPersistenceRoundtrip(110003, 60, 4, 10, { midSyncInterval: 2 });
+    }, 30_000);
+
+    it("seed 110004, medium cache, mid-sync + dup + rename", async () => {
+      await runPersistenceRoundtrip(110004, 120, 64, 30, { midSyncInterval: 7 });
+    }, 60_000);
   });
 });
