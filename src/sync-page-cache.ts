@@ -185,10 +185,14 @@ export class SyncPageCache {
     // per-iteration index computation.
     if (pageOffset + toRead <= PAGE_SIZE) {
       const page = this.getPage(path, firstPage);
-      buffer.set(
-        page.data.subarray(pageOffset, pageOffset + toRead),
-        offset,
-      );
+      if (toRead === PAGE_SIZE) {
+        buffer.set(page.data, offset);
+      } else {
+        buffer.set(
+          page.data.subarray(pageOffset, pageOffset + toRead),
+          offset,
+        );
+      }
       return toRead;
     }
 
@@ -238,10 +242,14 @@ export class SyncPageCache {
       const bytesInPage = Math.min(PAGE_SIZE - po, toRead - bytesRead);
 
       const page = this.getPage(path, pi);
-      buffer.set(
-        page.data.subarray(po, po + bytesInPage),
-        offset + bytesRead,
-      );
+      if (po === 0 && bytesInPage === PAGE_SIZE) {
+        buffer.set(page.data, offset + bytesRead);
+      } else {
+        buffer.set(
+          page.data.subarray(po, po + bytesInPage),
+          offset + bytesRead,
+        );
+      }
 
       bytesRead += bytesInPage;
       pos += bytesInPage;
