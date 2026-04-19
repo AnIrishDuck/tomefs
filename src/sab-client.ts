@@ -49,6 +49,15 @@ export class SabClient implements SyncStorageBackend {
   private readonly timeout: number;
 
   /**
+   * True when the previous call timed out and the worker may still be
+   * writing its response to the shared buffer. The next call() must
+   * wait for the worker to finish before encoding a new request —
+   * otherwise both sides write to the data region concurrently,
+   * corrupting the message.
+   */
+  private recovering = false;
+
+  /**
    * Maximum pages per batch call. Computed from buffer size to prevent
    * overflow when flushAll/flushFile sends large dirty page batches.
    *
@@ -414,6 +423,43 @@ export class SabClient implements SyncStorageBackend {
   }
 
   /**
+   * Wait for the worker to finish processing a timed-out request.
+   *
+   * After a timeout, we reset STATUS to IDLE, but the worker may still be
+   * writing its response to the shared buffer's data region. We must wait
+   * for it to finish (indicated by STATUS changing from IDLE to RESPONSE or
+   * ERROR) before encoding a new request — otherwise both sides write to
+   * the data region concurrently, corrupting the message.
+   *
+   * The Atomics memory model guarantees that once we observe the worker's
+   * STATUS_RESPONSE/STATUS_ERROR store (release), all prior writes to the
+   * data region are visible to us (acquire via Atomics.wait/load).
+   */
+  private recoverFromTimeout(): void {
+    const status = Atomics.load(this.controlView, SLOT_STATUS);
+
+    if (status === STATUS_IDLE) {
+      const recoveryTimeout =
+        this.timeout > 0 ? Math.max(this.timeout * 10, 5000) : 30000;
+      const result = Atomics.wait(
+        this.controlView,
+        SLOT_STATUS,
+        STATUS_IDLE,
+        recoveryTimeout,
+      );
+      if (result === "timed-out") {
+        throw new Error(
+          "SAB bridge: worker is unresponsive after timeout recovery. " +
+            "The storage worker may have crashed or is permanently blocked.",
+        );
+      }
+    }
+
+    Atomics.store(this.controlView, SLOT_STATUS, STATUS_IDLE);
+    this.recovering = false;
+  }
+
+  /**
    * Send a request and block until the response arrives.
    */
   private call(
@@ -421,6 +467,10 @@ export class SabClient implements SyncStorageBackend {
     params: unknown,
     binaryChunks?: Uint8Array[],
   ): { json: unknown; binary: Uint8Array } {
+    if (this.recovering) {
+      this.recoverFromTimeout();
+    }
+
     // Encode request into the data region
     const dataLen = encodeMessage(
       this.dataView,
@@ -448,8 +498,10 @@ export class SabClient implements SyncStorageBackend {
         waitTimeout,
       );
       if (result === "timed-out") {
-        // Reset to idle so the bridge can recover
+        // Reset to idle so the worker's eventual response changes status
+        // from IDLE → RESPONSE, which recoverFromTimeout() can detect.
         Atomics.store(this.controlView, SLOT_STATUS, STATUS_IDLE);
+        this.recovering = true;
         throw new Error(
           `SAB bridge timeout: storage worker did not respond within ${this.timeout}ms`,
         );
