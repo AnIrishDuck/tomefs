@@ -404,13 +404,32 @@ export class SabClient implements SyncStorageBackend {
       return;
     }
 
-    // Fallback: too many pages for a single call. Use separate writePages
-    // + writeMetas calls. This loses single-transaction atomicity for the
-    // IDB backend, but is needed to avoid SAB buffer overflow.
-    this.writePages(pages);
-    if (metas.length > 0) {
-      this.writeMetas(metas);
+    // Multi-round atomic protocol: chunk pages and metas into APPEND
+    // calls that the worker accumulates, then COMMIT triggers a single
+    // backend.syncAll() — preserving IDB single-transaction atomicity.
+    let reset = true;
+
+    for (let i = 0; i < pages.length; i += this.maxBatchPages) {
+      const chunk = pages.slice(i, i + this.maxBatchPages);
+      const pageMeta = chunk.map((p) => ({
+        path: p.path,
+        pageIndex: p.pageIndex,
+        dataLen: p.data.length,
+      }));
+      const binaryChunks = chunk.map((p) => p.data);
+      this.call(OpCode.SYNC_ALL_APPEND, { pages: pageMeta, reset }, binaryChunks);
+      reset = false;
     }
+
+    if (metas.length > 0) {
+      for (let i = 0; i < metas.length; i += this.maxBatchMetas) {
+        const chunk = metas.slice(i, i + this.maxBatchMetas);
+        this.call(OpCode.SYNC_ALL_APPEND, { metas: chunk, reset });
+        reset = false;
+      }
+    }
+
+    this.call(OpCode.SYNC_ALL_COMMIT, {});
   }
 
   /**

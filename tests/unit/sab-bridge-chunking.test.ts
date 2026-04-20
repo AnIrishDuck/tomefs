@@ -324,7 +324,7 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       expect(meta.mtime).toBe(200);
     });
 
-    it("@fast syncAll with 5 pages falls back to writePages + writeMetas", async () => {
+    it("@fast syncAll with 5 pages uses atomic APPEND+COMMIT protocol", async () => {
       const pages = Array.from({ length: 5 }, (_, i) => ({
         path: "/syncmulti",
         pageIndex: i,
@@ -351,9 +351,9 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       expect(meta.size).toBe(5 * PAGE_SIZE);
     });
 
-    it("syncAll with many metas falls back to chunked writeMetas", async () => {
-      // 1 page + 20 metas. With the fix, metas.length (20) > maxBatchMetas (16)
-      // triggers the fallback path which chunks metas into [16, 4].
+    it("syncAll with many metas uses atomic APPEND+COMMIT protocol", async () => {
+      // 1 page + 20 metas. metas.length (20) > maxBatchMetas (16)
+      // triggers the chunked path which sends metas via APPEND [16, 4].
       const pages = [{ path: "/file0", pageIndex: 0, data: fillPage(0xdd) }];
       const metas = Array.from({ length: 20 }, (_, i) => ({
         path: `/file${i}`,
@@ -542,6 +542,94 @@ describe("SAB bridge: batch chunking with small buffer", () => {
   });
 
   // -----------------------------------------------------------------
+  // Atomicity verification: chunked syncAll must call backend.syncAll()
+  // -----------------------------------------------------------------
+
+  describe("syncAll atomicity", () => {
+    it("@fast chunked syncAll calls backend.syncAll (not separate writePages+writeMetas)", async () => {
+      // With maxBatchPages=1, sending 3 pages forces the APPEND+COMMIT
+      // path. Verify that the backend receives a single syncAll() call
+      // with all 3 pages + 2 metas, not separate writePages + writeMetas.
+      const pages = Array.from({ length: 3 }, (_, i) => ({
+        path: `/atom_${i}`,
+        pageIndex: 0,
+        data: fillPage(0xe0 + i),
+      }));
+      const metas = Array.from({ length: 2 }, (_, i) => ({
+        path: `/atom_${i}`,
+        meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 1100 + i, mtime: 1200 + i } as FileMeta,
+      }));
+      await callClient(clientWorker, "syncAll", [pages, metas]);
+
+      // Verify all data persisted atomically
+      for (let i = 0; i < 3; i++) {
+        const page = toUint8Array(
+          await callClient(clientWorker, "readPage", [`/atom_${i}`, 0]),
+        );
+        expect(page[0]).toBe(0xe0 + i);
+      }
+      for (let i = 0; i < 2; i++) {
+        const meta = (await callClient(clientWorker, "readMeta", [`/atom_${i}`])) as FileMeta;
+        expect(meta.mtime).toBe(1200 + i);
+      }
+
+      // The key guarantee: the backend received one syncAll() call,
+      // not separate writePages() + writeMetas() calls. We verify this
+      // indirectly by confirming the data is consistent — with the old
+      // non-atomic fallback, a crash between writePages and writeMetas
+      // would leave pages without metadata.
+    });
+
+    it("chunked syncAll with pages + metas both exceeding buffer", async () => {
+      // 5 pages (5 chunks) + 20 metas (2 chunks) → all accumulated
+      // atomically via APPEND+COMMIT.
+      const pages = Array.from({ length: 5 }, (_, i) => ({
+        path: "/bigatomic",
+        pageIndex: i,
+        data: fillPage(0xf0 + i),
+      }));
+      const metas = Array.from({ length: 20 }, (_, i) => ({
+        path: `/bigatomic_meta_${i}`,
+        meta: { size: i * 10, mode: 0o100644, ctime: 2000 + i, mtime: 3000 + i } as FileMeta,
+      }));
+      await callClient(clientWorker, "syncAll", [pages, metas]);
+
+      // Verify all 5 pages
+      const result = toPageArray(
+        await callClient(clientWorker, "readPages", ["/bigatomic", [0, 1, 2, 3, 4]]),
+      );
+      for (let i = 0; i < 5; i++) {
+        expect(result[i]![0]).toBe((0xf0 + i) & 0xff);
+      }
+
+      // Verify all 20 metas
+      const paths = metas.map((m) => m.path);
+      const readMetas = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+      for (let i = 0; i < 20; i++) {
+        expect(readMetas[i]!.size).toBe(i * 10);
+        expect(readMetas[i]!.mtime).toBe(3000 + i);
+      }
+    });
+
+    it("chunked syncAll with empty pages + overflowing metas", async () => {
+      // 0 pages + 25 metas (2 chunks) — tests the reset flag on the
+      // first meta APPEND when there are no page APPENDs.
+      const metas = Array.from({ length: 25 }, (_, i) => ({
+        path: `/metaonly_${i}`,
+        meta: { size: i, mode: 0o040755, ctime: 4000 + i, mtime: 5000 + i } as FileMeta,
+      }));
+      await callClient(clientWorker, "syncAll", [[], metas]);
+
+      const paths = metas.map((m) => m.path);
+      const readMetas = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+      for (let i = 0; i < 25; i++) {
+        expect(readMetas[i]!.size).toBe(i);
+        expect(readMetas[i]!.mtime).toBe(5000 + i);
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------
   // Mixed operations across chunk boundaries
   // -----------------------------------------------------------------
 
@@ -616,5 +704,159 @@ describe("SAB bridge: batch chunking with small buffer", () => {
         expect(readMetas[i]!.mtime).toBe(2000 + i);
       }
     });
+  });
+});
+
+/**
+ * Instrumented backend that records which methods were called, so tests
+ * can verify that chunked syncAll uses backend.syncAll() (atomic) rather
+ * than separate writePages + writeMetas (non-atomic).
+ */
+class InstrumentedBackend extends MemoryBackend {
+  calls: Array<{ method: string; pageCount: number; metaCount: number }> = [];
+  private inSyncAll = false;
+
+  override async syncAll(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    this.calls.push({ method: "syncAll", pageCount: pages.length, metaCount: metas.length });
+    this.inSyncAll = true;
+    try {
+      return await super.syncAll(pages, metas);
+    } finally {
+      this.inSyncAll = false;
+    }
+  }
+
+  override async writePages(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+  ): Promise<void> {
+    if (!this.inSyncAll) {
+      this.calls.push({ method: "writePages", pageCount: pages.length, metaCount: 0 });
+    }
+    return super.writePages(pages);
+  }
+
+  override async writeMetas(
+    entries: Array<{ path: string; meta: FileMeta }>,
+  ): Promise<void> {
+    if (!this.inSyncAll) {
+      this.calls.push({ method: "writeMetas", pageCount: 0, metaCount: entries.length });
+    }
+    return super.writeMetas(entries);
+  }
+}
+
+describe("SAB bridge: syncAll atomicity with instrumented backend", () => {
+  let backend: InstrumentedBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    backend = new InstrumentedBackend();
+    sab = new SharedArrayBuffer(SMALL_BUFFER_SIZE);
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 0 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("@fast single-call syncAll uses one backend.syncAll", async () => {
+    const pages = [{ path: "/a", pageIndex: 0, data: fillPage(0x01) }];
+    const metas = [
+      { path: "/a", meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 2 } as FileMeta },
+    ];
+    backend.calls = [];
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    const syncCalls = backend.calls.filter((c) => c.method === "syncAll");
+    expect(syncCalls).toHaveLength(1);
+    expect(syncCalls[0].pageCount).toBe(1);
+    expect(syncCalls[0].metaCount).toBe(1);
+
+    const writeCalls = backend.calls.filter(
+      (c) => c.method === "writePages" || c.method === "writeMetas",
+    );
+    expect(writeCalls).toHaveLength(0);
+  });
+
+  it("@fast chunked syncAll (5 pages) uses one backend.syncAll, not writePages+writeMetas", async () => {
+    const pages = Array.from({ length: 5 }, (_, i) => ({
+      path: "/chunked",
+      pageIndex: i,
+      data: fillPage(0x10 + i),
+    }));
+    const metas = [
+      { path: "/chunked", meta: { size: 5 * PAGE_SIZE, mode: 0o100644, ctime: 10, mtime: 20 } as FileMeta },
+    ];
+    backend.calls = [];
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    const syncCalls = backend.calls.filter((c) => c.method === "syncAll");
+    expect(syncCalls).toHaveLength(1);
+    expect(syncCalls[0].pageCount).toBe(5);
+    expect(syncCalls[0].metaCount).toBe(1);
+
+    const writeCalls = backend.calls.filter(
+      (c) => c.method === "writePages" || c.method === "writeMetas",
+    );
+    expect(writeCalls).toHaveLength(0);
+  });
+
+  it("chunked syncAll with 3 pages + 20 metas uses one backend.syncAll", async () => {
+    const pages = Array.from({ length: 3 }, (_, i) => ({
+      path: `/f${i}`,
+      pageIndex: 0,
+      data: fillPage(0x30 + i),
+    }));
+    const metas = Array.from({ length: 20 }, (_, i) => ({
+      path: `/f${i}`,
+      meta: { size: i < 3 ? PAGE_SIZE : 0, mode: 0o100644, ctime: 100 + i, mtime: 200 + i } as FileMeta,
+    }));
+    backend.calls = [];
+    await callClient(clientWorker, "syncAll", [pages, metas]);
+
+    const syncCalls = backend.calls.filter((c) => c.method === "syncAll");
+    expect(syncCalls).toHaveLength(1);
+    expect(syncCalls[0].pageCount).toBe(3);
+    expect(syncCalls[0].metaCount).toBe(20);
+
+    const writeCalls = backend.calls.filter(
+      (c) => c.method === "writePages" || c.method === "writeMetas",
+    );
+    expect(writeCalls).toHaveLength(0);
+  });
+
+  it("chunked syncAll with 0 pages + 25 metas uses one backend.syncAll", async () => {
+    const metas = Array.from({ length: 25 }, (_, i) => ({
+      path: `/dir${i}`,
+      meta: { size: 0, mode: 0o040755, ctime: 300 + i, mtime: 400 + i } as FileMeta,
+    }));
+    backend.calls = [];
+    await callClient(clientWorker, "syncAll", [[], metas]);
+
+    const syncCalls = backend.calls.filter((c) => c.method === "syncAll");
+    expect(syncCalls).toHaveLength(1);
+    expect(syncCalls[0].pageCount).toBe(0);
+    expect(syncCalls[0].metaCount).toBe(25);
+
+    const writeCalls = backend.calls.filter(
+      (c) => c.method === "writePages" || c.method === "writeMetas",
+    );
+    expect(writeCalls).toHaveLength(0);
   });
 });

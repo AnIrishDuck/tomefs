@@ -41,6 +41,13 @@ export class SabWorker {
   private stopResolve: (() => void) | null = null;
   private stopPromise: Promise<void> = Promise.resolve();
 
+  private pendingSyncPages: Array<{
+    path: string;
+    pageIndex: number;
+    data: Uint8Array;
+  }> = [];
+  private pendingSyncMetas: Array<{ path: string; meta: FileMeta }> = [];
+
   constructor(sab: SharedArrayBuffer, backend: StorageBackend) {
     this.sab = sab;
     this.backend = backend;
@@ -411,6 +418,57 @@ export class SabWorker {
           ok: true,
         });
         Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
+      case OpCode.SYNC_ALL_APPEND: {
+        if (params.reset) {
+          this.pendingSyncPages = [];
+          this.pendingSyncMetas = [];
+        }
+        if (params.pages) {
+          const pageMeta = params.pages as Array<{
+            path: string;
+            pageIndex: number;
+            dataLen: number;
+          }>;
+          let offset = 0;
+          for (const pm of pageMeta) {
+            if (pm.dataLen < 0 || offset + pm.dataLen > binary.length) {
+              throw new Error(
+                `SYNC_ALL_APPEND: dataLen ${pm.dataLen} at offset ${offset} exceeds binary length ${binary.length}`,
+              );
+            }
+            const data = binary.slice(offset, offset + pm.dataLen);
+            offset += pm.dataLen;
+            this.pendingSyncPages.push({
+              path: pm.path,
+              pageIndex: pm.pageIndex,
+              data,
+            });
+          }
+        }
+        if (params.metas) {
+          const metas = params.metas as Array<{ path: string; meta: FileMeta }>;
+          this.pendingSyncMetas.push(...metas);
+        }
+        const appendLen = encodeMessage(this.dataView, this.uint8View, {
+          ok: true,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, appendLen);
+        break;
+      }
+
+      case OpCode.SYNC_ALL_COMMIT: {
+        const pages = this.pendingSyncPages;
+        const metas = this.pendingSyncMetas;
+        this.pendingSyncPages = [];
+        this.pendingSyncMetas = [];
+        await this.backend.syncAll(pages, metas);
+        const commitLen = encodeMessage(this.dataView, this.uint8View, {
+          ok: true,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, commitLen);
         break;
       }
 
