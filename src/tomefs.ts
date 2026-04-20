@@ -715,10 +715,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const metaWrites: Array<{ path: string; meta: FileMeta }> = [];
     const metaDeletes: string[] = [];
     const pageRenames: Array<{ child: any; oldPath: string; newPath: string }> = [];
+    const visitedNodes: any[] = [];
 
     function collect(node: any, oldBase: string, newBase: string): void {
       for (const childName of Object.keys(node.contents)) {
         const child = node.contents[childName];
+        visitedNodes.push(child);
         if (FS.isFile(child.mode)) {
           const oldPath = child.storagePath;
           const newPath = newBase + oldPath.substring(oldBase.length);
@@ -792,6 +794,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Delete old metadata last.
     if (metaDeletes.length > 0) {
       backend.deleteMetas(metaDeletes);
+    }
+
+    // Clear dirty flags — metadata was just written from live node state.
+    // Without this, the next incremental syncfs re-persists all descendants.
+    for (const node of visitedNodes) {
+      if (node._metaDirty) {
+        node._metaDirty = false;
+        dirtyMetaNodes.delete(node);
+      }
     }
   }
 
@@ -900,6 +911,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
+          if (node._metaDirty) {
+            node._metaDirty = false;
+            dirtyMetaNodes.delete(node);
+          }
         }
         // Dirty pages remain in the cache and are flushed by syncfs or
         // eviction. POSIX close() does not guarantee persistence — that
@@ -913,6 +928,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const oldSize = node.usedBytes;
       resizeFileStorage(node, Math.max(oldSize, offset + length));
       if (node.usedBytes !== oldSize) {
+        node.mtime = node.ctime = Date.now();
         markMetaDirty(node);
       }
     },
