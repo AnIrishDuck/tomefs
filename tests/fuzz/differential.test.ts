@@ -537,7 +537,12 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
 
       case "writeAt": {
         const s = FS.open(op.path, O.RDWR);
-        FS.write(s, op.data, 0, op.data.length, op.offset);
+        // Exercise non-zero buffer offset: deterministic padding derived
+        // from data length (doesn't consume RNG, preserves seed stability)
+        const waBufOff = op.data.length % 13;
+        const waBuf = new Uint8Array(waBufOff + op.data.length);
+        waBuf.set(op.data, waBufOff);
+        FS.write(s, waBuf, waBufOff, op.data.length, op.offset);
         const stat = FS.stat(op.path);
         FS.close(s);
         return { error: null, size: stat.size };
@@ -642,17 +647,26 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         if (!stream) return { error: "no-fd" };
         // Read entire file from position 0 using fstat for size
         const fstatResult = FS.fstat(stream.fd ?? stream);
-        const buf = new Uint8Array(fstatResult.size);
+        // Exercise non-zero buffer offset: deterministic padding derived
+        // from file size (doesn't consume RNG, preserves seed stability)
+        const rfBufOff = fstatResult.size % 11;
+        const buf = new Uint8Array(rfBufOff + fstatResult.size);
         if (fstatResult.size > 0) {
-          FS.read(stream, buf, 0, fstatResult.size, 0);
+          FS.read(stream, buf, rfBufOff, fstatResult.size, 0);
         }
-        return { error: null, data: buf, size: fstatResult.size };
+        const data = buf.slice(rfBufOff, rfBufOff + fstatResult.size);
+        return { error: null, data, size: fstatResult.size };
       }
 
       case "writeFd": {
         const stream = fdStreams?.get(op.fdId);
         if (!stream) return { error: "no-fd" };
-        FS.write(stream, op.data, 0, op.data.length, op.offset);
+        // Exercise non-zero buffer offset: deterministic padding derived
+        // from data length (doesn't consume RNG, preserves seed stability)
+        const wfBufOff = op.data.length % 17;
+        const wfBuf = new Uint8Array(wfBufOff + op.data.length);
+        wfBuf.set(op.data, wfBufOff);
+        FS.write(stream, wfBuf, wfBufOff, op.data.length, op.offset);
         const fstatResult = FS.fstat(stream.fd ?? stream);
         return { error: null, size: fstatResult.size };
       }
@@ -682,7 +696,10 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
 
       case "appendWrite": {
         const s = FS.open(op.path, O.WRONLY | O.APPEND);
-        FS.write(s, op.data, 0, op.data.length);
+        const awBufOff = op.data.length % 19;
+        const awBuf = new Uint8Array(awBufOff + op.data.length);
+        awBuf.set(op.data, awBufOff);
+        FS.write(s, awBuf, awBufOff, op.data.length);
         const stat = FS.stat(op.path);
         FS.close(s);
         return { error: null, size: stat.size };
