@@ -11,6 +11,8 @@
  *
  * These tests only run when TOMEFS_BACKEND=tomefs.
  */
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 import {
   createFS,
   encode,
@@ -21,10 +23,12 @@ import {
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
 describe("adversarial: close() dirty tracking for unlinked files (ethos §6, §9)", () => {
   it("dead file node is not in syncAll batch after write+close @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;
@@ -78,7 +82,7 @@ describe("adversarial: close() dirty tracking for unlinked files (ethos §6, §9
 
   it("fast path is restored after unlink+write+close+sync cycle @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;
@@ -125,7 +129,7 @@ describe("adversarial: close() dirty tracking for unlinked files (ethos §6, §9
 
   it("multiple unlink+write+close cycles do not accumulate dead nodes @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;
@@ -175,7 +179,7 @@ describe("adversarial: close() dirty tracking for unlinked files (ethos §6, §9
 
   it("write-to-unlinked + close does not leak into subsequent syncs @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;

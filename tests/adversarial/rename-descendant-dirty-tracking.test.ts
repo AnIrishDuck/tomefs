@@ -8,6 +8,8 @@
  *
  * These tests only run when TOMEFS_BACKEND=tomefs.
  */
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 import {
   createFS,
   encode,
@@ -18,10 +20,12 @@ import {
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
 describe("adversarial: renameDescendantPaths dirty tracking (ethos §6)", () => {
   it("syncfs after dir rename does not redundantly persist descendants @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;
@@ -81,7 +85,7 @@ describe("adversarial: renameDescendantPaths dirty tracking (ethos §6)", () => 
 
   it("subsequent write after dir rename correctly re-dirties @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;
@@ -136,7 +140,7 @@ describe("adversarial: renameDescendantPaths dirty tracking (ethos §6)", () => 
 
   it("wide directory rename clears all descendant dirty flags @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;
@@ -187,7 +191,7 @@ describe("adversarial: renameDescendantPaths dirty tracking (ethos §6)", () => 
 
   it("data persists correctly after dir rename + syncfs @fast", async () => {
     const { default: createModule } = await import(
-      "../harness/emscripten_fs.mjs"
+      join(__dirname, "../harness/emscripten_fs.mjs")
     );
     const Module = await createModule();
     const rawFS = Module.FS;
