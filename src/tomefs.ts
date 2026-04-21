@@ -190,6 +190,20 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // key construction, Map lookups, or LRU reordering overhead.
     const lastPage = ((position + toRead - 1) / PAGE_SIZE) | 0;
     const pages = node._pages;
+
+    // Two-page fast path: most cross-page boundary reads span exactly 2 pages.
+    // Inlined check avoids the allCached loop and first/middle/last dispatch.
+    if (lastPage === firstPage + 1) {
+      const pg1 = pages[firstPage];
+      const pg2 = pages[lastPage];
+      if (pg1 && !pg1.evicted && pg2 && !pg2.evicted) {
+        const firstN = PAGE_SIZE - pageOffset;
+        buffer.set(pg1.data.subarray(pageOffset, PAGE_SIZE), offset);
+        buffer.set(pg2.data.subarray(0, toRead - firstN), offset + firstN);
+        return toRead;
+      }
+    }
+
     let allCached = true;
     for (let p = firstPage; p <= lastPage; p++) {
       const pg = pages[p];
@@ -302,6 +316,24 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // key construction, Map lookups, or LRU reordering overhead.
     const lastPage = ((position + length - 1) / PAGE_SIZE) | 0;
     const pages = node._pages;
+
+    // Two-page fast path for cross-page boundary writes
+    if (lastPage === firstPage + 1) {
+      const pg1 = pages[firstPage];
+      const pg2 = pages[lastPage];
+      if (pg1 && !pg1.evicted && pg2 && !pg2.evicted) {
+        const sp = node.storagePath;
+        const firstN = PAGE_SIZE - pageOffset;
+        pg1.data.set(buffer.subarray(offset, offset + firstN), pageOffset);
+        if (!pg1.dirty) { pg1.dirty = true; pageCache.addDirtyKey(pg1.key, sp); }
+        pg2.data.set(buffer.subarray(offset + firstN, offset + length), 0);
+        if (!pg2.dirty) { pg2.dirty = true; pageCache.addDirtyKey(pg2.key, sp); }
+        const end = position + length;
+        if (end > node.usedBytes) node.usedBytes = end;
+        return length;
+      }
+    }
+
     let allCached = true;
     for (let p = firstPage; p <= lastPage; p++) {
       const pg = pages[p];
