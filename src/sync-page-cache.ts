@@ -185,10 +185,14 @@ export class SyncPageCache {
     // per-iteration index computation.
     if (pageOffset + toRead <= PAGE_SIZE) {
       const page = this.getPage(path, firstPage);
-      buffer.set(
-        page.data.subarray(pageOffset, pageOffset + toRead),
-        offset,
-      );
+      if (pageOffset === 0 && toRead === PAGE_SIZE) {
+        buffer.set(page.data, offset);
+      } else {
+        buffer.set(
+          page.data.subarray(pageOffset, pageOffset + toRead),
+          offset,
+        );
+      }
       return toRead;
     }
 
@@ -230,21 +234,36 @@ export class SyncPageCache {
 
     // Read from cache (all multi-miss pages are pre-loaded; single misses use getPage)
     let bytesRead = 0;
-    let pos = position;
 
-    while (bytesRead < toRead) {
-      const pi = Math.floor(pos / PAGE_SIZE);
-      const po = pos - pi * PAGE_SIZE;
-      const bytesInPage = Math.min(PAGE_SIZE - po, toRead - bytesRead);
+    // First page (may be partial)
+    {
+      const firstN = Math.min(PAGE_SIZE - pageOffset, toRead);
+      const page = this.getPage(path, firstPage);
+      if (pageOffset === 0 && firstN === PAGE_SIZE) {
+        buffer.set(page.data, offset);
+      } else {
+        buffer.set(page.data.subarray(pageOffset, pageOffset + firstN), offset);
+      }
+      bytesRead = firstN;
+    }
 
-      const page = this.getPage(path, pi);
-      buffer.set(
-        page.data.subarray(po, po + bytesInPage),
-        offset + bytesRead,
-      );
+    // Full middle pages (no subarray needed)
+    for (let p = firstPage + 1; p < lastPage; p++) {
+      const page = this.getPage(path, p);
+      buffer.set(page.data, offset + bytesRead);
+      bytesRead += PAGE_SIZE;
+    }
 
-      bytesRead += bytesInPage;
-      pos += bytesInPage;
+    // Last page (may be partial, only if multi-page)
+    if (firstPage < lastPage) {
+      const remaining = toRead - bytesRead;
+      const page = this.getPage(path, lastPage);
+      if (remaining === PAGE_SIZE) {
+        buffer.set(page.data, offset + bytesRead);
+      } else {
+        buffer.set(page.data.subarray(0, remaining), offset + bytesRead);
+      }
+      bytesRead = toRead;
     }
 
     // Compensate for false hits: batch-loaded pages were counted as misses
