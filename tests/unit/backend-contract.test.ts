@@ -21,6 +21,7 @@ import { MemoryBackend } from "../../src/memory-backend.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { IdbBackend } from "../../src/idb-backend.js";
 import { OpfsBackend } from "../../src/opfs-backend.js";
+import { PreloadBackend } from "../../src/preload-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import type { StorageBackend } from "../../src/storage-backend.js";
 import type { SyncStorageBackend } from "../../src/sync-storage-backend.js";
@@ -72,6 +73,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
 interface BackendFactory {
   name: string;
   create: () => StorageBackend;
+  init?: () => Promise<void>;
   destroy?: () => Promise<void>;
 }
 
@@ -103,6 +105,15 @@ const factories: BackendFactory[] = [
       return b;
     },
   },
+  {
+    name: "PreloadBackend",
+    create: () => {
+      const remote = new MemoryBackend();
+      const pb = new PreloadBackend(remote);
+      factories[4].init = () => pb.init();
+      return syncToAsync(pb);
+    },
+  },
 ];
 
 // -------------------------------------------------------------------
@@ -113,8 +124,9 @@ for (const factory of factories) {
   describe(`StorageBackend contract: ${factory.name}`, () => {
     let backend: StorageBackend;
 
-    beforeEach(() => {
+    beforeEach(async () => {
       backend = factory.create();
+      if (factory.init) await factory.init();
     });
 
     afterEach(async () => {
