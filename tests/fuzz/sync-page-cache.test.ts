@@ -310,6 +310,12 @@ function runFuzzSession(
     const op = pickOp(rng);
 
     try {
+      // Validate index consistency before and after each operation.
+      // Catches corruption in the five concurrent data structures
+      // (cache, mruPage, filePages, dirtyKeys, dirtyFileKeys) that
+      // doesn't immediately manifest as incorrect data.
+      cache.assertInvariants();
+
       switch (op) {
         case "write": {
           // Sub-page write at random position within a file
@@ -527,6 +533,7 @@ function runFuzzSession(
           break;
         }
       }
+      cache.assertInvariants();
     } catch (e) {
       throw new Error(
         `Seed ${seed}, step ${step}, op ${op} failed: ${(e as Error).message}`,
@@ -534,7 +541,8 @@ function runFuzzSession(
     }
   }
 
-  // Final verification: flush everything and compare all files
+  // Final invariant check and verification: flush everything and compare all files
+  cache.assertInvariants();
   cache.flushAll();
   for (const path of activeFiles) {
     verifyBackendFile(backend, model, path);

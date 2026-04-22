@@ -921,4 +921,138 @@ export class SyncPageCache {
       this.bufferPool.push(buf);
     }
   }
+
+  /**
+   * Validate internal index consistency. Throws if any invariant is violated.
+   *
+   * Checks that the five concurrent data structures (cache, mruPage,
+   * filePages, dirtyKeys, dirtyFileKeys) are mutually consistent. Intended
+   * for use in fuzz tests to catch index corruption that doesn't immediately
+   * manifest as incorrect data but degrades performance or leaks memory.
+   */
+  assertInvariants(): void {
+    // 1. Cache size within bounds
+    if (this.cache.size > this.maxPages) {
+      throw new Error(
+        `cache size ${this.cache.size} exceeds maxPages ${this.maxPages}`,
+      );
+    }
+
+    // 2. No evicted pages in the cache
+    for (const [key, page] of this.cache) {
+      if (page.evicted) {
+        throw new Error(`evicted page ${key} still in cache`);
+      }
+    }
+
+    // 3. Every dirty key exists in cache with dirty=true
+    for (const key of this.dirtyKeys) {
+      const page = this.cache.get(key);
+      if (!page) {
+        throw new Error(`dirtyKeys contains ${key} not in cache`);
+      }
+      if (!page.dirty) {
+        throw new Error(`dirtyKeys contains ${key} but page.dirty is false`);
+      }
+    }
+
+    // 4. Every page with dirty=true is in dirtyKeys
+    for (const [key, page] of this.cache) {
+      if (page.dirty && !this.dirtyKeys.has(key)) {
+        throw new Error(`page ${key} is dirty but not in dirtyKeys`);
+      }
+    }
+
+    // 5. filePages covers exactly the keys in cache
+    const filePagesUnion = new Set<string>();
+    for (const [path, keys] of this.filePages) {
+      for (const key of keys) {
+        if (filePagesUnion.has(key)) {
+          throw new Error(`filePages key ${key} appears under multiple paths`);
+        }
+        filePagesUnion.add(key);
+        const page = this.cache.get(key);
+        if (!page) {
+          throw new Error(
+            `filePages[${path}] contains ${key} not in cache`,
+          );
+        }
+        if (page.path !== path) {
+          throw new Error(
+            `filePages[${path}] contains ${key} but page.path is ${page.path}`,
+          );
+        }
+      }
+    }
+    for (const key of this.cache.keys()) {
+      if (!filePagesUnion.has(key)) {
+        throw new Error(`cache key ${key} not tracked in filePages`);
+      }
+    }
+
+    // 6. dirtyFileKeys is consistent with dirtyKeys
+    const dirtyFileKeysUnion = new Set<string>();
+    for (const [path, keys] of this.dirtyFileKeys) {
+      if (keys.size === 0) {
+        throw new Error(
+          `dirtyFileKeys[${path}] is empty (should be deleted)`,
+        );
+      }
+      for (const key of keys) {
+        dirtyFileKeysUnion.add(key);
+        if (!this.dirtyKeys.has(key)) {
+          throw new Error(
+            `dirtyFileKeys[${path}] contains ${key} not in dirtyKeys`,
+          );
+        }
+        const page = this.cache.get(key);
+        if (page && page.path !== path) {
+          throw new Error(
+            `dirtyFileKeys[${path}] contains ${key} but page.path is ${page.path}`,
+          );
+        }
+      }
+      const fileKeys = this.filePages.get(path);
+      if (fileKeys) {
+        for (const key of keys) {
+          if (!fileKeys.has(key)) {
+            throw new Error(
+              `dirtyFileKeys[${path}] contains ${key} not in filePages[${path}]`,
+            );
+          }
+        }
+      }
+    }
+    for (const key of this.dirtyKeys) {
+      if (!dirtyFileKeysUnion.has(key)) {
+        throw new Error(
+          `dirtyKeys contains ${key} not tracked in dirtyFileKeys`,
+        );
+      }
+    }
+
+    // 7. mruPage (if set) is in the cache
+    if (this.mruPage !== null) {
+      if (!this.cache.has(this.mruPage.key)) {
+        throw new Error(
+          `mruPage ${this.mruPage.key} not in cache`,
+        );
+      }
+    }
+
+    // 8. Page key/path/pageIndex consistency
+    for (const [key, page] of this.cache) {
+      if (page.key !== key) {
+        throw new Error(
+          `cache key ${key} but page.key is ${page.key}`,
+        );
+      }
+      const expectedKey = pageKeyStr(page.path, page.pageIndex);
+      if (key !== expectedKey) {
+        throw new Error(
+          `page key ${key} doesn't match pageKeyStr(${page.path}, ${page.pageIndex}) = ${expectedKey}`,
+        );
+      }
+    }
+  }
 }
