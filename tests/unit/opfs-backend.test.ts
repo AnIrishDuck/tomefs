@@ -1210,4 +1210,140 @@ describe("OpfsBackend", () => {
       expect(await backend.maxPageIndex("/crash-file")).toBe(-1);
     });
   });
+
+  // -------------------------------------------------------------------
+  // deleteAll ordering
+  // -------------------------------------------------------------------
+
+  describe("deleteAll ordering", () => {
+    it("deleteAll removes both pages and metadata @fast", async () => {
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      await backend.writePage("/a", 0, filledPage(0xaa));
+      await backend.writeMeta("/a", meta);
+      await backend.writePage("/b", 0, filledPage(0xbb));
+      await backend.writePage("/b", 1, filledPage(0xbc));
+      await backend.writeMeta("/b", meta);
+
+      await backend.deleteAll(["/a", "/b"]);
+
+      expect(await backend.readPage("/a", 0)).toBeNull();
+      expect(await backend.readMeta("/a")).toBeNull();
+      expect(await backend.readPage("/b", 0)).toBeNull();
+      expect(await backend.readPage("/b", 1)).toBeNull();
+      expect(await backend.readMeta("/b")).toBeNull();
+      expect(await backend.listFiles()).toEqual([]);
+    });
+
+    it("deleteAll deletes metadata before pages (crash-safe ordering) @fast", async () => {
+      // Instrument the backend to record deletion order.
+      // The correct ordering is: delete metadata first (files become
+      // invisible to listFiles), then delete pages. If a crash occurs
+      // between the two operations, orphaned page directories are
+      // discoverable and removable by cleanupOrphanedPages.
+      const root = createFakeOpfsRoot();
+      const b = new OpfsBackend({ root: root as any });
+
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      await b.writePage("/f", 0, filledPage(0x42));
+      await b.writeMeta("/f", meta);
+
+      // Record call order by wrapping deleteMetas and deleteFiles
+      const order: string[] = [];
+      const origDeleteMetas = b.deleteMetas.bind(b);
+      const origDeleteFiles = b.deleteFiles.bind(b);
+      b.deleteMetas = async (paths: string[]) => {
+        order.push("deleteMetas");
+        return origDeleteMetas(paths);
+      };
+      b.deleteFiles = async (paths: string[]) => {
+        order.push("deleteFiles");
+        return origDeleteFiles(paths);
+      };
+
+      await b.deleteAll(["/f"]);
+
+      expect(order).toEqual(["deleteMetas", "deleteFiles"]);
+      await b.destroy();
+    });
+
+    it("partial deleteAll (metadata deleted, pages not) leaves orphans cleanable by cleanupOrphanedPages", async () => {
+      // Simulate crash after metadata deletion but before page deletion.
+      // This is the expected failure mode with metadata-first ordering.
+      // Orphaned page directories should be discoverable and cleanable.
+      const meta = { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      await backend.writePage("/victim", 0, filledPage(0x01));
+      await backend.writePage("/victim", 1, filledPage(0x02));
+      await backend.writeMeta("/victim", meta);
+
+      // Simulate partial deleteAll: delete metadata only (crash before page deletion)
+      await backend.deleteMetas(["/victim"]);
+
+      // File is invisible to listFiles — consistent view
+      expect(await backend.listFiles()).toEqual([]);
+
+      // Page directories are orphaned — cleanupOrphanedPages handles them
+      const removed = await backend.cleanupOrphanedPages();
+      expect(removed).toBe(1);
+      expect(await backend.readPage("/victim", 0)).toBeNull();
+      expect(await backend.readPage("/victim", 1)).toBeNull();
+    });
+
+    it("deleteAll does not affect unrelated files @fast", async () => {
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      await backend.writePage("/keep", 0, filledPage(0x01));
+      await backend.writeMeta("/keep", meta);
+      await backend.writePage("/remove", 0, filledPage(0x02));
+      await backend.writeMeta("/remove", meta);
+
+      await backend.deleteAll(["/remove"]);
+
+      expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readMeta("/keep")).toEqual(meta);
+      expect(await backend.readPage("/remove", 0)).toBeNull();
+      expect(await backend.readMeta("/remove")).toBeNull();
+    });
+
+    it("deleteAll empty array is a no-op @fast", async () => {
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      await backend.writePage("/f", 0, filledPage(0x42));
+      await backend.writeMeta("/f", meta);
+
+      await backend.deleteAll([]);
+
+      expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x42));
+      expect(await backend.readMeta("/f")).toEqual(meta);
+    });
+
+    it("deleteAll with pages-only paths (no metadata) still removes pages", async () => {
+      await backend.writePage("/orphan", 0, filledPage(0xdd));
+
+      await backend.deleteAll(["/orphan"]);
+
+      expect(await backend.readPage("/orphan", 0)).toBeNull();
+    });
+
+    it("deleteAll with metadata-only paths (no pages) still removes metadata", async () => {
+      const meta = { size: 0, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      await backend.writeMeta("/empty-file", meta);
+
+      await backend.deleteAll(["/empty-file"]);
+
+      expect(await backend.readMeta("/empty-file")).toBeNull();
+      expect(await backend.listFiles()).toEqual([]);
+    });
+
+    it("deleteAll followed by cleanupOrphanedPages finds no orphans", async () => {
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      for (let i = 0; i < 5; i++) {
+        await backend.writePage(`/f${i}`, 0, filledPage(i));
+        await backend.writeMeta(`/f${i}`, meta);
+      }
+
+      await backend.deleteAll(["/f0", "/f1", "/f2", "/f3", "/f4"]);
+
+      const orphans = await backend.cleanupOrphanedPages();
+      expect(orphans).toBe(0);
+      expect(await backend.listFiles()).toEqual([]);
+    });
+  });
 });

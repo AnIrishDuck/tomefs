@@ -558,8 +558,13 @@ export class OpfsBackend implements StorageBackend {
 
   async deleteAll(paths: string[]): Promise<void> {
     if (paths.length === 0) return;
-    await this.deleteFiles(paths);
+    // Delete metadata first so files become invisible to listFiles().
+    // If a crash occurs between the two operations, orphaned page
+    // directories (pages without metadata) are cleaned up by
+    // cleanupOrphanedPages(). The reverse order would leave stale
+    // metadata pointing at deleted pages — invisible to orphan cleanup.
     await this.deleteMetas(paths);
+    await this.deleteFiles(paths);
   }
 
   /**
