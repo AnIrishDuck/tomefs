@@ -389,7 +389,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const firstNewPage = node.usedBytes > 0 ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
       const lastPageIdx = Math.ceil(newSize / PAGE_SIZE) - 1;
       if (lastPageIdx >= firstNewPage) {
-        pageCache.markPageDirty(path, lastPageIdx);
+        pageCache.markPageDirtyNoRead(path, lastPageIdx);
       }
     }
 

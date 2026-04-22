@@ -711,6 +711,26 @@ export class PageCache {
   }
 
   /**
+   * Ensure a page exists in the cache and is marked dirty, without reading
+   * from the backend on cache miss.
+   *
+   * Used when growing a file via allocate(). The sentinel page is always
+   * beyond the current file extent, so it cannot exist in the backend —
+   * the readPage call would be a wasted round-trip returning null. This
+   * skips that read and creates a zero-filled page directly.
+   *
+   * IMPORTANT: Only safe for pages known to not exist in the backend.
+   * For pages that may have existing data, use markPageDirty() instead.
+   */
+  async markPageDirtyNoRead(path: string, pageIndex: number): Promise<void> {
+    const page = await this.getPageNoRead(path, pageIndex);
+    if (!page.dirty) {
+      page.dirty = true;
+      this.trackDirty(path, page.key);
+    }
+  }
+
+  /**
    * Register a page as dirty by its cache key and file path (no page lookup
    * or key construction).
    *
