@@ -98,9 +98,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
   // True when the backend may contain stale metadata not in the live tree.
   // Set on mount (crash recovery may have left orphans) and cleared after
-  // a successful orphan cleanup pass in syncfs. Operations that directly
-  // modify backend metadata (rename, unlink-with-open-fds) re-set this
-  // flag since a crash between their backend writes could leave orphans.
+  // a successful orphan cleanup pass in syncfs.
   //
   // On mount, this is set to true by default. If the backend has a clean-
   // shutdown marker (written at the end of a successful syncfs), we know
@@ -114,6 +112,30 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    *  Set when the marker is consumed during mount (restoreTree) and
    *  cleared after a successful syncfs writes it back. */
   let needsCleanMarker = false;
+
+  /**
+   * Delete the clean-shutdown marker from the backend before a multi-step
+   * backend operation (rename, unlink). These operations perform multiple
+   * non-atomic backend writes — if the process crashes between them, stale
+   * or duplicate metadata may remain. Without invalidation, the clean
+   * marker from the previous syncfs would tell the next mount that the
+   * backend is consistent when it isn't.
+   *
+   * Does NOT set needsOrphanCleanup — if the operation completes normally,
+   * no orphan cleanup is needed in the current session. The marker deletion
+   * only matters on crash: the next mount won't find a marker and will
+   * default to orphan cleanup.
+   *
+   * The next syncfs re-writes the marker as part of its metadata batch.
+   * Cost: one deleteMeta call per rename/unlink cycle (amortized — calls
+   * after the first before the next syncfs are no-ops).
+   */
+  function invalidateCleanMarker(): void {
+    if (!needsCleanMarker) {
+      backend.deleteMeta(CLEAN_MARKER_PATH);
+      needsCleanMarker = true;
+    }
+  }
 
   /**
    * Set of nodes with dirty metadata (not yet persisted to the backend).
@@ -452,6 +474,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (new_name.length > NAME_MAX) {
       throw new FS.ErrnoError(ENAMETOOLONG);
     }
+
+    invalidateCleanMarker();
+
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
@@ -591,6 +616,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const node = parent.contents[name];
     if (node && FS.isFile(node.mode)) {
       node.unlinked = true;
+      invalidateCleanMarker();
       if (node.openCount === 0) {
         pageCache.deleteFile(node.storagePath);
         backend.deleteMeta(node.storagePath);
