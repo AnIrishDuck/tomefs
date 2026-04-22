@@ -105,4 +105,9 @@ export class MemoryBackend implements StorageBackend {
   ): Promise<void> {
     this.inner.syncAll(pages, metas);
   }
+
+  async deleteAll(paths: string[]): Promise<void> {
+    await this.deleteFiles(paths);
+    await this.deleteMetas(paths);
+  }
 }
