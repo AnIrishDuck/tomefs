@@ -91,7 +91,8 @@ type Op =
   | { type: "writeMetas"; entries: Array<{ path: string; meta: FileMeta }> }
   | { type: "deleteMeta"; path: string }
   | { type: "deleteMetas"; paths: string[] }
-  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> };
+  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> }
+  | { type: "deleteAll"; paths: string[] };
 
 const FILE_PATHS = ["/a", "/b", "/c", "/d", "/sub/x", "/sub/y"];
 const MAX_PAGE_INDEX = 5;
@@ -129,6 +130,7 @@ function generateOps(rng: Rng, count: number): Op[] {
       ["deleteMeta", knownPaths.size > 0 ? 5 : 0],
       ["deleteMetas", knownPaths.size > 1 ? 3 : 0],
       ["syncAll", knownPaths.size > 0 ? 6 : 2],
+      ["deleteAll", knownPaths.size > 0 ? 4 : 0],
     ];
 
     const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -240,6 +242,12 @@ function generateOps(rng: Rng, count: number): Op[] {
         ops.push({ type: "syncAll", pages, metas });
         break;
       }
+
+      case "deleteAll": {
+        const paths = [...knownPaths].slice(0, 1 + rng.int(Math.min(4, knownPaths.size)));
+        ops.push({ type: "deleteAll", paths });
+        break;
+      }
     }
   }
 
@@ -284,6 +292,9 @@ async function executeOp(backend: StorageBackend, op: Op): Promise<void> {
       break;
     case "syncAll":
       await backend.syncAll(op.pages, op.metas);
+      break;
+    case "deleteAll":
+      await backend.deleteAll(op.paths);
       break;
   }
 }
@@ -387,6 +398,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] deleteMetas(${op.paths.join(", ")})`;
     case "syncAll":
       return `[${index}] syncAll(${op.pages.length} pages, ${op.metas.length} metas)`;
+    case "deleteAll":
+      return `[${index}] deleteAll(${op.paths.join(", ")})`;
   }
 }
 
