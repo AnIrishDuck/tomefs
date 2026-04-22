@@ -103,6 +103,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -130,6 +131,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -146,6 +148,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -165,6 +168,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -183,6 +187,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -205,6 +210,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -230,6 +236,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -243,6 +250,7 @@ export class IdbBackend implements StorageBackend {
 
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -267,6 +275,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -290,6 +299,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -318,6 +328,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -356,6 +367,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -371,6 +383,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -394,6 +407,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -406,6 +420,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -425,6 +440,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -437,6 +453,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -454,6 +471,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -469,6 +487,7 @@ export class IdbBackend implements StorageBackend {
       };
 
       request.onerror = () => reject(request.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
@@ -497,6 +516,7 @@ export class IdbBackend implements StorageBackend {
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
     });
   }
 
