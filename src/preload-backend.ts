@@ -377,6 +377,11 @@ export class PreloadBackend implements SyncStorageBackend {
     this.writeMetas(metas);
   }
 
+  deleteAll(paths: string[]): void {
+    this.deleteFiles(paths);
+    this.deleteMetas(paths);
+  }
+
   // --- Flush: persist dirty state back to the async backend ---
 
   /** Number of dirty pages pending flush. */

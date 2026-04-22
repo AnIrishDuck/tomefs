@@ -61,6 +61,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     maxPageIndex: async (p) => sync.maxPageIndex(p),
     maxPageIndexBatch: async (ps) => sync.maxPageIndexBatch(ps),
     syncAll: async (pages, metas) => sync.syncAll(pages, metas),
+    deleteAll: async (paths) => sync.deleteAll(paths),
   };
 }
 
@@ -1114,6 +1115,106 @@ for (const factory of factories) {
 
         const files = await backend.listFiles();
         expect(files.sort()).toEqual(["/a", "/b"]);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // deleteAll (atomic page + metadata deletion)
+    // ---------------------------------------------------------------
+
+    describe("deleteAll", () => {
+      it("deletes both pages and metadata for given paths @fast", async () => {
+        await backend.writePage("/a", 0, filledPage(0xaa));
+        await backend.writePage("/a", 1, filledPage(0xab));
+        await backend.writeMeta("/a", meta);
+        await backend.writePage("/b", 0, filledPage(0xbb));
+        await backend.writeMeta("/b", meta);
+
+        await backend.deleteAll(["/a", "/b"]);
+
+        expect(await backend.readPage("/a", 0)).toBeNull();
+        expect(await backend.readPage("/a", 1)).toBeNull();
+        expect(await backend.readMeta("/a")).toBeNull();
+        expect(await backend.readPage("/b", 0)).toBeNull();
+        expect(await backend.readMeta("/b")).toBeNull();
+        expect(await backend.listFiles()).toEqual([]);
+      });
+
+      it("empty array is a no-op @fast", async () => {
+        await backend.writePage("/f", 0, filledPage(0x42));
+        await backend.writeMeta("/f", meta);
+
+        await backend.deleteAll([]);
+
+        expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x42));
+        expect(await backend.readMeta("/f")).toEqual(meta);
+      });
+
+      it("non-existent paths are a no-op", async () => {
+        await backend.deleteAll(["/missing1", "/missing2"]);
+      });
+
+      it("does not affect unrelated files", async () => {
+        await backend.writePage("/keep", 0, filledPage(0x01));
+        await backend.writeMeta("/keep", meta);
+        await backend.writePage("/remove", 0, filledPage(0x02));
+        await backend.writeMeta("/remove", meta);
+
+        await backend.deleteAll(["/remove"]);
+
+        expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readMeta("/keep")).toEqual(meta);
+      });
+
+      it("handles paths with pages but no metadata", async () => {
+        await backend.writePage("/orphan", 0, filledPage(0xdd));
+
+        await backend.deleteAll(["/orphan"]);
+
+        expect(await backend.readPage("/orphan", 0)).toBeNull();
+      });
+
+      it("handles paths with metadata but no pages", async () => {
+        await backend.writeMeta("/meta-only", meta);
+
+        await backend.deleteAll(["/meta-only"]);
+
+        expect(await backend.readMeta("/meta-only")).toBeNull();
+      });
+
+      it("does not delete files with a prefix match", async () => {
+        await backend.writePage("/file1", 0, filledPage(0x01));
+        await backend.writeMeta("/file1", meta);
+        await backend.writePage("/file10", 0, filledPage(0x10));
+        await backend.writeMeta("/file10", meta);
+
+        await backend.deleteAll(["/file1"]);
+
+        expect(await backend.readPage("/file1", 0)).toBeNull();
+        expect(await backend.readMeta("/file1")).toBeNull();
+        expect(await backend.readPage("/file10", 0)).toEqual(filledPage(0x10));
+        expect(await backend.readMeta("/file10")).toEqual(meta);
+      });
+
+      it("countPages and maxPageIndex reflect deletion", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 3, filledPage(0x03));
+        await backend.writeMeta("/f", meta);
+
+        await backend.deleteAll(["/f"]);
+
+        expect(await backend.countPages("/f")).toBe(0);
+        expect(await backend.maxPageIndex("/f")).toBe(-1);
+      });
+
+      it("handles duplicate paths", async () => {
+        await backend.writePage("/f", 0, filledPage(0x42));
+        await backend.writeMeta("/f", meta);
+
+        await backend.deleteAll(["/f", "/f"]);
+
+        expect(await backend.readPage("/f", 0)).toBeNull();
+        expect(await backend.readMeta("/f")).toBeNull();
       });
     });
 

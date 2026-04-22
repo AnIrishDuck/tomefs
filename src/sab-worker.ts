@@ -414,6 +414,16 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.DELETE_ALL: {
+        const paths = params.paths as string[];
+        await this.backend.deleteAll(paths);
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          ok: true,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       default:
         throw new Error(`Unknown opcode: ${opcode}`);
     }

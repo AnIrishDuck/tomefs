@@ -128,6 +128,9 @@ class FailOnSyncBackend implements SyncStorageBackend {
     }
     this.inner.syncAll(pages, metas);
   }
+  deleteAll(paths: string[]): void {
+    this.inner.deleteAll(paths);
+  }
 }
 
 async function createHarness(backend: FailOnSyncBackend, maxPages: number) {
