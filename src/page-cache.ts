@@ -518,9 +518,14 @@ export class PageCache {
   /**
    * Clear dirty flags for pages previously returned by collectDirtyPages.
    *
-   * Only clears pages that are still in the cache and still dirty —
-   * pages dirtied between collectDirtyPages and commitDirtyPages are
-   * preserved for the next sync cycle.
+   * Only clears pages that are still in the cache and still dirty.
+   * Pages at DIFFERENT keys dirtied between collect and commit are
+   * preserved. However, if the SAME page (same path + pageIndex) is
+   * re-dirtied between collect and commit, the dirty flag is cleared
+   * unconditionally — there is no generation counter to distinguish
+   * "dirty from before collect" vs "newly dirty." This is safe because
+   * the collect→syncAll→commit sequence is fully synchronous in the
+   * typical usage path, so no writes can interleave.
    */
   commitDirtyPages(
     pages: Array<{ path: string; pageIndex: number }>,
