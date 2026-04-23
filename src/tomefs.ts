@@ -1315,7 +1315,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             // writes pages + metadata in a single atomic transaction.
             const dirtyPages = pageCache.collectDirtyPages();
             const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
-            const mountPrefix = mount.mountpoint || "";
 
             for (const node of dirtyMetaNodes) {
               // Skip fully cleaned-up unlinked nodes
@@ -1407,7 +1406,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             // MEMFS parent nodes. These nodes have tomefs stream_ops and
             // storagePaths, so reads/writes go through the page cache
             // correctly, but they don't appear in mount.root's subtree.
-            const mountPrefix = mount.mountpoint || "";
             for (const node of allFileNodes) {
               if (visited.has(node)) continue;
               if (node.unlinked) continue;
