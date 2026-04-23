@@ -1,6 +1,12 @@
 /** Page size in bytes — matches Postgres's internal page size. */
 export const PAGE_SIZE = 8192;
 
+/** log2(PAGE_SIZE) — for replacing division with right-shift on hot paths. */
+export const PAGE_SHIFT = 13;
+
+/** PAGE_SIZE - 1 — bitmask for replacing modulo with bitwise AND on hot paths. */
+export const PAGE_MASK = 0x1fff;
+
 /** Default maximum number of pages in the LRU cache (4096 * 8KB = 32MB). */
 export const DEFAULT_MAX_PAGES = 4096;
 

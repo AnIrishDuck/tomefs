@@ -1,5 +1,5 @@
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
-import { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
+import { PAGE_SIZE, PAGE_SHIFT, PAGE_MASK, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
 import type { CachedPage, CacheStats } from "./types.js";
 
 /**
@@ -177,8 +177,8 @@ export class SyncPageCache {
     const toRead = Math.min(length, available);
     if (toRead === 0) return 0;
 
-    const firstPage = Math.floor(position / PAGE_SIZE);
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
 
     // Fast path: entire read fits within a single page (common case for
     // page-aligned Postgres I/O). Skips multi-page setup, loop, and
@@ -193,7 +193,7 @@ export class SyncPageCache {
     }
 
     // Multi-page path
-    const lastPage = Math.floor((position + toRead - 1) / PAGE_SIZE);
+    const lastPage = (position + toRead - 1) >>> PAGE_SHIFT;
 
     // Find cache misses — only batch when there are multiple misses
     const missingIndices: number[] = [];
@@ -233,8 +233,8 @@ export class SyncPageCache {
     let pos = position;
 
     while (bytesRead < toRead) {
-      const pi = Math.floor(pos / PAGE_SIZE);
-      const po = pos - pi * PAGE_SIZE;
+      const pi = pos >>> PAGE_SHIFT;
+      const po = pos & PAGE_MASK;
       const bytesInPage = Math.min(PAGE_SIZE - po, toRead - bytesRead);
 
       const page = this.getPage(path, pi);
@@ -278,8 +278,8 @@ export class SyncPageCache {
     if (length === 0)
       return { bytesWritten: 0, newFileSize: currentFileSize };
 
-    const firstPage = Math.floor(position / PAGE_SIZE);
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
 
     // Pages at or beyond this index don't exist in the backend, so we can
     // skip the readPage call and create zero-filled pages directly. This
@@ -309,7 +309,7 @@ export class SyncPageCache {
     }
 
     // Multi-page path
-    const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
+    const lastPage = (position + length - 1) >>> PAGE_SHIFT;
 
     // Separate cache misses into pages that need backend reads vs pages
     // that can skip them (beyond file extent, or fully overwritten).
@@ -368,8 +368,8 @@ export class SyncPageCache {
     let pos = position;
 
     while (bytesWritten < length) {
-      const pi = Math.floor(pos / PAGE_SIZE);
-      const po = pos - pi * PAGE_SIZE;
+      const pi = pos >>> PAGE_SHIFT;
+      const po = pos & PAGE_MASK;
       const bytesInPage = Math.min(PAGE_SIZE - po, length - bytesWritten);
 
       // Skip backend read for fully-overwritten pages (po === 0 means
