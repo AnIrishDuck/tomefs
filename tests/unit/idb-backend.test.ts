@@ -819,4 +819,244 @@ describe("IdbBackend", () => {
       }
     });
   });
+
+  // -------------------------------------------------------------------
+  // deleteFiles (batch)
+  // -------------------------------------------------------------------
+
+  describe("deleteFiles (batch)", () => {
+    it("deletes pages for multiple files @fast", async () => {
+      await backend.writePage("/a", 0, filledPage(0x01));
+      await backend.writePage("/b", 0, filledPage(0x02));
+      await backend.writePage("/c", 0, filledPage(0x03));
+
+      await backend.deleteFiles(["/a", "/b"]);
+
+      expect(await backend.readPage("/a", 0)).toBeNull();
+      expect(await backend.readPage("/b", 0)).toBeNull();
+      expect(await backend.readPage("/c", 0)).toEqual(filledPage(0x03));
+    });
+
+    it("empty array is a no-op @fast", async () => {
+      await backend.deleteFiles([]);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // deleteAll (atomic pages + metadata deletion)
+  // -------------------------------------------------------------------
+
+  describe("deleteAll", () => {
+    it("removes both pages and metadata for given paths @fast", async () => {
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 };
+      await backend.writePage("/a", 0, filledPage(0x01));
+      await backend.writePage("/a", 1, filledPage(0x02));
+      await backend.writeMeta("/a", meta);
+      await backend.writePage("/b", 0, filledPage(0x03));
+      await backend.writeMeta("/b", meta);
+
+      await backend.deleteAll(["/a", "/b"]);
+
+      expect(await backend.readPage("/a", 0)).toBeNull();
+      expect(await backend.readPage("/a", 1)).toBeNull();
+      expect(await backend.readMeta("/a")).toBeNull();
+      expect(await backend.readPage("/b", 0)).toBeNull();
+      expect(await backend.readMeta("/b")).toBeNull();
+    });
+
+    it("does not affect other files @fast", async () => {
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 };
+      await backend.writePage("/target", 0, filledPage(0x01));
+      await backend.writeMeta("/target", meta);
+      await backend.writePage("/keep", 0, filledPage(0x02));
+      await backend.writeMeta("/keep", meta);
+
+      await backend.deleteAll(["/target"]);
+
+      expect(await backend.readPage("/target", 0)).toBeNull();
+      expect(await backend.readMeta("/target")).toBeNull();
+      expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0x02));
+      expect(await backend.readMeta("/keep")).toEqual(meta);
+    });
+
+    it("empty array is a no-op @fast", async () => {
+      await backend.deleteAll([]);
+    });
+
+    it("non-existent paths are a no-op @fast", async () => {
+      await backend.deleteAll(["/nonexistent1", "/nonexistent2"]);
+    });
+
+    it("rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-deleteall-abort-${dbCounter++}`;
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(dbName, 1);
+        req.onupgradeneeded = () => {
+          const d = req.result;
+          if (!d.objectStoreNames.contains("pages"))
+            d.createObjectStore("pages");
+          if (!d.objectStoreNames.contains("file_meta"))
+            d.createObjectStore("file_meta");
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const b = new IdbBackend({ db });
+
+      await b.writePage("/file", 0, filledPage(0x01));
+      await b.writeMeta("/file", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      db.close();
+
+      await expect(b.deleteAll(["/file"])).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // countPages / countPagesBatch
+  // -------------------------------------------------------------------
+
+  describe("countPages", () => {
+    it("returns 0 for non-existent file @fast", async () => {
+      expect(await backend.countPages("/missing")).toBe(0);
+    });
+
+    it("returns correct count after writes @fast", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 1, filledPage(0x02));
+      await backend.writePage("/file", 5, filledPage(0x03));
+
+      expect(await backend.countPages("/file")).toBe(3);
+    });
+
+    it("reflects deletions @fast", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 1, filledPage(0x02));
+
+      await backend.deletePagesFrom("/file", 1);
+
+      expect(await backend.countPages("/file")).toBe(1);
+    });
+  });
+
+  describe("countPagesBatch", () => {
+    it("returns counts for multiple files @fast", async () => {
+      await backend.writePage("/a", 0, filledPage(0x01));
+      await backend.writePage("/a", 1, filledPage(0x02));
+      await backend.writePage("/b", 0, filledPage(0x03));
+
+      const counts = await backend.countPagesBatch(["/a", "/b", "/missing"]);
+      expect(counts).toEqual([2, 1, 0]);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // maxPageIndex / maxPageIndexBatch
+  // -------------------------------------------------------------------
+
+  describe("maxPageIndex", () => {
+    it("returns -1 for non-existent file @fast", async () => {
+      expect(await backend.maxPageIndex("/missing")).toBe(-1);
+    });
+
+    it("returns highest page index @fast", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 3, filledPage(0x02));
+      await backend.writePage("/file", 7, filledPage(0x03));
+
+      expect(await backend.maxPageIndex("/file")).toBe(7);
+    });
+
+    it("reflects deletions @fast", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 5, filledPage(0x02));
+
+      await backend.deletePagesFrom("/file", 3);
+
+      expect(await backend.maxPageIndex("/file")).toBe(0);
+    });
+  });
+
+  describe("maxPageIndexBatch", () => {
+    it("returns indices for multiple files @fast", async () => {
+      await backend.writePage("/a", 0, filledPage(0x01));
+      await backend.writePage("/a", 4, filledPage(0x02));
+      await backend.writePage("/b", 2, filledPage(0x03));
+
+      const indices = await backend.maxPageIndexBatch(["/a", "/b", "/missing"]);
+      expect(indices).toEqual([4, 2, -1]);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // readMetas (batch)
+  // -------------------------------------------------------------------
+
+  describe("readMetas (batch)", () => {
+    it("reads multiple metadata entries @fast", async () => {
+      const meta1 = { size: 100, mode: 0o100644, ctime: 1000, mtime: 2000 };
+      const meta2 = { size: 200, mode: 0o100755, ctime: 3000, mtime: 4000 };
+      await backend.writeMeta("/a", meta1);
+      await backend.writeMeta("/b", meta2);
+
+      const results = await backend.readMetas(["/a", "/b", "/missing"]);
+      expect(results).toHaveLength(3);
+      expect(results[0]).toEqual(meta1);
+      expect(results[1]).toEqual(meta2);
+      expect(results[2]).toBeNull();
+    });
+
+    it("empty array returns empty array @fast", async () => {
+      const results = await backend.readMetas([]);
+      expect(results).toEqual([]);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // syncAll (atomic pages + metadata write)
+  // -------------------------------------------------------------------
+
+  describe("syncAll", () => {
+    it("writes pages and metadata atomically @fast", async () => {
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 };
+
+      await backend.syncAll(
+        [
+          { path: "/file1", pageIndex: 0, data: filledPage(0x01) },
+          { path: "/file1", pageIndex: 1, data: filledPage(0x02) },
+        ],
+        [{ path: "/file1", meta }],
+      );
+
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/file1", 1)).toEqual(filledPage(0x02));
+      expect(await backend.readMeta("/file1")).toEqual(meta);
+    });
+
+    it("handles empty inputs @fast", async () => {
+      await backend.syncAll([], []);
+    });
+
+    it("handles pages-only @fast", async () => {
+      await backend.syncAll(
+        [{ path: "/file", pageIndex: 0, data: filledPage(0xab) }],
+        [],
+      );
+
+      expect(await backend.readPage("/file", 0)).toEqual(filledPage(0xab));
+    });
+
+    it("handles metadata-only @fast", async () => {
+      const meta = { size: 0, mode: 0o100644, ctime: 0, mtime: 0 };
+      await backend.syncAll([], [{ path: "/file", meta }]);
+
+      expect(await backend.readMeta("/file")).toEqual(meta);
+    });
+  });
 });
