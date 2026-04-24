@@ -164,6 +164,13 @@ class ReferenceModel {
     this.meta.delete(path);
   }
 
+  deleteAll(paths: string[]): void {
+    for (const path of paths) {
+      this.deleteFile(path);
+      this.deleteMeta(path);
+    }
+  }
+
   listFiles(): string[] {
     return [...this.meta.keys()].sort();
   }
@@ -196,6 +203,7 @@ type OpType =
   | "deleteMeta"
   | "deleteMetas"
   | "syncAll"
+  | "deleteAll"
   | "readVerify";
 
 const OP_WEIGHTS: Array<[OpType, number]> = [
@@ -209,6 +217,7 @@ const OP_WEIGHTS: Array<[OpType, number]> = [
   ["deleteMeta", 5],
   ["deleteMetas", 3],
   ["syncAll", 5],
+  ["deleteAll", 5],
   ["readVerify", 10],
 ];
 
@@ -362,6 +371,15 @@ function executeOp(
       model.writePage(path, pageIndex, data);
       model.writeMeta(path, meta);
       activeFiles.add(path);
+      break;
+    }
+
+    case "deleteAll": {
+      if (activeFiles.size === 0) break;
+      const count = Math.min(rng.int(3) + 1, activeFiles.size);
+      const paths = [...activeFiles].slice(0, count);
+      preload.deleteAll(paths);
+      model.deleteAll(paths);
       break;
     }
 
@@ -575,6 +593,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
       ["deleteMeta", 10],
       ["deleteMetas", 5],
       ["syncAll", 5],
+      ["deleteAll", 8],
       ["readVerify", 5],
     ]);
 
@@ -598,6 +617,7 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
       ["deleteMeta", 3],
       ["deleteMetas", 2],
       ["syncAll", 5],
+      ["deleteAll", 5],
       ["readVerify", 10],
     ]);
 
@@ -621,11 +641,39 @@ describe("PreloadBackend flush roundtrip fuzz", () => {
       ["deleteMeta", 2],
       ["deleteMetas", 1],
       ["syncAll", 5],
+      ["deleteAll", 3],
       ["readVerify", 10],
     ]);
 
     for (let seed = 600; seed <= 602; seed++) {
       it(`seed ${seed} (truncation stress)`, async () => {
+        await runFuzzSession(seed, 80, 5, opTable);
+      });
+    }
+  });
+
+  // deleteAll stress: biased toward deleteAll + writes to exercise the
+  // combined page+metadata deletion path and its interaction with flush
+  // partitioning. deleteAll adds paths to BOTH deletedFiles and deletedMeta,
+  // so subsequent writes at the same path must be deferred to the late batch.
+  describe("deleteAll stress (80 ops × 5 cycles)", () => {
+    const opTable = buildOpTable([
+      ["writePage", 15],
+      ["writePages", 5],
+      ["deleteFile", 3],
+      ["renameFile", 5],
+      ["deletePagesFrom", 3],
+      ["writeMeta", 15],
+      ["writeMetas", 3],
+      ["deleteMeta", 3],
+      ["deleteMetas", 2],
+      ["syncAll", 5],
+      ["deleteAll", 20],
+      ["readVerify", 10],
+    ]);
+
+    for (let seed = 700; seed <= 704; seed++) {
+      it(`seed ${seed} (deleteAll stress)`, async () => {
         await runFuzzSession(seed, 80, 5, opTable);
       });
     }
