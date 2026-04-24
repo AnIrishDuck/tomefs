@@ -170,6 +170,10 @@ class CrashBackend implements SyncStorageBackend {
     this.writePages(pages);
     this.writeMetas(metas);
   }
+  deleteAll(paths: string[]) {
+    this.deleteFiles(paths);
+    this.deleteMetas(paths);
+  }
 }
 
 async function mountTome(backend: SyncStorageBackend, maxPages?: number) {
@@ -348,7 +352,7 @@ describe("clean marker invalidation on unlink with open fds", () => {
     FS.close(s);
   });
 
-  it("unlink without open fd does not invalidate marker @fast", async () => {
+  it("unlink without open fd invalidates marker (deleteAll defense-in-depth) @fast", async () => {
     const { FS, tomefs } = await mountTome(backend);
 
     // Create file, close it, syncfs
@@ -361,11 +365,12 @@ describe("clean marker invalidation on unlink with open fds", () => {
     // Clean marker should exist
     expect(backend.readMeta(CLEAN_MARKER_PATH)).not.toBeNull();
 
-    // Unlink without open fds — single backend operation, no crash window
+    // Unlink without open fds uses deleteAll (atomic for IDB) but still
+    // invalidates the marker for non-atomic backends (OPFS)
     FS.unlink(`${MOUNT}/no-fd.txt`);
 
-    // Clean marker should still exist (no multi-step operation)
-    expect(backend.readMeta(CLEAN_MARKER_PATH)).not.toBeNull();
+    // Clean marker should be deleted
+    expect(backend.readMeta(CLEAN_MARKER_PATH)).toBeNull();
   });
 });
 

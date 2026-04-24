@@ -98,10 +98,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
   // True when the backend may contain stale metadata not in the live tree.
   // Set on mount (crash recovery may have left orphans) and cleared after
-  // a successful orphan cleanup pass in syncfs. Operations that directly
-  // modify backend metadata (rename, unlink-with-open-fds) re-set this
-  // flag via invalidateCleanMarker() since a crash between their backend
-  // writes could leave orphans.
+  // a successful orphan cleanup pass in syncfs. Operations that modify
+  // backend metadata non-atomically (rename, unlink) re-set this flag via
+  // invalidateCleanMarker() since a crash between their backend writes
+  // could leave orphans.
   //
   // On mount, this is set to true by default. If the backend has a clean-
   // shutdown marker (written at the end of a successful syncfs), we know
@@ -117,12 +117,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   let needsCleanMarker = false;
 
   /**
-   * Invalidate the clean-shutdown marker before a multi-step backend
-   * operation (rename, unlink-with-open-fds). These operations perform
-   * multiple non-atomic backend writes — if the process crashes between
-   * them, stale metadata may remain. Without invalidation, the clean
-   * marker from the previous syncfs would tell the next mount that the
-   * backend is consistent when it isn't.
+   * Invalidate the clean-shutdown marker before a backend operation that
+   * may not be atomic (rename, unlink). Even deleteAll — which is a single
+   * IDB transaction — may be non-atomic on other backends (e.g. OPFS).
+   * Without invalidation, the clean marker from the previous syncfs would
+   * tell the next mount that the backend is consistent when it isn't.
    *
    * Only deletes the marker from the backend — does NOT set
    * needsOrphanCleanup. If the operation completes successfully, no
@@ -626,8 +625,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (node && FS.isFile(node.mode)) {
       node.unlinked = true;
       if (node.openCount === 0) {
-        pageCache.deleteFile(node.storagePath);
-        backend.deleteMeta(node.storagePath);
+        invalidateCleanMarker();
+        pageCache.discardFile(node.storagePath);
+        backend.deleteAll([node.storagePath]);
       } else {
         // Open fds exist — move pages to a unique temporary path so the
         // original storagePath is free for reuse by new files or renames.
@@ -931,9 +931,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       if (FS.isFile(node.mode)) {
         node.openCount--;
         if (node.unlinked && node.openCount === 0) {
-          // Last fd closed on an unlinked file — clean up pages + marker metadata
-          pageCache.deleteFile(node.storagePath);
-          backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
+          pageCache.discardFile(node.storagePath);
+          backend.deleteAll([node.storagePath]);
           allFileNodes.delete(node);
           // Clean up dirty tracking. If the file was written to via fd after
           // unlinking (valid POSIX pattern for temp files), markMetaDirty

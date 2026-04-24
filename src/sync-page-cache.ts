@@ -615,11 +615,12 @@ export class SyncPageCache {
   }
 
   /**
-   * Delete all pages for a file from both cache and backend.
+   * Remove all pages for a file from the cache without touching the backend.
+   * Callers that need atomic backend cleanup (e.g. deleteAll) use this to
+   * clear the cache separately from the backend operation.
    * O(pages-for-file) via filePages index.
    */
-  deleteFile(path: string): void {
-    // Remove from cache (no flush — file is being deleted)
+  discardFile(path: string): void {
     const keys = this.filePages.get(path);
     if (keys) {
       for (const key of keys) {
@@ -633,6 +634,14 @@ export class SyncPageCache {
       this.filePages.delete(path);
     }
     this.dirtyFileKeys.delete(path);
+  }
+
+  /**
+   * Delete all pages for a file from both cache and backend.
+   * O(pages-for-file) via filePages index.
+   */
+  deleteFile(path: string): void {
+    this.discardFile(path);
     this.backend.deleteFile(path);
   }
 
