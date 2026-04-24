@@ -90,7 +90,8 @@ type Op =
   | { type: "writeMetas"; entries: Array<{ path: string; meta: FileMeta }> }
   | { type: "deleteMeta"; path: string }
   | { type: "deleteMetas"; paths: string[] }
-  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> };
+  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> }
+  | { type: "deleteAll"; paths: string[] };
 
 // ---------------------------------------------------------------
 // Operation generation
@@ -243,6 +244,17 @@ const OP_TABLE: WeightedOp[] = [
       return { type: "syncAll", pages, metas };
     },
   },
+  {
+    weight: 5,
+    generate: (rng) => {
+      const count = 1 + rng.int(3);
+      const paths = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        paths.add(rng.pick(FILE_PATHS));
+      }
+      return { type: "deleteAll", paths: [...paths] };
+    },
+  },
 ];
 
 const TOTAL_WEIGHT = OP_TABLE.reduce((sum, op) => sum + op.weight, 0);
@@ -301,6 +313,9 @@ async function executeOp(backend: StorageBackend, op: Op): Promise<void> {
         op.pages.map((p) => ({ ...p, data: new Uint8Array(p.data) })),
         op.metas.map((e) => ({ path: e.path, meta: { ...e.meta } })),
       );
+      break;
+    case "deleteAll":
+      await backend.deleteAll(op.paths);
       break;
   }
 }
@@ -418,6 +433,8 @@ function formatOp(op: Op): string {
       return `deleteMetas([${op.paths.join(", ")}])`;
     case "syncAll":
       return `syncAll(pages=[${op.pages.map((p) => `${p.path}:${p.pageIndex}`).join(", ")}], metas=[${op.metas.map((m) => m.path).join(", ")}])`;
+    case "deleteAll":
+      return `deleteAll([${op.paths.join(", ")}])`;
   }
 }
 

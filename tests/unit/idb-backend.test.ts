@@ -819,4 +819,125 @@ describe("IdbBackend", () => {
       }
     });
   });
+
+  // -------------------------------------------------------------------
+  // deleteAll (atomic page + metadata deletion via single IDB transaction)
+  // -------------------------------------------------------------------
+
+  describe("deleteAll", () => {
+    it("deletes pages and metadata for multiple paths @fast", async () => {
+      await backend.writePage("/a", 0, filledPage(0xaa));
+      await backend.writePage("/a", 1, filledPage(0xab));
+      await backend.writeMeta("/a", { size: 8192, mode: 0o100644, ctime: 1, mtime: 2 });
+      await backend.writePage("/b", 0, filledPage(0xbb));
+      await backend.writeMeta("/b", { size: 4096, mode: 0o100644, ctime: 3, mtime: 4 });
+
+      await backend.deleteAll(["/a", "/b"]);
+
+      expect(await backend.readPage("/a", 0)).toBeNull();
+      expect(await backend.readPage("/a", 1)).toBeNull();
+      expect(await backend.readMeta("/a")).toBeNull();
+      expect(await backend.readPage("/b", 0)).toBeNull();
+      expect(await backend.readMeta("/b")).toBeNull();
+      expect(await backend.listFiles()).toEqual([]);
+    });
+
+    it("empty array is a no-op @fast", async () => {
+      await backend.writePage("/f", 0, filledPage(0x42));
+      await backend.writeMeta("/f", { size: 8192, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      await backend.deleteAll([]);
+
+      expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x42));
+      expect(await backend.readMeta("/f")).not.toBeNull();
+    });
+
+    it("non-existent paths are a no-op", async () => {
+      await backend.deleteAll(["/missing1", "/missing2"]);
+    });
+
+    it("does not affect unrelated files @fast", async () => {
+      await backend.writePage("/keep", 0, filledPage(0x01));
+      await backend.writeMeta("/keep", { size: 8192, mode: 0o100644, ctime: 1, mtime: 2 });
+      await backend.writePage("/remove", 0, filledPage(0x02));
+      await backend.writeMeta("/remove", { size: 4096, mode: 0o100644, ctime: 3, mtime: 4 });
+
+      await backend.deleteAll(["/remove"]);
+
+      expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readMeta("/keep")).not.toBeNull();
+      expect(await backend.readPage("/remove", 0)).toBeNull();
+      expect(await backend.readMeta("/remove")).toBeNull();
+    });
+
+    it("handles paths with pages but no metadata", async () => {
+      await backend.writePage("/orphan", 0, filledPage(0xdd));
+      await backend.writePage("/orphan", 5, filledPage(0xee));
+
+      await backend.deleteAll(["/orphan"]);
+
+      expect(await backend.readPage("/orphan", 0)).toBeNull();
+      expect(await backend.readPage("/orphan", 5)).toBeNull();
+    });
+
+    it("handles paths with metadata but no pages", async () => {
+      await backend.writeMeta("/meta-only", { size: 0, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      await backend.deleteAll(["/meta-only"]);
+
+      expect(await backend.readMeta("/meta-only")).toBeNull();
+    });
+
+    it("does not delete files with a prefix match", async () => {
+      await backend.writePage("/file1", 0, filledPage(0x01));
+      await backend.writeMeta("/file1", { size: 8192, mode: 0o100644, ctime: 1, mtime: 2 });
+      await backend.writePage("/file10", 0, filledPage(0x10));
+      await backend.writeMeta("/file10", { size: 8192, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      await backend.deleteAll(["/file1"]);
+
+      expect(await backend.readPage("/file1", 0)).toBeNull();
+      expect(await backend.readMeta("/file1")).toBeNull();
+      expect(await backend.readPage("/file10", 0)).toEqual(filledPage(0x10));
+      expect(await backend.readMeta("/file10")).not.toBeNull();
+    });
+
+    it("countPages and maxPageIndex reflect deletion", async () => {
+      await backend.writePage("/f", 0, filledPage(0x01));
+      await backend.writePage("/f", 3, filledPage(0x03));
+      await backend.writeMeta("/f", { size: 32768, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      await backend.deleteAll(["/f"]);
+
+      expect(await backend.countPages("/f")).toBe(0);
+      expect(await backend.maxPageIndex("/f")).toBe(-1);
+    });
+
+    it("handles duplicate paths gracefully", async () => {
+      await backend.writePage("/f", 0, filledPage(0x42));
+      await backend.writeMeta("/f", { size: 8192, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      await backend.deleteAll(["/f", "/f"]);
+
+      expect(await backend.readPage("/f", 0)).toBeNull();
+      expect(await backend.readMeta("/f")).toBeNull();
+    });
+
+    it("write after deleteAll creates fresh state", async () => {
+      await backend.writePage("/f", 0, filledPage(0x01));
+      await backend.writePage("/f", 1, filledPage(0x02));
+      await backend.writeMeta("/f", { size: 16384, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      await backend.deleteAll(["/f"]);
+
+      await backend.writePage("/f", 0, filledPage(0xff));
+      await backend.writeMeta("/f", { size: 8192, mode: 0o100644, ctime: 10, mtime: 20 });
+
+      expect(await backend.readPage("/f", 0)).toEqual(filledPage(0xff));
+      expect(await backend.readPage("/f", 1)).toBeNull();
+      expect(await backend.countPages("/f")).toBe(1);
+      const meta = await backend.readMeta("/f");
+      expect(meta!.ctime).toBe(10);
+    });
+  });
 });

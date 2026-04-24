@@ -170,6 +170,10 @@ class CrashBackend implements SyncStorageBackend {
     this.writePages(pages);
     this.writeMetas(metas);
   }
+  deleteAll(ps: string[]) {
+    this.deleteFiles(ps);
+    this.deleteMetas(ps);
+  }
 }
 
 async function mountTome(backend: SyncStorageBackend, maxPages?: number) {
