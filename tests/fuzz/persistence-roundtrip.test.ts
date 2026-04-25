@@ -157,7 +157,8 @@ type Op =
   | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "allocate"; path: string; offset: number; length: number }
   | { type: "utime"; path: string; atime: number; mtime: number }
-  | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array };
+  | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array }
+  | { type: "fchmodFd"; fdId: number; mode: number };
 
 const DIR_NAMES = ["alpha", "beta", "gamma"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"];
@@ -233,6 +234,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["allocate", allFiles.length > 0 ? 8 : 0],
     ["utime", allFiles.length > 0 ? 6 : 0],
     ["mmapWriteAt", allFiles.length > 0 ? 6 : 0],
+    ["fchmodFd", openFdIds.length > 0 ? 5 : 0],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -458,6 +460,12 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "mmapWriteAt", path, position, data };
     }
 
+    case "fchmodFd": {
+      const fdId = rng.pick(openFdIds);
+      const modeChoices = [0o444, 0o555, 0o644, 0o666, 0o755, 0o777];
+      return { type: "fchmodFd", fdId, mode: rng.pick(modeChoices) };
+    }
+
     default:
       return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(10) };
   }
@@ -614,6 +622,13 @@ function execOp(FS: EmscriptenFS, op: Op, streams: StreamMap): boolean {
         buf.set(op.data);
         s.stream_ops.msync(s, buf, op.position, op.data.length, 0);
         FS.close(s);
+        return true;
+      }
+
+      case "fchmodFd": {
+        const s = streams.get(op.fdId);
+        if (!s) return false;
+        FS.fchmod(s.fd, op.mode);
         return true;
       }
 
@@ -888,6 +903,15 @@ function updateModel(model: FSModel, op: Op): void {
       file.mtime = null;
       break;
     }
+
+    case "fchmodFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (!fd) break;
+      const file = model.files.get(fd.path);
+      if (!file) break;
+      file.mode = (file.mode & 0o170000) | (op.mode & 0o7777);
+      break;
+    }
   }
 }
 
@@ -939,6 +963,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
     case "mmapWriteAt":
       return `[${index}] mmapWriteAt(${op.path}, @${op.position}, ${op.data.length}B)`;
+    case "fchmodFd":
+      return `[${index}] fchmodFd(fdId=${op.fdId}, 0o${op.mode.toString(8)})`;
   }
 }
 
@@ -1245,8 +1271,8 @@ describe("fuzz: persistence roundtrip testing", () => {
       await runPersistenceRoundtrip(20001, OPS, CACHE, INTERVAL);
     }, 30_000);
 
-    it("seed 20002", async () => {
-      await runPersistenceRoundtrip(20002, OPS, CACHE, INTERVAL);
+    it("seed 20005", async () => {
+      await runPersistenceRoundtrip(20005, OPS, CACHE, INTERVAL);
     }, 30_000);
 
     it("seed 20003", async () => {
