@@ -172,6 +172,10 @@ type Op =
   | { type: "mmapRead"; fdId: number; length: number; position: number }
   | { type: "mmapWrite"; fdId: number; length: number; position: number; data: Uint8Array }
   | { type: "allocateFd"; fdId: number; offset: number; length: number }
+  | { type: "fchmodFd"; fdId: number; mode: number }
+  | { type: "fstatOp"; fdId: number }
+  | { type: "lstatOp"; path: string }
+  | { type: "openExcl"; path: string }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -221,6 +225,10 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["mmapRead", model.openFds.size > 0 ? 6 : 0],
     ["mmapWrite", model.openFds.size > 0 ? 6 : 0],
     ["allocateFd", model.openFds.size > 0 ? 6 : 0],
+    ["fchmodFd", model.openFds.size > 0 ? 5 : 0],
+    ["fstatOp", model.openFds.size > 0 ? 5 : 0],
+    ["lstatOp", allSymlinks.length > 0 ? 4 : 0],
+    ["openExcl", allFiles.length > 0 ? 4 : 0],
     ["syncfs", 3],
   ];
 
@@ -504,6 +512,26 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "allocateFd", fdId, offset, length };
     }
 
+    case "fchmodFd": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const modeChoices = [0o444, 0o555, 0o644, 0o666, 0o755, 0o777];
+      return { type: "fchmodFd", fdId, mode: rng.pick(modeChoices) };
+    }
+
+    case "fstatOp": {
+      const fds = [...model.openFds.keys()];
+      return { type: "fstatOp", fdId: rng.pick(fds) };
+    }
+
+    case "lstatOp":
+      return { type: "lstatOp", path: rng.pick(allSymlinks) };
+
+    case "openExcl": {
+      const path = rng.pick(allFiles);
+      return { type: "openExcl", path };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -778,6 +806,38 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         return { error: null, size: fstatResult.size };
       }
 
+      case "fchmodFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        FS.fchmod(stream.fd ?? stream, op.mode);
+        return { error: null };
+      }
+
+      case "fstatOp": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        const st = FS.fstat(stream.fd ?? stream);
+        return { error: null, size: st.size, data: new TextEncoder().encode(
+          `${st.size}:${st.mode}`,
+        )};
+      }
+
+      case "lstatOp": {
+        const st = FS.lstat(op.path);
+        // For symlinks, size is the link target length — differs between
+        // MEMFS and tomefs due to mount prefix rewriting ("/a.dat" vs
+        // "/tome/a.dat"). Only encode mode and isLink for comparison.
+        return { error: null, data: new TextEncoder().encode(
+          `${st.mode}:${FS.isLink(st.mode)}`,
+        )};
+      }
+
+      case "openExcl": {
+        const s = FS.open(op.path, O.WRONLY | O.CREAT | O.EXCL, 0o666);
+        FS.close(s);
+        return { error: null };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -998,6 +1058,14 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] mmapWrite(fdId=${op.fdId}, len=${op.length}, pos=${op.position}, ${op.data.length}B)`;
     case "allocateFd":
       return `[${index}] allocateFd(fdId=${op.fdId}, offset=${op.offset}, len=${op.length})`;
+    case "fchmodFd":
+      return `[${index}] fchmodFd(fdId=${op.fdId}, 0o${op.mode.toString(8)})`;
+    case "fstatOp":
+      return `[${index}] fstatFd(fdId=${op.fdId})`;
+    case "lstatOp":
+      return `[${index}] lstat(${op.path})`;
+    case "openExcl":
+      return `[${index}] openExcl(${op.path})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -1282,6 +1350,24 @@ async function runFuzzSequence(
       expect(tomeStat.mode, `${desc}: mode mismatch after chmod`).toBe(memStat.mode);
     }
 
+    // For fchmod, verify mode via fstat (path may not exist if file was unlinked)
+    if (op.type === "fchmodFd" && !memResult.error) {
+      const memStream = memFdStreams.get(op.fdId);
+      const tomeStream = tomeFdStreams.get(op.fdId);
+      if (memStream && tomeStream) {
+        const memStat = memFS.fstat(memStream.fd ?? memStream);
+        const tomeStat = tomeFS.fstat(tomeStream.fd ?? tomeStream);
+        expect(tomeStat.mode, `${desc}: mode mismatch after fchmod`).toBe(memStat.mode);
+      }
+    }
+
+    // For fstat and lstat, compare encoded size:mode strings
+    if ((op.type === "fstatOp" || op.type === "lstatOp") && !memResult.error && memResult.data && tomeResult.data) {
+      const memStr = new TextDecoder().decode(memResult.data);
+      const tomeStr = new TextDecoder().decode(tomeResult.data);
+      expect(tomeStr, `${desc}: ${op.type} mismatch`).toBe(memStr);
+    }
+
     // For readdir, compare sorted directory listings
     if (op.type === "readdirOp" && !memResult.error && memResult.data && tomeResult.data) {
       const memStr = new TextDecoder().decode(memResult.data);
@@ -1486,6 +1572,31 @@ describe("fuzz: randomized differential testing", () => {
 
     it("seed 54321 small cache", async () => {
       await runFuzzSequence(54321, 150, 16);
+    }, 30_000);
+  });
+
+  describe("fd-metadata operations (fchmod, fstat, lstat, O_EXCL)", () => {
+    // Seeds chosen to exercise fd-based metadata operations that use
+    // different Emscripten code paths than their path-based counterparts.
+    // fchmod goes through FS.fchmod → FS.chmod → node_ops.setattr;
+    // fstat goes through FS.fstat → node_ops.getattr via fd lookup;
+    // lstat returns symlink metadata without following the link;
+    // O_EXCL verifies EEXIST error parity on existing files.
+
+    it("seed 11111 tiny cache @fast", async () => {
+      await runFuzzSequence(11111, 120, 4);
+    }, 30_000);
+
+    it("seed 13131 tiny cache", async () => {
+      await runFuzzSequence(13131, 120, 4);
+    }, 30_000);
+
+    it("seed 14141 small cache", async () => {
+      await runFuzzSequence(14141, 150, 16);
+    }, 30_000);
+
+    it("seed 15151 medium cache", async () => {
+      await runFuzzSequence(15151, 150, 64);
     }, 30_000);
   });
 });
