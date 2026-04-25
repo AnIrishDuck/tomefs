@@ -147,6 +147,30 @@ function exec(cmd: string, args: any[]): any {
       }
       return { ok: true };
     }
+    case "symlink": {
+      const [target, linkpath] = args;
+      FS.symlink(target, mp(linkpath));
+      return null;
+    }
+    case "readlink": {
+      const [path] = args;
+      return FS.readlink(mp(path));
+    }
+    case "lstat": {
+      const [path] = args;
+      const s = FS.lstat(mp(path));
+      return { size: s.size, mode: s.mode, mtime: s.mtime, atime: s.atime, ctime: s.ctime };
+    }
+    case "chmod": {
+      const [path, mode] = args;
+      FS.chmod(mp(path), mode);
+      return null;
+    }
+    case "utime": {
+      const [path, atime, mtime] = args;
+      FS.utime(mp(path), atime, mtime);
+      return null;
+    }
     case "cacheStats": {
       return {
         size: tomefs.pageCache.size,

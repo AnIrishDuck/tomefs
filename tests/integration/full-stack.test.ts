@@ -285,21 +285,21 @@ describe("full-stack: tomefs → SAB bridge → MemoryBackend", () => {
   // are the only ones exercising the full production persistence path.
   // -------------------------------------------------------------------
 
-  describe("persistence across remount (full SAB bridge roundtrip)", () => {
-    /**
-     * Terminate the current FS worker and start a fresh one with the same
-     * SAB + backend. The new worker creates a new Emscripten module, mounts
-     * tomefs, and restoreTree rebuilds the filesystem from backend metadata
-     * through the SabClient → SabWorker → MemoryBackend chain.
-     */
-    async function remount(maxPages?: number): Promise<void> {
-      await fsWorker.terminate();
-      fsWorker = new Worker(WORKER_BUNDLE, {
-        workerData: { sab, maxPages: maxPages ?? 64 },
-      });
-      await waitReady(fsWorker);
-    }
+  /**
+   * Terminate the current FS worker and start a fresh one with the same
+   * SAB + backend. The new worker creates a new Emscripten module, mounts
+   * tomefs, and restoreTree rebuilds the filesystem from backend metadata
+   * through the SabClient → SabWorker → MemoryBackend chain.
+   */
+  async function remount(maxPages?: number): Promise<void> {
+    await fsWorker.terminate();
+    fsWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, maxPages: maxPages ?? 64 },
+    });
+    await waitReady(fsWorker);
+  }
 
+  describe("persistence across remount (full SAB bridge roundtrip)", () => {
     it("@fast basic file persists across remount", async () => {
       await callWorker(fsWorker, "writeFile", ["/persist.txt", "survives restart"]);
       await callWorker(fsWorker, "syncfs", []);
@@ -545,6 +545,150 @@ describe("full-stack: tomefs → SAB bridge → MemoryBackend", () => {
       expect(await callWorker(fsWorker, "readFile", ["/cycle1.txt"])).toBe("first");
       expect(await callWorker(fsWorker, "readFile", ["/cycle2.txt"])).toBe("second");
       expect(await callWorker(fsWorker, "readFile", ["/cycle3.txt"])).toBe("third");
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Symlinks, permissions, and timestamps through the SAB bridge.
+  //
+  // These operations serialize metadata with non-numeric fields (symlink
+  // targets) and optional fields (atime, mode) through JSON in the SAB
+  // protocol. A bug in serialization could silently drop the `link` field
+  // or corrupt mode bits — only manifest through the SAB bridge path.
+  // -------------------------------------------------------------------
+
+  describe("symlink operations through SAB bridge", () => {
+    it("@fast create and resolve a symlink", async () => {
+      await callWorker(fsWorker, "writeFile", ["/target.txt", "symlink target data"]);
+      await callWorker(fsWorker, "symlink", ["/data/target.txt", "/link.txt"]);
+
+      const resolved = await callWorker(fsWorker, "readlink", ["/link.txt"]);
+      expect(resolved).toBe("/data/target.txt");
+
+      // Reading through the symlink should return the target's content
+      const content = await callWorker(fsWorker, "readFile", ["/link.txt"]);
+      expect(content).toBe("symlink target data");
+    });
+
+    it("@fast symlink persists across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/real.txt", "persistent"]);
+      await callWorker(fsWorker, "symlink", ["/data/real.txt", "/sym.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Symlink target must survive JSON serialization through SAB bridge
+      const target = await callWorker(fsWorker, "readlink", ["/sym.txt"]);
+      expect(target).toBe("/data/real.txt");
+
+      // Content accessible through the restored symlink
+      const content = await callWorker(fsWorker, "readFile", ["/sym.txt"]);
+      expect(content).toBe("persistent");
+    });
+
+    it("symlink in subdirectory persists across remount", async () => {
+      await callWorker(fsWorker, "mkdir", ["/dir"]);
+      await callWorker(fsWorker, "writeFile", ["/dir/file.txt", "nested target"]);
+      await callWorker(fsWorker, "symlink", ["/data/dir/file.txt", "/dir/link.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const target = await callWorker(fsWorker, "readlink", ["/dir/link.txt"]);
+      expect(target).toBe("/data/dir/file.txt");
+      expect(await callWorker(fsWorker, "readFile", ["/dir/link.txt"])).toBe("nested target");
+    });
+
+    it("rename symlink preserves target across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/target.txt", "rename test"]);
+      await callWorker(fsWorker, "symlink", ["/data/target.txt", "/old-link.txt"]);
+      await callWorker(fsWorker, "rename", ["/old-link.txt", "/new-link.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const target = await callWorker(fsWorker, "readlink", ["/new-link.txt"]);
+      expect(target).toBe("/data/target.txt");
+      expect(await callWorker(fsWorker, "readFile", ["/new-link.txt"])).toBe("rename test");
+      await expect(callWorker(fsWorker, "readlink", ["/old-link.txt"])).rejects.toThrow();
+    });
+
+    it("unlink symlink does not affect target across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/keep.txt", "untouched"]);
+      await callWorker(fsWorker, "symlink", ["/data/keep.txt", "/doomed-link.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+
+      await callWorker(fsWorker, "unlink", ["/doomed-link.txt"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Target file must survive
+      expect(await callWorker(fsWorker, "readFile", ["/keep.txt"])).toBe("untouched");
+      // Symlink must be gone
+      await expect(callWorker(fsWorker, "readlink", ["/doomed-link.txt"])).rejects.toThrow();
+    });
+
+    it("mixed tree with files, dirs, and symlinks persists", async () => {
+      await callWorker(fsWorker, "mkdir", ["/app"]);
+      await callWorker(fsWorker, "mkdir", ["/app/data"]);
+      await callWorker(fsWorker, "writeFile", ["/app/data/config.json", '{"key":"value"}']);
+      await callWorker(fsWorker, "writeMultiPage", ["/app/data/store.db", 4, 99]);
+      await callWorker(fsWorker, "symlink", ["/data/app/data/config.json", "/app/config-link"]);
+      await callWorker(fsWorker, "symlink", ["/data/app/data/store.db", "/app/db-link"]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      // Directory structure
+      const appEntries = await callWorker(fsWorker, "readdir", ["/app"]);
+      expect(appEntries).toContain("data");
+      expect(appEntries).toContain("config-link");
+      expect(appEntries).toContain("db-link");
+
+      // Regular file
+      expect(await callWorker(fsWorker, "readFile", ["/app/data/config.json"])).toBe('{"key":"value"}');
+
+      // Multi-page file
+      const result = await callWorker(fsWorker, "verifyMultiPage", ["/app/data/store.db", 4, 99]);
+      expect(result).toEqual({ ok: true });
+
+      // Symlinks resolve correctly
+      expect(await callWorker(fsWorker, "readlink", ["/app/config-link"])).toBe("/data/app/data/config.json");
+      expect(await callWorker(fsWorker, "readFile", ["/app/config-link"])).toBe('{"key":"value"}');
+    });
+  });
+
+  describe("file metadata persistence through SAB bridge", () => {
+    it("@fast chmod persists across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/secret.txt", "classified"]);
+      await callWorker(fsWorker, "chmod", ["/secret.txt", 0o100400]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const stat = await callWorker(fsWorker, "stat", ["/secret.txt"]);
+      expect(stat.mode & 0o777).toBe(0o400);
+    });
+
+    it("utime persists across remount", async () => {
+      await callWorker(fsWorker, "writeFile", ["/timed.txt", "timestamp test"]);
+      // Emscripten's FS.utime takes milliseconds (matching Date.getTime())
+      const atime = 1700000000000;
+      const mtime = 1700000001000;
+      await callWorker(fsWorker, "utime", ["/timed.txt", atime, mtime]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const stat = await callWorker(fsWorker, "lstat", ["/timed.txt"]);
+      const restoredMtime = typeof stat.mtime === "object" ? stat.mtime.getTime() : stat.mtime;
+      expect(restoredMtime).toBe(mtime);
+    });
+
+    it("directory permissions persist across remount", async () => {
+      await callWorker(fsWorker, "mkdir", ["/restricted"]);
+      await callWorker(fsWorker, "writeFile", ["/restricted/file.txt", "inside"]);
+      await callWorker(fsWorker, "chmod", ["/restricted", 0o40755]);
+      await callWorker(fsWorker, "syncfs", []);
+      await remount();
+
+      const stat = await callWorker(fsWorker, "stat", ["/restricted"]);
+      expect(stat.mode & 0o777).toBe(0o755);
+      expect(await callWorker(fsWorker, "readFile", ["/restricted/file.txt"])).toBe("inside");
     });
   });
 });
