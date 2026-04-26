@@ -41,7 +41,7 @@ function decode(buf: Uint8Array, length?: number): string {
  */
 class RecordingBackend extends SyncMemoryBackend {
   operations: Array<{
-    op: "writeMeta" | "deleteMeta" | "deleteFile" | "readMeta" | "listFiles";
+    op: "writeMeta" | "deleteMeta" | "deleteFile" | "deleteAll" | "readMeta" | "listFiles";
     path: string;
   }> = [];
   recording = false;
@@ -106,6 +106,15 @@ class RecordingBackend extends SyncMemoryBackend {
       this.operations.push({ op: "listFiles", path: "*" });
     }
     return super.listFiles();
+  }
+
+  deleteAll(paths: string[]): void {
+    if (this.recording) {
+      for (const path of paths) {
+        this.operations.push({ op: "deleteAll", path });
+      }
+    }
+    super.deleteAll(paths);
   }
 }
 
@@ -891,6 +900,75 @@ describe("syncfs detached node handling", () => {
 
     // Orphan should be cleaned up
     expect(backend.readMeta("/__deleted_42")).toBeNull();
+
+    FS2.unmount(MOUNT);
+  });
+
+  it("orphan cleanup uses atomic deleteAll after data persist @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    const s = FS.open(`${MOUNT}/live`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s, encode("keep"), 0, 4);
+    FS.close(s);
+    const s2 = FS.open(`${MOUNT}/orphan1`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s2, encode("gone"), 0, 4);
+    FS.close(s2);
+    const s3 = FS.open(`${MOUNT}/orphan2`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s3, encode("gone"), 0, 4);
+    FS.close(s3);
+    syncAndUnmount(FS, tomefs);
+
+    // Simulate crash: remove clean marker
+    backend.deleteMeta("/__tomefs_clean");
+
+    // Remount — restoreTree restores all files. Then unlink orphans
+    // from the tree so they exist in the backend but not in currentPaths.
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+    FS2.unlink(`${MOUNT}/orphan1`);
+    FS2.unlink(`${MOUNT}/orphan2`);
+
+    // Re-inject stale data as if crash left orphans behind
+    const orphanMeta = { size: 4, mode: 0o100666, ctime: 0, mtime: 0 };
+    backend.writeMeta("/orphan1", orphanMeta);
+    backend.writePage("/orphan1", 0, new Uint8Array(8192));
+    backend.writeMeta("/orphan2", orphanMeta);
+    backend.writePage("/orphan2", 0, new Uint8Array(8192));
+
+    backend.startRecording();
+    syncfs(FS2, t2);
+    backend.stopRecording();
+
+    // deleteAll must be used (not individual deleteFile + deleteMeta)
+    const deleteAllOps = backend.operations.filter((o) => o.op === "deleteAll");
+    expect(deleteAllOps.length).toBeGreaterThanOrEqual(2);
+    const deletedPaths = deleteAllOps.map((o) => o.path).sort();
+    expect(deletedPaths).toContain("/orphan1");
+    expect(deletedPaths).toContain("/orphan2");
+
+    // deleteAll must come after writeMeta (data persisted first)
+    const lastWriteIdx = backend.operations.reduce(
+      (max, op, i) => (op.op === "writeMeta" ? i : max),
+      -1,
+    );
+    const firstDeleteAllIdx = backend.operations.findIndex(
+      (o) => o.op === "deleteAll",
+    );
+    if (lastWriteIdx >= 0 && firstDeleteAllIdx >= 0) {
+      expect(lastWriteIdx).toBeLessThan(firstDeleteAllIdx);
+    }
+
+    // Orphans are fully cleaned
+    expect(backend.readMeta("/orphan1")).toBeNull();
+    expect(backend.readPage("/orphan1", 0)).toBeNull();
+    expect(backend.readMeta("/orphan2")).toBeNull();
+    expect(backend.readPage("/orphan2", 0)).toBeNull();
+
+    // Live file survives
+    const r = FS2.open(`${MOUNT}/live`, O.RDONLY);
+    const buf = new Uint8Array(20);
+    const n = FS2.read(r, buf, 0, 20);
+    FS2.close(r);
+    expect(decode(buf, n)).toBe("keep");
 
     FS2.unmount(MOUNT);
   });
