@@ -558,8 +558,7 @@ export class OpfsBackend implements StorageBackend {
 
   async deleteAll(paths: string[]): Promise<void> {
     if (paths.length === 0) return;
-    await this.deleteFiles(paths);
-    await this.deleteMetas(paths);
+    await Promise.all([this.deleteFiles(paths), this.deleteMetas(paths)]);
   }
 
   /**

@@ -745,6 +745,25 @@ describe("IdbBackend", () => {
         req.onerror = () => reject(req.error);
       });
     });
+
+    it("IdbBackend deleteAll rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-deleteall-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writePage("/file", 0, filledPage(0x01));
+      await b.writeMeta("/file", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      db.close();
+
+      await expect(b.deleteAll(["/file"])).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
   });
 
   describe("edge cases", () => {
