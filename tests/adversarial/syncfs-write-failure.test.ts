@@ -58,6 +58,8 @@ class FailOnSyncBackend implements SyncStorageBackend {
   readonly inner = new SyncMemoryBackend();
   syncAllFails = false;
   syncAllFailCount = 0;
+  deleteAllFails = false;
+  deleteAllFailCount = 0;
 
   readPage(path: string, pageIndex: number): Uint8Array | null {
     return this.inner.readPage(path, pageIndex);
@@ -129,6 +131,10 @@ class FailOnSyncBackend implements SyncStorageBackend {
     this.inner.syncAll(pages, metas);
   }
   deleteAll(paths: string[]): void {
+    if (this.deleteAllFails) {
+      this.deleteAllFailCount++;
+      throw new Error("injected deleteAll failure");
+    }
     this.inner.deleteAll(paths);
   }
 }
@@ -206,42 +212,18 @@ describe("syncfs write failure recovery", () => {
   });
 
   it("preserves dirty page flags when syncAll fails (full tree walk path)", async () => {
+    // On fresh mount, needsOrphanCleanup defaults to true, so the first
+    // syncfs takes the full tree walk path (persistTree + orphan cleanup).
     const backend = new FailOnSyncBackend();
     const { FS } = await createHarness(backend, 64);
 
-    // Write data
+    // Write data without syncing first — needsOrphanCleanup stays true
     const data = encode("tree walk data");
     const fd = FS.open(`${MOUNT}/treetest`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
     FS.write(fd, data, 0, data.length);
     FS.close(fd);
 
-    // First sync
-    FS.syncfs(false, (err: Error | null) => {
-      if (err) throw err;
-    });
-
-    // Write more data then unlink a different file to force full tree walk
-    // (unlink sets needsOrphanCleanup = true)
-    const dummy = encode("dummy");
-    const dfd = FS.open(
-      `${MOUNT}/dummy`,
-      O.WRONLY | O.CREAT | O.TRUNC,
-      0o666,
-    );
-    FS.write(dfd, dummy, 0, dummy.length);
-    FS.close(dfd);
-    FS.syncfs(false, (err: Error | null) => {
-      if (err) throw err;
-    });
-
-    // Now write to treetest and unlink dummy to trigger orphan cleanup path
-    const data2 = encode("updated tree walk data");
-    const fd2 = FS.open(`${MOUNT}/treetest`, O.WRONLY, 0o666);
-    FS.write(fd2, data2, 0, data2.length);
-    FS.close(fd2);
-    FS.unlink(`${MOUNT}/dummy`);
-
-    // syncfs fails on full tree walk path
+    // syncfs fails on full tree walk path (first sync after mount)
     backend.syncAllFails = true;
     let syncErr: Error | null = null;
     FS.syncfs(false, (err: Error | null) => {
@@ -271,7 +253,7 @@ describe("syncfs write failure recovery", () => {
     const rfd = FS2.open(`${MOUNT}/treetest`, O.RDONLY);
     const bytesRead = FS2.read(rfd, readBuf, 0, readBuf.length);
     FS2.close(rfd);
-    expect(decode(readBuf, data2.length)).toBe("updated tree walk data");
+    expect(decode(readBuf, data.length)).toBe("tree walk data");
   });
 
   it("dirty pages survive cache eviction after failed syncfs + retry", async () => {
@@ -391,5 +373,172 @@ describe("syncfs write failure recovery", () => {
 
     const stat = FS2.stat(`${MOUNT}/meta`);
     expect(stat.mode & 0o777).toBe(0o600);
+  });
+
+  it("deleteAll failure during orphan cleanup preserves data and retries @fast", async () => {
+    // Scenario: syncAll succeeds (pages + metadata committed) but deleteAll
+    // fails during orphan cleanup. Data must survive, and the next syncfs
+    // must retry the orphan cleanup.
+    const backend = new FailOnSyncBackend();
+    const { FS } = await createHarness(backend, 64);
+
+    // Create two files
+    const keepData = encode("keep this data");
+    const fd1 = FS.open(`${MOUNT}/keep`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    FS.write(fd1, keepData, 0, keepData.length);
+    FS.close(fd1);
+
+    const removeData = encode("will be orphaned");
+    const fd2 = FS.open(`${MOUNT}/remove`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    FS.write(fd2, removeData, 0, removeData.length);
+    FS.close(fd2);
+
+    // First sync establishes both files in backend
+    FS.syncfs(false, (err: Error | null) => {
+      if (err) throw err;
+    });
+
+    // Inject /__deleted_* orphan metadata into backend to simulate a crash
+    // that left temporary pages behind. restoreTree detects /__deleted_*
+    // entries and forces orphan cleanup on the first syncfs.
+    backend.inner.writeMeta("/__deleted_stale", {
+      size: 100, mode: 0o100644, ctime: 1000, mtime: 1000,
+    });
+    backend.inner.writePage("/__deleted_stale", 0, new Uint8Array(PAGE_SIZE));
+
+    // Remount so needsOrphanCleanup=true (/__deleted_* triggers it)
+    const { default: createModule2 } = await import(
+      join(__dirname, "../harness/emscripten_fs.mjs")
+    );
+    const Module2 = await createModule2();
+    const FS2 = Module2.FS as any;
+    const tomefs2 = createTomeFS(FS2, { backend, maxPages: 64 });
+    FS2.mkdir(MOUNT);
+    FS2.mount(tomefs2, {}, MOUNT);
+
+    // Verify both files restored
+    const readBuf = new Uint8Array(256);
+    const rfd = FS2.open(`${MOUNT}/keep`, O.RDONLY);
+    const n = FS2.read(rfd, readBuf, 0, readBuf.length);
+    FS2.close(rfd);
+    expect(decode(readBuf, keepData.length)).toBe("keep this data");
+
+    // syncfs: syncAll succeeds but deleteAll fails during orphan cleanup
+    backend.deleteAllFails = true;
+    let syncErr: Error | null = null;
+    FS2.syncfs(false, (err: Error | null) => {
+      syncErr = err;
+    });
+    expect(syncErr).not.toBeNull();
+    expect(syncErr!.message).toContain("injected deleteAll failure");
+    expect(backend.deleteAllFailCount).toBe(1);
+
+    // Orphan should still exist in backend
+    const files = backend.inner.listFiles();
+    expect(files).toContain("/__deleted_stale");
+
+    // Retry with deleteAll working — orphan cleanup should succeed
+    backend.deleteAllFails = false;
+    syncErr = null;
+    FS2.syncfs(false, (err: Error | null) => {
+      syncErr = err;
+    });
+    expect(syncErr).toBeNull();
+
+    // Orphan should be cleaned up now
+    const filesAfter = backend.inner.listFiles();
+    expect(filesAfter).not.toContain("/__deleted_stale");
+    // Real files must still exist
+    expect(filesAfter).toContain("/keep");
+    expect(filesAfter).toContain("/remove");
+  });
+
+  it("deleteAll failure does not corrupt committed page data", async () => {
+    // Verify that pages committed via syncAll before the deleteAll failure
+    // are fully intact in the backend, even under cache pressure.
+    const backend = new FailOnSyncBackend();
+    const { FS } = await createHarness(backend, 4); // tiny cache
+
+    // Fill cache with dirty pages (4 pages = 32 KB)
+    const fileData = new Uint8Array(PAGE_SIZE * 4);
+    for (let i = 0; i < fileData.length; i++) {
+      fileData[i] = (i * 37 + 11) & 0xff;
+    }
+    const fd = FS.open(`${MOUNT}/bigfile`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+    FS.write(fd, fileData, 0, fileData.length);
+    FS.close(fd);
+
+    // First sync to establish the file
+    FS.syncfs(false, (err: Error | null) => {
+      if (err) throw err;
+    });
+
+    // Write new data to the file
+    const newData = new Uint8Array(PAGE_SIZE * 4);
+    for (let i = 0; i < newData.length; i++) {
+      newData[i] = (i * 53 + 7) & 0xff;
+    }
+    const fd2 = FS.open(`${MOUNT}/bigfile`, O.WRONLY, 0o666);
+    FS.write(fd2, newData, 0, newData.length);
+    FS.close(fd2);
+
+    // Inject /__deleted_* orphan so full tree walk path is taken on next mount
+    backend.inner.writeMeta("/__deleted_orphan", {
+      size: 10, mode: 0o100644, ctime: 1000, mtime: 1000,
+    });
+
+    // Remount to get needsOrphanCleanup=true
+    const { default: createModule2 } = await import(
+      join(__dirname, "../harness/emscripten_fs.mjs")
+    );
+    const Module2 = await createModule2();
+    const FS2 = Module2.FS as any;
+    const tomefs2 = createTomeFS(FS2, { backend, maxPages: 64 });
+    FS2.mkdir(MOUNT);
+    FS2.mount(tomefs2, {}, MOUNT);
+
+    // Write new data on the remounted FS
+    const fd3 = FS2.open(`${MOUNT}/bigfile`, O.WRONLY, 0o666);
+    FS2.write(fd3, newData, 0, newData.length);
+    FS2.close(fd3);
+
+    // syncfs: syncAll commits pages, deleteAll fails on orphan cleanup
+    backend.deleteAllFails = true;
+    let syncErr: Error | null = null;
+    FS2.syncfs(false, (err: Error | null) => {
+      syncErr = err;
+    });
+    expect(syncErr).not.toBeNull();
+
+    // Pages were committed before deleteAll — verify by remounting
+    backend.deleteAllFails = false;
+    const { default: createModule3 } = await import(
+      join(__dirname, "../harness/emscripten_fs.mjs")
+    );
+    const Module3 = await createModule3();
+    const FS3 = Module3.FS as any;
+    const tomefs3 = createTomeFS(FS3, { backend, maxPages: 64 });
+    FS3.mkdir(MOUNT);
+    FS3.mount(tomefs3, {}, MOUNT);
+
+    const readBuf = new Uint8Array(PAGE_SIZE * 4);
+    const rfd = FS3.open(`${MOUNT}/bigfile`, O.RDONLY);
+    const bytesRead = FS3.read(rfd, readBuf, 0, readBuf.length);
+    FS3.close(rfd);
+    expect(bytesRead).toBe(PAGE_SIZE * 4);
+    for (let i = 0; i < newData.length; i++) {
+      if (readBuf[i] !== newData[i]) {
+        throw new Error(
+          `Data mismatch at byte ${i}: expected ${newData[i]}, got ${readBuf[i]}`,
+        );
+      }
+    }
+
+    // Clean sync should remove orphan
+    FS3.syncfs(false, (err: Error | null) => {
+      if (err) throw err;
+    });
+    const files = backend.inner.listFiles();
+    expect(files).not.toContain("/__deleted_orphan");
   });
 });

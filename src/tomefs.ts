@@ -97,15 +97,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   const allFileNodes = new Set<any>();
 
   // True when the backend may contain stale metadata not in the live tree.
-  // Set on mount (crash recovery may have left orphans) and cleared after
-  // a successful orphan cleanup pass in syncfs. Operations that directly
-  // modify backend metadata (rename, unlink-with-open-fds) re-set this
-  // flag via invalidateCleanMarker() since a crash between their backend
-  // writes could leave orphans.
+  // Defaults to true on mount and cleared after a successful orphan cleanup
+  // pass in syncfs. If the backend has a clean-shutdown marker AND no
+  // /__deleted_* entries, restoreTree sets this to false (fast path).
   //
-  // On mount, this is set to true by default. If the backend has a clean-
-  // shutdown marker (written at the end of a successful syncfs), we know
-  // the backend is consistent and can skip the first full tree walk.
+  // Operations like rename and unlink-with-open-fds don't re-set this flag
+  // directly. Instead, invalidateCleanMarker() deletes the backend marker
+  // so the next mount defaults to needsOrphanCleanup=true if a crash occurs.
+  // Within the same session, those operations handle their own cleanup.
   let needsOrphanCleanup = true;
 
   /** Backend key for the clean-shutdown marker. */
