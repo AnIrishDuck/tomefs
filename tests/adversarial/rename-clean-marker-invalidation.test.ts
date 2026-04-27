@@ -163,6 +163,7 @@ class CrashBackend implements SyncStorageBackend {
   deleteMeta(p: string) { this.tick(); this.inner.deleteMeta(p); }
   deleteMetas(ps: string[]) { for (const p of ps) { this.tick(); this.inner.deleteMeta(p); } }
   renameFile(o: string, n: string) { this.tick(); this.inner.renameFile(o, n); }
+  deleteAll(ps: string[]) { this.tick(); this.inner.deleteAll(ps); }
   syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
