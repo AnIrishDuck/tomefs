@@ -614,4 +614,77 @@ describe("PreloadBackend flush ordering", () => {
     expect(existingPage).not.toBeNull();
     expect(existingPage![0]).toBe(0x42);
   });
+
+  it("@fast flush uses deleteAll for paths with both file and meta deletion", async () => {
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0xaa;
+    await innerRemote.writePage("/del1", 0, data);
+    await innerRemote.writeMeta("/del1", {
+      size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 1000,
+    });
+    await innerRemote.writePage("/del2", 0, data);
+    await innerRemote.writeMeta("/del2", {
+      size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 1000,
+    });
+
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+    remote.clearLog();
+
+    backend.deleteFile("/del1");
+    backend.deleteMeta("/del1");
+    backend.deleteFile("/del2");
+    backend.deleteMeta("/del2");
+
+    await backend.flush();
+
+    const deleteAllCalls = remote.log.filter(([op]) => op === "deleteAll");
+    expect(deleteAllCalls.length).toBe(1);
+    const paths = deleteAllCalls[0][1] as string[];
+    expect(paths.sort()).toEqual(["/del1", "/del2"]);
+
+    const deleteFilesCalls = remote.log.filter(([op]) => op === "deleteFiles");
+    const deleteMetasCalls = remote.log.filter(([op]) => op === "deleteMetas");
+    expect(deleteFilesCalls).toHaveLength(0);
+    expect(deleteMetasCalls).toHaveLength(0);
+  });
+
+  it("@fast flush uses separate calls for asymmetric deletions", async () => {
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0xbb;
+    await innerRemote.writePage("/both", 0, data);
+    await innerRemote.writeMeta("/both", {
+      size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 1000,
+    });
+    await innerRemote.writePage("/fileonly", 0, data);
+    await innerRemote.writeMeta("/fileonly", {
+      size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 1000,
+    });
+    await innerRemote.writeMeta("/metaonly", {
+      size: 0, mode: 0o100644, ctime: 1000, mtime: 1000,
+    });
+
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+    remote.clearLog();
+
+    backend.deleteFile("/both");
+    backend.deleteMeta("/both");
+    backend.deleteFile("/fileonly");
+    backend.deleteMeta("/metaonly");
+
+    await backend.flush();
+
+    const deleteAllCalls = remote.log.filter(([op]) => op === "deleteAll");
+    expect(deleteAllCalls.length).toBe(1);
+    expect(deleteAllCalls[0][1]).toEqual(["/both"]);
+
+    const deleteFilesCalls = remote.log.filter(([op]) => op === "deleteFiles");
+    expect(deleteFilesCalls.length).toBe(1);
+    expect(deleteFilesCalls[0][1]).toEqual(["/fileonly"]);
+
+    const deleteMetasCalls = remote.log.filter(([op]) => op === "deleteMetas");
+    expect(deleteMetasCalls.length).toBe(1);
+    expect(deleteMetasCalls[0][1]).toEqual(["/metaonly"]);
+  });
 });
