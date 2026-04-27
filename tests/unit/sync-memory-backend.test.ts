@@ -452,6 +452,296 @@ describe("SyncMemoryBackend", () => {
     });
   });
 
+  describe("readMetas", () => {
+    it("reads multiple metadata entries in one call", () => {
+      const metaA = { size: 100, mode: 0o644, ctime: 1, mtime: 2 };
+      const metaB = { size: 200, mode: 0o755, ctime: 3, mtime: 4 };
+      backend.writeMeta("/a", metaA);
+      backend.writeMeta("/b", metaB);
+
+      const results = backend.readMetas(["/a", "/b", "/missing"]);
+
+      expect(results).toHaveLength(3);
+      expect(results[0]).toEqual(metaA);
+      expect(results[1]).toEqual(metaB);
+      expect(results[2]).toBeNull();
+    });
+
+    it("returns empty array for empty input", () => {
+      expect(backend.readMetas([])).toEqual([]);
+    });
+
+    it("returns independent copies", () => {
+      backend.writeMeta("/a", { size: 100, mode: 0o644, ctime: 1, mtime: 2 });
+
+      const results = backend.readMetas(["/a", "/a"]);
+      results[0]!.size = 9999;
+
+      expect(results[1]!.size).toBe(100);
+    });
+  });
+
+  describe("deleteFiles", () => {
+    it("deletes pages for multiple files in one call", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 1, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/b", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/keep", 0, new Uint8Array(PAGE_SIZE));
+
+      backend.deleteFiles(["/a", "/b"]);
+
+      expect(backend.readPage("/a", 0)).toBeNull();
+      expect(backend.readPage("/a", 1)).toBeNull();
+      expect(backend.readPage("/b", 0)).toBeNull();
+      expect(backend.readPage("/keep", 0)).not.toBeNull();
+    });
+
+    it("is a no-op for empty array", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.deleteFiles([]);
+      expect(backend.readPage("/a", 0)).not.toBeNull();
+    });
+  });
+
+  describe("countPages", () => {
+    it("returns 0 for non-existent file", () => {
+      expect(backend.countPages("/missing")).toBe(0);
+    });
+
+    it("counts pages for a file", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 3, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 7, new Uint8Array(PAGE_SIZE));
+
+      expect(backend.countPages("/a")).toBe(3);
+    });
+
+    it("reflects deletions", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 1, new Uint8Array(PAGE_SIZE));
+      backend.deletePagesFrom("/a", 1);
+
+      expect(backend.countPages("/a")).toBe(1);
+    });
+  });
+
+  describe("countPagesBatch", () => {
+    it("counts pages for multiple files in one call", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 1, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/b", 0, new Uint8Array(PAGE_SIZE));
+
+      expect(backend.countPagesBatch(["/a", "/b", "/missing"])).toEqual([2, 1, 0]);
+    });
+
+    it("returns empty array for empty input", () => {
+      expect(backend.countPagesBatch([])).toEqual([]);
+    });
+  });
+
+  describe("maxPageIndex", () => {
+    it("returns -1 for non-existent file", () => {
+      expect(backend.maxPageIndex("/missing")).toBe(-1);
+    });
+
+    it("returns highest page index", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 5, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 2, new Uint8Array(PAGE_SIZE));
+
+      expect(backend.maxPageIndex("/a")).toBe(5);
+    });
+
+    it("reflects deletions", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 3, new Uint8Array(PAGE_SIZE));
+      backend.deletePagesFrom("/a", 2);
+
+      expect(backend.maxPageIndex("/a")).toBe(0);
+    });
+
+    it("returns -1 after all pages deleted", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.deleteFile("/a");
+
+      expect(backend.maxPageIndex("/a")).toBe(-1);
+    });
+  });
+
+  describe("maxPageIndexBatch", () => {
+    it("returns max page index for multiple files", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 4, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/b", 2, new Uint8Array(PAGE_SIZE));
+
+      expect(backend.maxPageIndexBatch(["/a", "/b", "/missing"])).toEqual([4, 2, -1]);
+    });
+
+    it("returns empty array for empty input", () => {
+      expect(backend.maxPageIndexBatch([])).toEqual([]);
+    });
+  });
+
+  describe("syncAll", () => {
+    it("writes pages and metadata atomically", () => {
+      const page = new Uint8Array(PAGE_SIZE);
+      page[0] = 0xab;
+
+      backend.syncAll(
+        [{ path: "/a", pageIndex: 0, data: page }],
+        [{ path: "/a", meta: { size: PAGE_SIZE, mode: 0o644, ctime: 1, mtime: 2 } }],
+      );
+
+      expect(backend.readPage("/a", 0)![0]).toBe(0xab);
+      expect(backend.readMeta("/a")).toEqual({
+        size: PAGE_SIZE, mode: 0o644, ctime: 1, mtime: 2,
+      });
+    });
+
+    it("handles empty pages with metadata", () => {
+      backend.syncAll(
+        [],
+        [{ path: "/a", meta: { size: 0, mode: 0o644, ctime: 1, mtime: 2 } }],
+      );
+
+      expect(backend.readMeta("/a")).not.toBeNull();
+      expect(backend.countPages("/a")).toBe(0);
+    });
+
+    it("handles pages with empty metadata", () => {
+      const page = new Uint8Array(PAGE_SIZE);
+      page[0] = 0xcd;
+
+      backend.syncAll(
+        [{ path: "/a", pageIndex: 0, data: page }],
+        [],
+      );
+
+      expect(backend.readPage("/a", 0)![0]).toBe(0xcd);
+      expect(backend.readMeta("/a")).toBeNull();
+    });
+
+    it("is a no-op with both arrays empty", () => {
+      backend.syncAll([], []);
+      expect(backend.listFiles()).toEqual([]);
+    });
+
+    it("overwrites existing data", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/a", { size: 100, mode: 0o644, ctime: 0, mtime: 0 });
+
+      const page = new Uint8Array(PAGE_SIZE);
+      page[0] = 0xff;
+      backend.syncAll(
+        [{ path: "/a", pageIndex: 0, data: page }],
+        [{ path: "/a", meta: { size: PAGE_SIZE, mode: 0o755, ctime: 5, mtime: 6 } }],
+      );
+
+      expect(backend.readPage("/a", 0)![0]).toBe(0xff);
+      expect(backend.readMeta("/a")!.mode).toBe(0o755);
+    });
+  });
+
+  describe("deleteAll", () => {
+    it("deletes both pages and metadata for given paths", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 1, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/a", { size: PAGE_SIZE * 2, mode: 0o644, ctime: 1, mtime: 2 });
+      backend.writePage("/b", 0, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/b", { size: PAGE_SIZE, mode: 0o644, ctime: 1, mtime: 2 });
+
+      backend.deleteAll(["/a", "/b"]);
+
+      expect(backend.readPage("/a", 0)).toBeNull();
+      expect(backend.readPage("/a", 1)).toBeNull();
+      expect(backend.readMeta("/a")).toBeNull();
+      expect(backend.readPage("/b", 0)).toBeNull();
+      expect(backend.readMeta("/b")).toBeNull();
+      expect(backend.listFiles()).toEqual([]);
+    });
+
+    it("is a no-op for empty array", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/a", { size: PAGE_SIZE, mode: 0o644, ctime: 0, mtime: 0 });
+
+      backend.deleteAll([]);
+
+      expect(backend.readPage("/a", 0)).not.toBeNull();
+      expect(backend.readMeta("/a")).not.toBeNull();
+    });
+
+    it("does not affect unrelated files", () => {
+      const page = new Uint8Array(PAGE_SIZE);
+      page[0] = 0x42;
+      backend.writePage("/keep", 0, page);
+      backend.writeMeta("/keep", { size: PAGE_SIZE, mode: 0o644, ctime: 0, mtime: 0 });
+      backend.writePage("/remove", 0, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/remove", { size: PAGE_SIZE, mode: 0o644, ctime: 0, mtime: 0 });
+
+      backend.deleteAll(["/remove"]);
+
+      expect(backend.readPage("/keep", 0)![0]).toBe(0x42);
+      expect(backend.readMeta("/keep")).not.toBeNull();
+    });
+
+    it("handles paths with pages but no metadata", () => {
+      backend.writePage("/orphan", 0, new Uint8Array(PAGE_SIZE));
+
+      backend.deleteAll(["/orphan"]);
+
+      expect(backend.readPage("/orphan", 0)).toBeNull();
+    });
+
+    it("handles paths with metadata but no pages", () => {
+      backend.writeMeta("/meta-only", { size: 0, mode: 0o644, ctime: 0, mtime: 0 });
+
+      backend.deleteAll(["/meta-only"]);
+
+      expect(backend.readMeta("/meta-only")).toBeNull();
+    });
+
+    it("handles non-existent paths", () => {
+      backend.deleteAll(["/nonexistent"]);
+    });
+
+    it("handles duplicate paths", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/a", { size: PAGE_SIZE, mode: 0o644, ctime: 0, mtime: 0 });
+
+      backend.deleteAll(["/a", "/a"]);
+
+      expect(backend.readPage("/a", 0)).toBeNull();
+      expect(backend.readMeta("/a")).toBeNull();
+    });
+
+    it("updates countPages and maxPageIndex", () => {
+      backend.writePage("/a", 0, new Uint8Array(PAGE_SIZE));
+      backend.writePage("/a", 3, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/a", { size: PAGE_SIZE * 4, mode: 0o644, ctime: 0, mtime: 0 });
+
+      backend.deleteAll(["/a"]);
+
+      expect(backend.countPages("/a")).toBe(0);
+      expect(backend.maxPageIndex("/a")).toBe(-1);
+    });
+
+    it("does not delete files with a prefix match", () => {
+      const page10 = new Uint8Array(PAGE_SIZE);
+      page10[0] = 0x10;
+      backend.writePage("/file1", 0, new Uint8Array(PAGE_SIZE));
+      backend.writeMeta("/file1", { size: PAGE_SIZE, mode: 0o644, ctime: 0, mtime: 0 });
+      backend.writePage("/file10", 0, page10);
+      backend.writeMeta("/file10", { size: PAGE_SIZE, mode: 0o644, ctime: 0, mtime: 0 });
+
+      backend.deleteAll(["/file1"]);
+
+      expect(backend.readPage("/file1", 0)).toBeNull();
+      expect(backend.readMeta("/file1")).toBeNull();
+      expect(backend.readPage("/file10", 0)![0]).toBe(0x10);
+      expect(backend.readMeta("/file10")).not.toBeNull();
+    });
+  });
+
   describe("page and metadata independence", () => {
     it("deleteFile does not remove metadata", () => {
       backend.writeMeta("/a", {
