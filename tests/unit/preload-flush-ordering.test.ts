@@ -569,6 +569,75 @@ describe("PreloadBackend flush ordering", () => {
     expect(sa.metas.includes("/f")).toBe(true);
   });
 
+  it("@fast flush uses deleteAll for paths needing both page and meta deletion", async () => {
+    // When deleteAll is called (orphan cleanup), both deletedFiles and
+    // deletedMeta contain the same paths. Flush should use a single
+    // remote.deleteAll() instead of separate deleteFiles + deleteMetas,
+    // giving IDB backends a single atomic transaction for the deletion.
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0x42;
+    await innerRemote.writePage("/orphan1", 0, data);
+    await innerRemote.writeMeta("/orphan1", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+    await innerRemote.writePage("/orphan2", 0, data);
+    await innerRemote.writeMeta("/orphan2", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+    await innerRemote.writePage("/keep", 0, data);
+    await innerRemote.writeMeta("/keep", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+    remote.clearLog();
+
+    // Simulate orphan cleanup: deleteAll adds to both deletedFiles and deletedMeta
+    backend.deleteAll(["/orphan1", "/orphan2"]);
+
+    await backend.flush();
+
+    // Should see a single deleteAll call, not separate deleteFiles + deleteMetas
+    const deleteAllCalls = remote.log.filter(([op]) => op === "deleteAll");
+    expect(deleteAllCalls.length).toBe(1);
+    const paths = deleteAllCalls[0][1] as string[];
+    expect(paths.sort()).toEqual(["/orphan1", "/orphan2"]);
+
+    // Should NOT see separate deleteFiles or deleteMetas for these paths
+    const deleteFilesCalls = remote.log.filter(
+      ([op, arg]) =>
+        op === "deleteFiles" &&
+        (arg as string[]).some((p) => p === "/orphan1" || p === "/orphan2"),
+    );
+    const deleteMetasCalls = remote.log.filter(
+      ([op, arg]) =>
+        op === "deleteMetas" &&
+        (arg as string[]).some((p) => p === "/orphan1" || p === "/orphan2"),
+    );
+    expect(deleteFilesCalls).toHaveLength(0);
+    expect(deleteMetasCalls).toHaveLength(0);
+
+    // Verify orphans are actually gone from remote
+    expect(await innerRemote.readPage("/orphan1", 0)).toBeNull();
+    expect(await innerRemote.readMeta("/orphan1")).toBeNull();
+    expect(await innerRemote.readPage("/orphan2", 0)).toBeNull();
+    expect(await innerRemote.readMeta("/orphan2")).toBeNull();
+
+    // Survivor is untouched
+    expect(await innerRemote.readPage("/keep", 0)).not.toBeNull();
+    expect(await innerRemote.readMeta("/keep")).not.toBeNull();
+  });
+
   it("crash during syncAll is atomic — no partial page+meta writes", async () => {
     // With syncAll, a crash during the atomic operation should leave the
     // remote in a consistent state: either both pages and metadata are

@@ -521,16 +521,31 @@ export class PreloadBackend implements SyncStorageBackend {
       await this.remote.syncAll(earlyBatch, earlyMeta);
     }
 
-    // 3. Batch-delete files from remote (single call instead of O(n))
-    if (this.deletedFiles.size > 0) {
-      await this.remote.deleteFiles([...this.deletedFiles]);
+    // 3. Batch-delete pages and metadata from remote.
+    // Paths in both deletedFiles and deletedMeta use deleteAll for
+    // atomicity (single IDB transaction). Remaining paths use the
+    // targeted operation.
+    if (this.deletedFiles.size > 0 || this.deletedMeta.size > 0) {
+      const bothPaths: string[] = [];
+      const filesOnly: string[] = [];
+      const metaOnly: string[] = [];
+      for (const p of this.deletedFiles) {
+        if (this.deletedMeta.has(p)) {
+          bothPaths.push(p);
+        } else {
+          filesOnly.push(p);
+        }
+      }
+      for (const p of this.deletedMeta) {
+        if (!this.deletedFiles.has(p)) {
+          metaOnly.push(p);
+        }
+      }
+      if (bothPaths.length > 0) await this.remote.deleteAll(bothPaths);
+      if (filesOnly.length > 0) await this.remote.deleteFiles(filesOnly);
+      if (metaOnly.length > 0) await this.remote.deleteMetas(metaOnly);
     }
     this.deletedFiles.clear();
-
-    // 4. Batch-delete metadata
-    if (this.deletedMeta.size > 0) {
-      await this.remote.deleteMetas([...this.deletedMeta]);
-    }
     this.deletedMeta.clear();
 
     // 5. Atomically write pages + metadata for delete-then-recreate paths.
