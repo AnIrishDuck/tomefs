@@ -587,6 +587,155 @@ describe("SAB bridge: batch chunking with small buffer", () => {
   });
 
   // -----------------------------------------------------------------
+  // deleteAll chunking (uses maxBatchMetas = 16)
+  // -----------------------------------------------------------------
+
+  describe("deleteAll chunking (maxBatchMetas=16)", () => {
+    it("@fast deleteAll with 20 paths removes pages and metadata (chunked into [16, 4])", async () => {
+      // Write pages and metadata for 20 files
+      for (let i = 0; i < 20; i++) {
+        await callClient(clientWorker, "writePage", [
+          `/da_${i}`,
+          0,
+          fillPage(i),
+        ]);
+        await callClient(clientWorker, "writeMeta", [
+          `/da_${i}`,
+          { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 } as FileMeta,
+        ]);
+      }
+
+      // Verify pages and metadata exist
+      for (let i = 0; i < 20; i++) {
+        const page = await callClient(clientWorker, "readPage", [`/da_${i}`, 0]);
+        expect(page).not.toBeNull();
+        const meta = await callClient(clientWorker, "readMeta", [`/da_${i}`]);
+        expect(meta).not.toBeNull();
+      }
+
+      // deleteAll 20 paths — exceeds maxBatchMetas=16, so it chunks
+      const paths = Array.from({ length: 20 }, (_, i) => `/da_${i}`);
+      await callClient(clientWorker, "deleteAll", [paths]);
+
+      // Verify all pages deleted
+      for (let i = 0; i < 20; i++) {
+        const page = await callClient(clientWorker, "readPage", [`/da_${i}`, 0]);
+        expect(page).toBeNull();
+      }
+
+      // Verify all metadata deleted
+      const metas = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+      for (const meta of metas) {
+        expect(meta).toBeNull();
+      }
+    });
+
+    it("deleteAll with paths at exact chunk boundary (16 paths)", async () => {
+      for (let i = 0; i < 16; i++) {
+        await callClient(clientWorker, "writePage", [
+          `/dab_${i}`,
+          0,
+          fillPage(0x80 + i),
+        ]);
+        await callClient(clientWorker, "writeMeta", [
+          `/dab_${i}`,
+          { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 } as FileMeta,
+        ]);
+      }
+
+      const paths = Array.from({ length: 16 }, (_, i) => `/dab_${i}`);
+      await callClient(clientWorker, "deleteAll", [paths]);
+
+      for (let i = 0; i < 16; i++) {
+        const page = await callClient(clientWorker, "readPage", [`/dab_${i}`, 0]);
+        expect(page).toBeNull();
+      }
+      const metas = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+      for (const meta of metas) {
+        expect(meta).toBeNull();
+      }
+    });
+
+    it("deleteAll with empty array is a no-op", async () => {
+      await callClient(clientWorker, "writePage", ["/keep", 0, fillPage(0xff)]);
+      await callClient(clientWorker, "writeMeta", [
+        "/keep",
+        { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 } as FileMeta,
+      ]);
+
+      await callClient(clientWorker, "deleteAll", [[]]);
+
+      const page = await callClient(clientWorker, "readPage", ["/keep", 0]);
+      expect(page).not.toBeNull();
+      const meta = await callClient(clientWorker, "readMeta", ["/keep"]);
+      expect(meta).not.toBeNull();
+    });
+
+    it("deleteAll removes multi-page files across chunk boundary", async () => {
+      // Write 20 files with 2 pages each
+      for (let i = 0; i < 20; i++) {
+        await callClient(clientWorker, "writePages", [
+          [
+            { path: `/dam_${i}`, pageIndex: 0, data: fillPage(i) },
+            { path: `/dam_${i}`, pageIndex: 1, data: fillPage(i + 100) },
+          ],
+        ]);
+        await callClient(clientWorker, "writeMeta", [
+          `/dam_${i}`,
+          { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 1000, mtime: 2000 } as FileMeta,
+        ]);
+      }
+
+      const paths = Array.from({ length: 20 }, (_, i) => `/dam_${i}`);
+      await callClient(clientWorker, "deleteAll", [paths]);
+
+      // Both pages of every file should be gone
+      for (let i = 0; i < 20; i++) {
+        expect(await callClient(clientWorker, "readPage", [`/dam_${i}`, 0])).toBeNull();
+        expect(await callClient(clientWorker, "readPage", [`/dam_${i}`, 1])).toBeNull();
+      }
+      const metas = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+      for (const meta of metas) {
+        expect(meta).toBeNull();
+      }
+    });
+
+    it("deleteAll only deletes specified paths — others survive", async () => {
+      // Write 25 files
+      for (let i = 0; i < 25; i++) {
+        await callClient(clientWorker, "writePage", [
+          `/das_${i}`,
+          0,
+          fillPage(i),
+        ]);
+        await callClient(clientWorker, "writeMeta", [
+          `/das_${i}`,
+          { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 3000 + i } as FileMeta,
+        ]);
+      }
+
+      // Delete only the first 20 (chunked) — leave 5 survivors
+      const toDelete = Array.from({ length: 20 }, (_, i) => `/das_${i}`);
+      await callClient(clientWorker, "deleteAll", [toDelete]);
+
+      // Deleted files are gone
+      for (let i = 0; i < 20; i++) {
+        expect(await callClient(clientWorker, "readPage", [`/das_${i}`, 0])).toBeNull();
+      }
+
+      // Survivors are intact
+      for (let i = 20; i < 25; i++) {
+        const page = toUint8Array(
+          await callClient(clientWorker, "readPage", [`/das_${i}`, 0]),
+        );
+        expect(page[0]).toBe(i);
+        const meta = (await callClient(clientWorker, "readMeta", [`/das_${i}`])) as FileMeta;
+        expect(meta.mtime).toBe(3000 + i);
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------
   // Mixed operations across chunk boundaries
   // -----------------------------------------------------------------
 
