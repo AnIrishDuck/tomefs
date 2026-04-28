@@ -1193,3 +1193,345 @@ describeWithPersistence(
     expect(entries).toEqual(["seg_001"]);
   },
 );
+
+// ---------------------------------------------------------------------------
+// Scenario 11: VACUUM FULL — Complete Heap Rewrite via Temp File
+//
+// Unlike regular VACUUM (Scenario 2) which rewrites pages in-place,
+// VACUUM FULL creates a new heap file, copies all live tuples to it in a
+// compacted layout, then renames the new file over the original. This
+// exercises the critical rename-over-existing path with multi-page files
+// under cache pressure: both old and new files compete for cache slots
+// during the copy phase, and the rename must correctly re-key all pages.
+//
+// The pattern: open old → create temp → sequential copy with compaction →
+// close both → rename temp over original → syncfs → remount → verify.
+//
+// This targets bugs in:
+// - pageCache.renameFile with destination eviction under cache pressure
+// - Backend page re-keying when both source and destination have pages
+// - restoreTree size recovery after rename + persist
+// - Dirty page tracking across rename boundaries
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 11: VACUUM FULL @fast",
+  async (backend, maxPages) => {
+    const basePath = `${MOUNT}/base/16384`;
+    const heapPath = `${basePath}/16400`;
+    const toastPath = `${basePath}/16400_toast`;
+    const tempPath = `${basePath}/16400_vm_tmp`;
+    const totalPages = 12;
+    const readBuf = new Uint8Array(PAGE_SIZE);
+
+    // --- Cycle 1: create a heap with 12 pages of known data + TOAST ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(`${MOUNT}/base`);
+    FS1.mkdir(basePath);
+
+    const s1 = FS1.open(heapPath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < totalPages; p++) {
+      FS1.write(s1, fillPattern(PAGE_SIZE, p), 0, PAGE_SIZE);
+    }
+    FS1.close(s1);
+
+    // TOAST table with 4 pages
+    const toast1 = FS1.open(toastPath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < 4; p++) {
+      FS1.write(toast1, fillPattern(PAGE_SIZE, 0xA0 + p), 0, PAGE_SIZE);
+    }
+    FS1.close(toast1);
+
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: VACUUM FULL — rebuild the heap into a temp file ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Read back old heap to verify persistence from cycle 1
+    const oldHeap = FS2.open(heapPath, O.RDONLY);
+    for (let p = 0; p < totalPages; p++) {
+      FS2.read(oldHeap, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, p);
+    }
+
+    // Create temp file and copy live tuples (skip pages 3, 7, 11 = dead)
+    const tempFile = FS2.open(tempPath, O.RDWR | O.CREAT, 0o666);
+    let outPage = 0;
+    for (let p = 0; p < totalPages; p++) {
+      if (p === 3 || p === 7 || p === 11) continue; // dead tuples
+      FS2.read(oldHeap, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      // Write with compacted seed to distinguish from original
+      const compacted = fillPattern(PAGE_SIZE, p + 0x40);
+      FS2.write(tempFile, compacted, 0, PAGE_SIZE, outPage * PAGE_SIZE);
+      outPage++;
+    }
+    FS2.close(oldHeap);
+    FS2.close(tempFile);
+
+    // Rename temp over original (the VACUUM FULL atomic swap)
+    FS2.rename(tempPath, heapPath);
+
+    // Verify TOAST is untouched after heap rename
+    const toast2 = FS2.open(toastPath, O.RDONLY);
+    for (let p = 0; p < 4; p++) {
+      FS2.read(toast2, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, 0xA0 + p);
+    }
+    FS2.close(toast2);
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify VACUUM FULL results survived persistence ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+
+    // Heap should now have 9 compacted pages (12 - 3 dead)
+    const stat = FS3.stat(heapPath);
+    expect(stat.size).toBe(9 * PAGE_SIZE);
+
+    const s3 = FS3.open(heapPath, O.RDONLY);
+    let expectedPage = 0;
+    for (let origPage = 0; origPage < totalPages; origPage++) {
+      if (origPage === 3 || origPage === 7 || origPage === 11) continue;
+      FS3.read(s3, readBuf, 0, PAGE_SIZE, expectedPage * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, origPage + 0x40);
+      expectedPage++;
+    }
+    FS3.close(s3);
+
+    // TOAST should still be intact
+    const toast3 = FS3.open(toastPath, O.RDONLY);
+    for (let p = 0; p < 4; p++) {
+      FS3.read(toast3, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, 0xA0 + p);
+    }
+    FS3.close(toast3);
+
+    // Temp file should be gone
+    expect(() => FS3.stat(tempPath)).toThrow();
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 12: COPY Bulk Load — Sequential Write Exceeding Cache
+//
+// Postgres COPY writes tuples sequentially into heap pages, extending the
+// file one page at a time. For large imports, the total data far exceeds
+// the page cache capacity, forcing eviction of earlier pages while later
+// pages are still being written. After the COPY, an index is built by
+// scanning the heap (re-reading evicted pages) and writing index pages.
+//
+// This exercises:
+// - Sequential writes past cache capacity (eviction during write)
+// - Re-reading evicted pages (cache miss → backend read after eviction)
+// - Two files (heap + index) competing for cache slots
+// - Persistence of both files after the combined operation
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 12: COPY Bulk Load + Index Build",
+  async (backend, maxPages) => {
+    const basePath = `${MOUNT}/base/16384`;
+    const heapPath = `${basePath}/16390`;
+    const indexPath = `${basePath}/16390_idx`;
+    // 24 pages = 192 KB. With tiny cache (4 pages), this forces 6x cache
+    // rotations during the sequential write. With small cache (16 pages),
+    // still forces 1.5x rotation.
+    const heapPages = 24;
+    const readBuf = new Uint8Array(PAGE_SIZE);
+
+    // --- Cycle 1: COPY bulk load (sequential write) + index build ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(`${MOUNT}/base`);
+    FS1.mkdir(basePath);
+
+    // Simulate COPY: write pages sequentially
+    const heap1 = FS1.open(heapPath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < heapPages; p++) {
+      FS1.write(heap1, fillPattern(PAGE_SIZE, p), 0, PAGE_SIZE);
+    }
+    FS1.close(heap1);
+
+    // Build index: scan heap (forces re-read of evicted pages) and
+    // write index entries. Each index page references 4 heap pages.
+    const indexPages = Math.ceil(heapPages / 4);
+    const idx1 = FS1.open(indexPath, O.RDWR | O.CREAT, 0o666);
+    const heapScan = FS1.open(heapPath, O.RDONLY);
+
+    for (let ip = 0; ip < indexPages; ip++) {
+      // Read 4 heap pages to "scan" them
+      for (let h = 0; h < 4 && (ip * 4 + h) < heapPages; h++) {
+        const heapPageIdx = ip * 4 + h;
+        FS1.read(heapScan, readBuf, 0, PAGE_SIZE, heapPageIdx * PAGE_SIZE);
+        expectPattern(readBuf, PAGE_SIZE, heapPageIdx);
+      }
+      // Write one index page (derived from heap data)
+      FS1.write(idx1, fillPattern(PAGE_SIZE, 0xE0 + ip), 0, PAGE_SIZE);
+    }
+    FS1.close(heapScan);
+    FS1.close(idx1);
+
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: verify bulk load survived persistence ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Verify heap
+    const heapStat = FS2.stat(heapPath);
+    expect(heapStat.size).toBe(heapPages * PAGE_SIZE);
+
+    const heap2 = FS2.open(heapPath, O.RDONLY);
+    for (let p = 0; p < heapPages; p++) {
+      FS2.read(heap2, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, p);
+    }
+    FS2.close(heap2);
+
+    // Verify index
+    const idxStat = FS2.stat(indexPath);
+    expect(idxStat.size).toBe(indexPages * PAGE_SIZE);
+
+    const idx2 = FS2.open(indexPath, O.RDONLY);
+    for (let ip = 0; ip < indexPages; ip++) {
+      FS2.read(idx2, readBuf, 0, PAGE_SIZE, ip * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, 0xE0 + ip);
+    }
+    FS2.close(idx2);
+
+    // --- Update via positioned writes (simulating UPDATEs after COPY) ---
+    // Modify pages 5 and 15 (scattered within the heap)
+    const heap2w = FS2.open(heapPath, O.RDWR);
+    FS2.write(heap2w, fillPattern(PAGE_SIZE, 0xF5), 0, PAGE_SIZE, 5 * PAGE_SIZE);
+    FS2.write(heap2w, fillPattern(PAGE_SIZE, 0xFF), 0, PAGE_SIZE, 15 * PAGE_SIZE);
+    FS2.close(heap2w);
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify updates persisted correctly ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+
+    const heap3 = FS3.open(heapPath, O.RDONLY);
+    for (let p = 0; p < heapPages; p++) {
+      FS3.read(heap3, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      if (p === 5) {
+        expectPattern(readBuf, PAGE_SIZE, 0xF5);
+      } else if (p === 15) {
+        expectPattern(readBuf, PAGE_SIZE, 0xFF);
+      } else {
+        expectPattern(readBuf, PAGE_SIZE, p);
+      }
+    }
+    FS3.close(heap3);
+
+    // Index should be unchanged
+    const idx3 = FS3.open(indexPath, O.RDONLY);
+    for (let ip = 0; ip < indexPages; ip++) {
+      FS3.read(idx3, readBuf, 0, PAGE_SIZE, ip * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, 0xE0 + ip);
+    }
+    FS3.close(idx3);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 13: CREATE INDEX CONCURRENTLY — Multi-phase Index Build
+//
+// CREATE INDEX CONCURRENTLY builds the index in multiple phases:
+// 1. Sequential heap scan → write sorted entries to temp file
+// 2. Merge temp file into final index structure
+// 3. Rename temp to final index path
+// Each phase involves different I/O patterns competing for cache slots.
+// With a tiny cache, the heap scan evicts index pages and vice versa.
+//
+// This exercises:
+// - Three files (heap, temp, final index) competing for cache
+// - Read + write interleaving across files under extreme pressure
+// - Rename of a multi-page file to a new path (not over existing)
+// - Persistence after a complex multi-file operation
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 13: CREATE INDEX CONCURRENTLY @fast",
+  async (backend, maxPages) => {
+    const basePath = `${MOUNT}/base/16384`;
+    const heapPath = `${basePath}/16395`;
+    const tempIdxPath = `${basePath}/16395_idx_tmp`;
+    const finalIdxPath = `${basePath}/16395_pkey`;
+    const heapPages = 16;
+    const readBuf = new Uint8Array(PAGE_SIZE);
+
+    // --- Cycle 1: create heap table ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(`${MOUNT}/base`);
+    FS1.mkdir(basePath);
+
+    const s1 = FS1.open(heapPath, O.RDWR | O.CREAT, 0o666);
+    for (let p = 0; p < heapPages; p++) {
+      FS1.write(s1, fillPattern(PAGE_SIZE, p), 0, PAGE_SIZE);
+    }
+    FS1.close(s1);
+
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: build index concurrently ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Phase 1: scan heap → write sorted entries to temp index file
+    const heapScan = FS2.open(heapPath, O.RDONLY);
+    const tempIdx = FS2.open(tempIdxPath, O.RDWR | O.CREAT, 0o666);
+
+    // Each heap page produces half a page of index entries (compressed)
+    // So 16 heap pages → 8 index pages
+    const indexPages = heapPages / 2;
+    for (let ip = 0; ip < indexPages; ip++) {
+      // Read 2 heap pages per index page
+      for (let h = 0; h < 2; h++) {
+        const hp = ip * 2 + h;
+        FS2.read(heapScan, readBuf, 0, PAGE_SIZE, hp * PAGE_SIZE);
+        expectPattern(readBuf, PAGE_SIZE, hp);
+      }
+      // Write index page (derived from heap data)
+      FS2.write(tempIdx, fillPattern(PAGE_SIZE, 0xD0 + ip), 0, PAGE_SIZE);
+    }
+    FS2.close(heapScan);
+    FS2.close(tempIdx);
+
+    // Phase 2: rename temp index to final location
+    FS2.rename(tempIdxPath, finalIdxPath);
+
+    // Phase 3: verify heap is still readable after index build
+    // (ensure index build didn't corrupt heap pages in cache)
+    const heapVerify = FS2.open(heapPath, O.RDONLY);
+    for (let p = 0; p < heapPages; p++) {
+      FS2.read(heapVerify, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, p);
+    }
+    FS2.close(heapVerify);
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify index build results survived persistence ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+
+    // Temp index should be gone
+    expect(() => FS3.stat(tempIdxPath)).toThrow();
+
+    // Final index should exist
+    const idxStat = FS3.stat(finalIdxPath);
+    expect(idxStat.size).toBe(indexPages * PAGE_SIZE);
+
+    const idx3 = FS3.open(finalIdxPath, O.RDONLY);
+    for (let ip = 0; ip < indexPages; ip++) {
+      FS3.read(idx3, readBuf, 0, PAGE_SIZE, ip * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, 0xD0 + ip);
+    }
+    FS3.close(idx3);
+
+    // Heap should still be intact
+    const heap3 = FS3.open(heapPath, O.RDONLY);
+    for (let p = 0; p < heapPages; p++) {
+      FS3.read(heap3, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, p);
+    }
+    FS3.close(heap3);
+  },
+);
