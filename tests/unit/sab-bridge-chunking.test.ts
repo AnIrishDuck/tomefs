@@ -324,7 +324,7 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       expect(meta.mtime).toBe(200);
     });
 
-    it("@fast syncAll with 5 pages falls back to writePages + writeMetas", async () => {
+    it("@fast syncAll with 5 pages uses APPEND+COMMIT protocol", async () => {
       const pages = Array.from({ length: 5 }, (_, i) => ({
         path: "/syncmulti",
         pageIndex: i,
@@ -351,9 +351,10 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       expect(meta.size).toBe(5 * PAGE_SIZE);
     });
 
-    it("syncAll with many metas falls back to chunked writeMetas", async () => {
-      // 1 page + 20 metas. With the fix, metas.length (20) > maxBatchMetas (16)
-      // triggers the fallback path which chunks metas into [16, 4].
+    it("syncAll with many metas uses chunked APPEND+COMMIT", async () => {
+      // 1 page + 20 metas. metas.length (20) > maxBatchMetas (16) triggers
+      // the APPEND+COMMIT protocol: pages in 1 APPEND, metas in 2 APPENDs
+      // [16, 4], then a single COMMIT calls backend.syncAll() atomically.
       const pages = [{ path: "/file0", pageIndex: 0, data: fillPage(0xdd) }];
       const metas = Array.from({ length: 20 }, (_, i) => ({
         path: `/file${i}`,
@@ -390,7 +391,7 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       }
     });
 
-    it("@fast syncAll with combined pages + metas overflowing buffer falls back gracefully", async () => {
+    it("@fast syncAll with combined pages + metas overflowing buffer uses APPEND+COMMIT", async () => {
       // With the small buffer (12 KB data region), maxBatchPages=1 and
       // maxBatchMetas=16. A single page passes the pages check (1 <= 1),
       // and 16 metas passes the metas check (16 <= 16). But each limit
@@ -398,9 +399,8 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       // the combined payload is ~12.5 KB: 8192 bytes of page binary data +
       // ~4.3 KB of JSON metadata, exceeding the 12 KB data region.
       //
-      // Before the fix, this would throw "SAB buffer overflow" from
-      // encodeMessage. After the fix, syncAll catches the overflow and
-      // falls back to separate writePages + writeMetas calls.
+      // The SYNC_ALL fast path catches the overflow and falls back to the
+      // APPEND+COMMIT protocol, preserving backend.syncAll() atomicity.
       const longPath = (i: number) =>
         `/deeply/nested/directory/structure/that/inflates/json/size` +
         `_padding_to_make_this_much_longer_abcdefghijklmnopqrstuvwxyz_0123456789_abcdefghijklmnopqrstuvwxyz_extra_padding_here` +
