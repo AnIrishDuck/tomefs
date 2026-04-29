@@ -661,7 +661,7 @@ describe("SyncPageCache", () => {
     it("@fast starts at zero", () => {
       const cache = new SyncPageCache(backend, 4);
       const stats = cache.getStats();
-      expect(stats).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+      expect(stats).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0, dirtyEvictions: 0, cleanEvictions: 0, mruHits: 0 });
     });
 
     it("@fast counts cache miss on first getPage", () => {
@@ -740,7 +740,7 @@ describe("SyncPageCache", () => {
       expect(before.hits + before.misses + before.evictions + before.flushes).toBeGreaterThan(0);
 
       cache.resetStats();
-      expect(cache.getStats()).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+      expect(cache.getStats()).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0, dirtyEvictions: 0, cleanEvictions: 0, mruHits: 0 });
     });
 
     it("getStats returns a snapshot (not a live reference)", () => {
@@ -838,6 +838,103 @@ describe("SyncPageCache", () => {
       expect(stats.misses).toBe(3);
       // No pages should be counted as hits
       expect(stats.hits).toBe(0);
+    });
+  });
+
+  describe("dirty vs clean eviction stats", () => {
+    it("tracks clean eviction", () => {
+      const cache = new SyncPageCache(backend, 2);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 1);
+      cache.getPage("/file", 2);
+      const stats = cache.getStats();
+      expect(stats.evictions).toBe(1);
+      expect(stats.cleanEvictions).toBe(1);
+      expect(stats.dirtyEvictions).toBe(0);
+    });
+
+    it("tracks dirty eviction", () => {
+      const cache = new SyncPageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      cache.write("/file", data, 0, 1, 0, 0);
+      cache.getPage("/file", 1);
+      cache.getPage("/file", 2);
+      const stats = cache.getStats();
+      expect(stats.evictions).toBe(1);
+      expect(stats.dirtyEvictions).toBe(1);
+      expect(stats.cleanEvictions).toBe(0);
+    });
+
+    it("tracks mixed evictions", () => {
+      const cache = new SyncPageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      cache.write("/file", data, 0, 1, 0, 0);
+      cache.getPage("/file", 1);
+      // Evict dirty page 0 → dirtyEviction
+      cache.getPage("/file", 2);
+      // Evict clean page 1 → cleanEviction
+      cache.getPage("/file", 3);
+      const stats = cache.getStats();
+      expect(stats.evictions).toBe(2);
+      expect(stats.dirtyEvictions).toBe(1);
+      expect(stats.cleanEvictions).toBe(1);
+      expect(stats.dirtyEvictions + stats.cleanEvictions).toBe(stats.evictions);
+    });
+
+    it("invariant: dirtyEvictions + cleanEvictions == evictions after batch", () => {
+      const cache = new SyncPageCache(backend, 4);
+      const data = new Uint8Array(PAGE_SIZE * 4);
+      data.fill(0xaa);
+      cache.write("/a", data, 0, PAGE_SIZE * 4, 0, 0);
+      cache.resetStats();
+      const readBuf = new Uint8Array(PAGE_SIZE * 4);
+      cache.read("/b", readBuf, 0, PAGE_SIZE * 4, 0, PAGE_SIZE * 4);
+      const stats = cache.getStats();
+      expect(stats.dirtyEvictions + stats.cleanEvictions).toBe(stats.evictions);
+    });
+  });
+
+  describe("MRU hit stats", () => {
+    it("tracks MRU fast-path hits", () => {
+      const cache = new SyncPageCache(backend, 4);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 0);
+      const stats = cache.getStats();
+      expect(stats.mruHits).toBe(2);
+      expect(stats.hits).toBe(2);
+    });
+
+    it("does not count regular cache hit as MRU hit", () => {
+      const cache = new SyncPageCache(backend, 4);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 1);
+      cache.getPage("/file", 0);
+      const stats = cache.getStats();
+      expect(stats.hits).toBe(1);
+      expect(stats.mruHits).toBe(0);
+    });
+
+    it("MRU hit count is subset of total hits", () => {
+      const cache = new SyncPageCache(backend, 4);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 1);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 0);
+      const stats = cache.getStats();
+      expect(stats.mruHits).toBeLessThanOrEqual(stats.hits);
+      expect(stats.mruHits).toBe(2);
+      expect(stats.hits).toBe(3);
+    });
+
+    it("resets MRU hits with resetStats", () => {
+      const cache = new SyncPageCache(backend, 4);
+      cache.getPage("/file", 0);
+      cache.getPage("/file", 0);
+      expect(cache.getStats().mruHits).toBe(1);
+      cache.resetStats();
+      expect(cache.getStats().mruHits).toBe(0);
     });
   });
 

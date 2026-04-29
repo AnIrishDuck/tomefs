@@ -814,7 +814,7 @@ describe("PageCache", () => {
   describe("getStats", () => {
     it("@fast starts at zero", () => {
       const stats = cache.getStats();
-      expect(stats).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+      expect(stats).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0, dirtyEvictions: 0, cleanEvictions: 0, mruHits: 0 });
     });
 
     it("@fast counts cache miss on first getPage", async () => {
@@ -885,7 +885,7 @@ describe("PageCache", () => {
       expect(before.hits + before.misses + before.evictions + before.flushes).toBeGreaterThan(0);
 
       small.resetStats();
-      expect(small.getStats()).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0 });
+      expect(small.getStats()).toEqual({ hits: 0, misses: 0, evictions: 0, flushes: 0, dirtyEvictions: 0, cleanEvictions: 0, mruHits: 0 });
     });
 
     it("getStats returns a snapshot (not a live reference)", async () => {
@@ -961,6 +961,70 @@ describe("PageCache", () => {
       const stats = cache.getStats();
       expect(stats.misses).toBe(3);
       expect(stats.hits).toBe(0);
+    });
+  });
+
+  describe("dirty vs clean eviction stats", () => {
+    it("tracks clean eviction", async () => {
+      const small = new PageCache(backend, 2);
+      await small.getPage("/file", 0);
+      await small.getPage("/file", 1);
+      await small.getPage("/file", 2);
+      const stats = small.getStats();
+      expect(stats.evictions).toBe(1);
+      expect(stats.cleanEvictions).toBe(1);
+      expect(stats.dirtyEvictions).toBe(0);
+    });
+
+    it("tracks dirty eviction", async () => {
+      const small = new PageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      await small.write("/file", data, 0, 1, 0, 0);
+      await small.getPage("/file", 1);
+      await small.getPage("/file", 2);
+      const stats = small.getStats();
+      expect(stats.evictions).toBe(1);
+      expect(stats.dirtyEvictions).toBe(1);
+      expect(stats.cleanEvictions).toBe(0);
+    });
+
+    it("invariant: dirtyEvictions + cleanEvictions == evictions", async () => {
+      const small = new PageCache(backend, 2);
+      const data = new Uint8Array([1]);
+      await small.write("/file", data, 0, 1, 0, 0);
+      await small.getPage("/file", 1);
+      await small.getPage("/file", 2);
+      await small.getPage("/file", 3);
+      const stats = small.getStats();
+      expect(stats.dirtyEvictions + stats.cleanEvictions).toBe(stats.evictions);
+    });
+  });
+
+  describe("MRU hit stats", () => {
+    it("tracks MRU fast-path hits", async () => {
+      await cache.getPage("/file", 0);
+      await cache.getPage("/file", 0);
+      await cache.getPage("/file", 0);
+      const stats = cache.getStats();
+      expect(stats.mruHits).toBe(2);
+      expect(stats.hits).toBe(2);
+    });
+
+    it("does not count regular cache hit as MRU hit", async () => {
+      await cache.getPage("/file", 0);
+      await cache.getPage("/file", 1);
+      await cache.getPage("/file", 0);
+      const stats = cache.getStats();
+      expect(stats.hits).toBe(1);
+      expect(stats.mruHits).toBe(0);
+    });
+
+    it("resets MRU hits with resetStats", async () => {
+      await cache.getPage("/file", 0);
+      await cache.getPage("/file", 0);
+      expect(cache.getStats().mruHits).toBe(1);
+      cache.resetStats();
+      expect(cache.getStats().mruHits).toBe(0);
     });
   });
 

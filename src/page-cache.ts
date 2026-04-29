@@ -49,6 +49,9 @@ export class PageCache {
   private _misses = 0;
   private _evictions = 0;
   private _flushes = 0;
+  private _dirtyEvictions = 0;
+  private _cleanEvictions = 0;
+  private _mruHits = 0;
 
   constructor(backend: StorageBackend, maxPages: number = DEFAULT_MAX_PAGES) {
     if (maxPages < 1) {
@@ -109,6 +112,7 @@ export class PageCache {
     const mru = this.mruPage;
     if (mru !== null && mru.path === path && mru.pageIndex === pageIndex) {
       this._hits++;
+      this._mruHits++;
       return mru;
     }
 
@@ -764,13 +768,16 @@ export class PageCache {
     return this.dirtyKeys.size;
   }
 
-  /** Snapshot of performance counters (hits, misses, evictions, flushes). */
+  /** Snapshot of performance counters. */
   getStats(): CacheStats {
     return {
       hits: this._hits,
       misses: this._misses,
       evictions: this._evictions,
       flushes: this._flushes,
+      dirtyEvictions: this._dirtyEvictions,
+      cleanEvictions: this._cleanEvictions,
+      mruHits: this._mruHits,
     };
   }
 
@@ -780,6 +787,9 @@ export class PageCache {
     this._misses = 0;
     this._evictions = 0;
     this._flushes = 0;
+    this._dirtyEvictions = 0;
+    this._cleanEvictions = 0;
+    this._mruHits = 0;
   }
 
   /**
@@ -846,6 +856,9 @@ export class PageCache {
       victim.dirty = false;
       this.untrackDirty(victim.path, firstKey);
       this._flushes++;
+      this._dirtyEvictions++;
+    } else {
+      this._cleanEvictions++;
     }
 
     victim.evicted = true;
@@ -909,6 +922,8 @@ export class PageCache {
       await this.backend.writePages(dirtyPages);
     }
     this._flushes += dirtyPages.length;
+    this._dirtyEvictions += dirtyPages.length;
+    this._cleanEvictions += victimKeys.length - dirtyPages.length;
 
     // Remove victims from cache and indexes
     this._evictions += victimKeys.length;

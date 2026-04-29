@@ -58,4 +58,10 @@ export interface CacheStats {
   evictions: number;
   /** Total dirty pages flushed to the backend. */
   flushes: number;
+  /** Evictions that required flushing a dirty page (write amplification). */
+  dirtyEvictions: number;
+  /** Evictions of clean pages (no flush needed). */
+  cleanEvictions: number;
+  /** Cache hits via the MRU fast path (same page as last access). */
+  mruHits: number;
 }
