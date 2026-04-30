@@ -142,8 +142,8 @@ function seedWithOrphans(backend: DeleteAllFailBackend) {
   });
 }
 
-describe("clean marker written after orphan cleanup", { tags: ["@fast"] }, () => {
-  it("crash during deleteAll does not leave a clean marker", async () => {
+describe("clean marker written after orphan cleanup", () => {
+  it("crash during deleteAll does not leave a clean marker @fast", async () => {
     const backend = new DeleteAllFailBackend();
     seedWithOrphans(backend);
 
@@ -164,7 +164,7 @@ describe("clean marker written after orphan cleanup", { tags: ["@fast"] }, () =>
     expect(backend.inner.readMeta("/file")).not.toBeNull();
   });
 
-  it("retry after deleteAll failure succeeds and writes marker", async () => {
+  it("retry after deleteAll failure succeeds and writes marker @fast", async () => {
     const backend = new DeleteAllFailBackend();
     seedWithOrphans(backend);
 
@@ -191,7 +191,7 @@ describe("clean marker written after orphan cleanup", { tags: ["@fast"] }, () =>
     expect(backend.inner.listFiles()).toContain("/file");
   });
 
-  it("remount after failed orphan cleanup forces cleanup", async () => {
+  it("remount after failed orphan cleanup forces cleanup @fast", async () => {
     const backend = new DeleteAllFailBackend();
     seedWithOrphans(backend);
 
@@ -234,7 +234,7 @@ describe("clean marker written after orphan cleanup", { tags: ["@fast"] }, () =>
     }
   });
 
-  it("successful cleanup writes marker and clears orphans in one pass", async () => {
+  it("successful cleanup writes marker and clears orphans in one pass @fast", async () => {
     const backend = new DeleteAllFailBackend();
     seedWithOrphans(backend);
 
@@ -266,7 +266,7 @@ describe("clean marker written after orphan cleanup", { tags: ["@fast"] }, () =>
     expect(backend.deleteAllCallCount).toBe(0);
   });
 
-  it("no orphans: marker still written after empty check", async () => {
+  it("no orphans: marker still written after empty check @fast", async () => {
     const backend = new DeleteAllFailBackend();
 
     // No orphans — just a clean file
@@ -288,7 +288,7 @@ describe("clean marker written after orphan cleanup", { tags: ["@fast"] }, () =>
     expect(backend.inner.readMeta(CLEAN_MARKER)).not.toBeNull();
   });
 
-  it("multiple orphans cleaned up atomically before marker", async () => {
+  it("multiple orphans cleaned up atomically before marker @fast", async () => {
     const backend = new DeleteAllFailBackend();
 
     // Real file
