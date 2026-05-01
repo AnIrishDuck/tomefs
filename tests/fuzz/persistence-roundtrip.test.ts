@@ -103,11 +103,16 @@ interface SymlinkState {
   target: string;
 }
 
+/** Shared file position: duped FDs share the same position object (POSIX semantics). */
+interface SharedPosition {
+  value: number;
+}
+
 interface OpenFdState {
   /** Model path of the open file. */
   path: string;
-  /** Current stream position. */
-  position: number;
+  /** Shared stream position — dup'd FDs reference the same object. */
+  position: SharedPosition;
   /** True when the file has been unlinked while this fd was open. */
   orphaned: boolean;
 }
@@ -387,7 +392,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
         offset = rng.int(fileSize + PAGE_SIZE + 1);
       } else {
         // SEEK_CUR: relative to current position, keep non-negative result
-        const maxForward = fileSize + PAGE_SIZE - fd.position;
+        const maxForward = fileSize + PAGE_SIZE - fd.position.value;
         offset = rng.int(Math.max(1, maxForward + 1));
       }
       return { type: "seekFd", fdId, offset, whence };
@@ -818,7 +823,7 @@ function updateModel(model: FSModel, op: Op): void {
     }
 
     case "openFd": {
-      model.openFds.set(op.fdId, { path: op.path, position: 0, orphaned: false });
+      model.openFds.set(op.fdId, { path: op.path, position: { value: 0 }, orphaned: false });
       model.nextFdId = op.fdId + 1;
       break;
     }
@@ -827,22 +832,18 @@ function updateModel(model: FSModel, op: Op): void {
       const fd = model.openFds.get(op.fdId);
       if (!fd) break;
       if (fd.orphaned) {
-        // Orphaned FD: data won't survive remount, just advance position.
-        // The write still executes against the real FS — this exercises
-        // the tomefs path for writing to unlinked files via open FDs.
-        fd.position += op.data.length;
+        fd.position.value += op.data.length;
         break;
       }
       const file = model.files.get(fd.path);
       if (!file) break;
-      const pos = fd.position;
+      const pos = fd.position.value;
       const newSize = Math.max(file.data.length, pos + op.data.length);
       const newData = new Uint8Array(newSize);
       newData.set(file.data);
       newData.set(op.data, pos);
       file.data = newData;
-      fd.position = pos + op.data.length;
-      // Write via fd updates mtime
+      fd.position.value = pos + op.data.length;
       file.mtime = null;
       break;
     }
@@ -852,18 +853,18 @@ function updateModel(model: FSModel, op: Op): void {
       if (!fd) break;
       if (fd.orphaned) {
         if (op.whence === SEEK_SET) {
-          fd.position = op.offset;
+          fd.position.value = op.offset;
         } else if (op.whence === SEEK_CUR) {
-          fd.position = fd.position + op.offset;
+          fd.position.value = fd.position.value + op.offset;
         }
         break;
       }
       const file = model.files.get(fd.path);
       if (!file) break;
       if (op.whence === SEEK_SET) {
-        fd.position = op.offset;
+        fd.position.value = op.offset;
       } else if (op.whence === SEEK_CUR) {
-        fd.position = fd.position + op.offset;
+        fd.position.value = fd.position.value + op.offset;
       }
       break;
     }
@@ -881,6 +882,7 @@ function updateModel(model: FSModel, op: Op): void {
       const srcFd = model.openFds.get(op.srcFdId);
       if (!srcFd) break;
       model.openFds.set(op.newFdId, { path: srcFd.path, position: srcFd.position, orphaned: srcFd.orphaned });
+      // position is a shared reference — dup'd FDs share the same position object (POSIX dup semantics)
       model.nextFdId = op.newFdId + 1;
       break;
     }
