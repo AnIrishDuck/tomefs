@@ -18,8 +18,6 @@
  */
 import {
   createFS,
-  encode,
-  decode,
   O,
   SEEK_SET,
   type FSHarness,
