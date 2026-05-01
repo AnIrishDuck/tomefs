@@ -890,6 +890,7 @@ function updateModel(model: FSModel, op: Op): void {
     case "ftruncateFd": {
       const fd = model.openFds.get(op.fdId);
       if (!fd) break;
+      if (fd.orphaned) break;
       const file = model.files.get(fd.path);
       if (!file) break;
       if (op.size < file.data.length) {
