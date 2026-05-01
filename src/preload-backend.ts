@@ -83,6 +83,21 @@ export class PreloadBackend implements SyncStorageBackend {
   }
 
   private async doInit(): Promise<void> {
+    // Clear state from any previous failed attempt. Without this, a retry
+    // after partial failure leaves stale pages and secondary indices for
+    // files that loaded successfully before the failure. If the remote
+    // state changed between attempts (e.g., another tab deleted a file),
+    // the stale entries persist with no metadata referencing them.
+    this.pages.clear();
+    this.meta.clear();
+    this.filePageKeys.clear();
+    this.filePageIndices.clear();
+    this.dirtyPages.clear();
+    this.dirtyMeta.clear();
+    this.deletedFiles.clear();
+    this.truncations.clear();
+    this.deletedMeta.clear();
+
     const files = await this.remote.listFiles();
 
     // Batch-read all metadata and true page extents in parallel.
@@ -375,6 +390,11 @@ export class PreloadBackend implements SyncStorageBackend {
   ): void {
     this.writePages(pages);
     this.writeMetas(metas);
+  }
+
+  deleteAll(paths: string[]): void {
+    this.deleteFiles(paths);
+    this.deleteMetas(paths);
   }
 
   // --- Flush: persist dirty state back to the async backend ---

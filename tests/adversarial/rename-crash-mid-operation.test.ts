@@ -175,6 +175,10 @@ class CrashAfterNOpsSyncBackend implements SyncStorageBackend {
     this.writePages(pages);
     this.writeMetas(metas);
   }
+  deleteAll(paths: string[]): void {
+    this.deleteFiles(paths);
+    this.deleteMetas(paths);
+  }
 }
 
 async function mountTome(backend: SyncStorageBackend, maxPages?: number) {

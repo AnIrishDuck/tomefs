@@ -910,3 +910,286 @@ describeWithPersistence(
     FSv.close(ivs);
   },
 );
+
+// ---------------------------------------------------------------------------
+// Scenario 9: WAL Segment Recycling
+//
+// Postgres reuses WAL segment files instead of creating new ones. After a
+// checkpoint consumes a WAL segment, Postgres renames the archived segment
+// to a new segment number (recycling), truncates it, and writes fresh data.
+// This differs from WAL rotation (Scenario 1): rotation archives segments
+// with a .done suffix; recycling reuses the FILE itself for a new segment.
+//
+// The recycling pattern exercises a critical interaction chain:
+//   1. rename(old_segment, new_segment) — page cache moves pages to new path
+//   2. truncate(new_segment, 0) — page cache deletes ALL old pages
+//   3. write(new_segment, new_data) — page cache adds new pages at same path
+//   4. syncfs — persist new data under the new segment name
+//   5. remount — verify new data survives, old data is gone
+//
+// A bug in any step can cause data corruption: stale pages from the old
+// segment surviving the rename+truncate, or new pages being keyed under
+// the wrong storage path after rename.
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 9: WAL Segment Recycling @fast",
+  async (backend, maxPages) => {
+    const walDir = `${MOUNT}/pg_wal`;
+    const segmentSize = PAGE_SIZE * 4; // 32 KB per WAL segment
+
+    // --- Cycle 1: create 3 WAL segments and fill them ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(walDir);
+
+    for (let seg = 0; seg < 3; seg++) {
+      writeFile(FS1, `${walDir}/seg_${seg}`, fillPattern(segmentSize, seg + 1));
+    }
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: "checkpoint" consumes seg_0 and seg_1; recycle them ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Verify all 3 segments survived remount
+    for (let seg = 0; seg < 3; seg++) {
+      const data = readFile(FS2, `${walDir}/seg_${seg}`, segmentSize);
+      expectPattern(data, segmentSize, seg + 1);
+    }
+
+    // Recycle seg_0 → seg_3: rename, truncate, write new data
+    FS2.rename(`${walDir}/seg_0`, `${walDir}/seg_3`);
+    FS2.truncate(`${walDir}/seg_3`, 0);
+    writeFile(FS2, `${walDir}/seg_3`, fillPattern(segmentSize, 0x30));
+
+    // Recycle seg_1 → seg_4: rename, truncate, write new data
+    FS2.rename(`${walDir}/seg_1`, `${walDir}/seg_4`);
+    FS2.truncate(`${walDir}/seg_4`, 0);
+    writeFile(FS2, `${walDir}/seg_4`, fillPattern(segmentSize, 0x40));
+
+    // seg_2 remains active (current WAL segment), extend it
+    appendFile(FS2, `${walDir}/seg_2`, fillPattern(PAGE_SIZE, 0x2E));
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify recycled segments have NEW data ---
+    const { FS: FS3, tomefs: t3 } = await mountTome(backend, maxPages);
+
+    // seg_0 and seg_1 should be GONE (recycled into seg_3 and seg_4)
+    expect(() => FS3.stat(`${walDir}/seg_0`)).toThrow();
+    expect(() => FS3.stat(`${walDir}/seg_1`)).toThrow();
+
+    // seg_2 should be extended (original 4 pages + 1 appended)
+    const seg2 = readFile(FS3, `${walDir}/seg_2`, segmentSize + PAGE_SIZE);
+    expectPattern(seg2.subarray(0, segmentSize), segmentSize, 3);
+    expectPattern(seg2.subarray(segmentSize), PAGE_SIZE, 0x2E);
+
+    // seg_3 should have NEW data from cycle 2, NOT old seg_0 data
+    const seg3 = readFile(FS3, `${walDir}/seg_3`, segmentSize);
+    expectPattern(seg3, segmentSize, 0x30);
+
+    // seg_4 should have NEW data from cycle 2, NOT old seg_1 data
+    const seg4 = readFile(FS3, `${walDir}/seg_4`, segmentSize);
+    expectPattern(seg4, segmentSize, 0x40);
+
+    // --- Cycle 3 continued: recycle seg_2 → seg_5, create seg_6 ---
+    FS3.rename(`${walDir}/seg_2`, `${walDir}/seg_5`);
+    FS3.truncate(`${walDir}/seg_5`, 0);
+    writeFile(FS3, `${walDir}/seg_5`, fillPattern(PAGE_SIZE * 2, 0x50));
+
+    // Create a brand new segment (not recycled)
+    writeFile(FS3, `${walDir}/seg_6`, fillPattern(PAGE_SIZE * 3, 0x60));
+
+    syncAndUnmount(FS3, t3);
+
+    // --- Cycle 4: final verification across all surviving segments ---
+    const { FS: FS4 } = await mountTome(backend, maxPages);
+
+    const entries = FS4.readdir(walDir)
+      .filter((e: string) => e !== "." && e !== "..")
+      .sort();
+    expect(entries).toEqual(["seg_3", "seg_4", "seg_5", "seg_6"]);
+
+    // Verify each segment has correct data
+    const seg3v = readFile(FS4, `${walDir}/seg_3`, segmentSize);
+    expectPattern(seg3v, segmentSize, 0x30);
+
+    const seg4v = readFile(FS4, `${walDir}/seg_4`, segmentSize);
+    expectPattern(seg4v, segmentSize, 0x40);
+
+    const seg5v = readFile(FS4, `${walDir}/seg_5`, PAGE_SIZE * 2);
+    expectPattern(seg5v, PAGE_SIZE * 2, 0x50);
+
+    const seg6v = readFile(FS4, `${walDir}/seg_6`, PAGE_SIZE * 3);
+    expectPattern(seg6v, PAGE_SIZE * 3, 0x60);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Scenario 10: WAL Pre-allocation + Recycling Under Cache Pressure
+//
+// Postgres pre-allocates WAL segments via posix_fallocate() to avoid
+// filesystem allocation latency during critical WAL writes. The pre-
+// allocated segment is a sparse file filled with zeros. After filling,
+// the segment is checkpointed and recycled. Under small cache sizes,
+// the pre-allocation can thrash the cache if it materializes too many
+// pages (the allocate() optimization in tomefs only materializes the
+// LAST page as a sentinel — see resizeFileStorage comments).
+//
+// This test verifies:
+//   1. allocate() correctly extends file size without data corruption
+//   2. Pre-allocated regions read as zeros (POSIX guarantee)
+//   3. Writes into pre-allocated space work correctly
+//   4. Recycling a pre-allocated+filled segment preserves new data
+//   5. All of the above survives syncfs + remount at each cache size
+// ---------------------------------------------------------------------------
+
+describeWithPersistence(
+  "Persistence Scenario 10: WAL Pre-allocation + Recycling",
+  async (backend, maxPages) => {
+    const walDir = `${MOUNT}/pg_wal`;
+    const preAllocSize = PAGE_SIZE * 6; // 48 KB pre-allocated segment
+
+    // --- Cycle 1: pre-allocate, then fill partially ---
+    const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);
+    FS1.mkdir(walDir);
+
+    // Pre-allocate a WAL segment (posix_fallocate equivalent)
+    const stream1 = FS1.open(
+      `${walDir}/seg_000`,
+      O.RDWR | O.CREAT,
+      0o666,
+    );
+    stream1.stream_ops.allocate(stream1, 0, preAllocSize);
+
+    // Verify size is extended
+    const stat1 = FS1.fstat(stream1.fd);
+    expect(stat1.size).toBe(preAllocSize);
+
+    // Verify pre-allocated region reads as zeros
+    const zeroBuf = new Uint8Array(PAGE_SIZE);
+    for (let p = 0; p < 6; p++) {
+      const n = FS1.read(stream1, zeroBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expect(n).toBe(PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        if (zeroBuf[i] !== 0) {
+          throw new Error(
+            `Pre-allocated page ${p} byte ${i} is ${zeroBuf[i]}, expected 0`,
+          );
+        }
+      }
+    }
+
+    // Write WAL records into first 3 pages (partially filling the segment)
+    for (let p = 0; p < 3; p++) {
+      FS1.write(
+        stream1,
+        fillPattern(PAGE_SIZE, 0xA0 + p),
+        0,
+        PAGE_SIZE,
+        p * PAGE_SIZE,
+      );
+    }
+    FS1.close(stream1);
+
+    syncAndUnmount(FS1, t1);
+
+    // --- Cycle 2: verify partial fill + continue filling + recycle ---
+    const { FS: FS2, tomefs: t2 } = await mountTome(backend, maxPages);
+
+    // Verify the segment size and partial fill survived remount
+    const stat2 = FS2.stat(`${walDir}/seg_000`);
+    expect(stat2.size).toBe(preAllocSize);
+
+    const stream2 = FS2.open(`${walDir}/seg_000`, O.RDWR);
+    const readBuf = new Uint8Array(PAGE_SIZE);
+
+    // First 3 pages have written data
+    for (let p = 0; p < 3; p++) {
+      FS2.read(stream2, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, 0xA0 + p);
+    }
+
+    // Last 3 pages should still be zero (pre-allocated but unwritten)
+    for (let p = 3; p < 6; p++) {
+      FS2.read(stream2, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        if (readBuf[i] !== 0) {
+          throw new Error(
+            `Post-remount pre-allocated page ${p} byte ${i} is ${readBuf[i]}, expected 0`,
+          );
+        }
+      }
+    }
+
+    // Fill remaining 3 pages
+    for (let p = 3; p < 6; p++) {
+      FS2.write(
+        stream2,
+        fillPattern(PAGE_SIZE, 0xB0 + p),
+        0,
+        PAGE_SIZE,
+        p * PAGE_SIZE,
+      );
+    }
+    FS2.close(stream2);
+
+    // Now recycle seg_000 → seg_001: rename, truncate, pre-allocate, fill
+    FS2.rename(`${walDir}/seg_000`, `${walDir}/seg_001`);
+    FS2.truncate(`${walDir}/seg_001`, 0);
+
+    // Pre-allocate the recycled segment (same size)
+    const stream2b = FS2.open(`${walDir}/seg_001`, O.RDWR);
+    stream2b.stream_ops.allocate(stream2b, 0, preAllocSize);
+
+    // Partially fill with different data
+    for (let p = 0; p < 2; p++) {
+      FS2.write(
+        stream2b,
+        fillPattern(PAGE_SIZE, 0xC0 + p),
+        0,
+        PAGE_SIZE,
+        p * PAGE_SIZE,
+      );
+    }
+    FS2.close(stream2b);
+
+    syncAndUnmount(FS2, t2);
+
+    // --- Cycle 3: verify recycled+pre-allocated segment ---
+    const { FS: FS3 } = await mountTome(backend, maxPages);
+
+    // seg_000 should be gone
+    expect(() => FS3.stat(`${walDir}/seg_000`)).toThrow();
+
+    // seg_001 should exist with pre-allocated size
+    const stat3 = FS3.stat(`${walDir}/seg_001`);
+    expect(stat3.size).toBe(preAllocSize);
+
+    const stream3 = FS3.open(`${walDir}/seg_001`, O.RDONLY);
+
+    // First 2 pages have new data (from cycle 2 after recycling)
+    for (let p = 0; p < 2; p++) {
+      FS3.read(stream3, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      expectPattern(readBuf, PAGE_SIZE, 0xC0 + p);
+    }
+
+    // Pages 2-5 should be zeros (pre-allocated but unwritten after recycle)
+    for (let p = 2; p < 6; p++) {
+      FS3.read(stream3, readBuf, 0, PAGE_SIZE, p * PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        if (readBuf[i] !== 0) {
+          throw new Error(
+            `Final verify recycled page ${p} byte ${i} is ${readBuf[i]}, expected 0`,
+          );
+        }
+      }
+    }
+    FS3.close(stream3);
+
+    // Directory should only contain seg_001
+    const entries = FS3.readdir(walDir)
+      .filter((e: string) => e !== "." && e !== "..")
+      .sort();
+    expect(entries).toEqual(["seg_001"]);
+  },
+);

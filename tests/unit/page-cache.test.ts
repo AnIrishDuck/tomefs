@@ -1326,4 +1326,71 @@ describe("PageCache", () => {
       expect(stored![0]).toBe(0x42);
     });
   });
+
+  describe("markPageDirtyNoRead", () => {
+    it("@fast marks a page as dirty without reading from backend", async () => {
+      let readPageCalls = 0;
+      const origReadPage = backend.readPage.bind(backend);
+      backend.readPage = async (path: string, pageIndex: number) => {
+        readPageCalls++;
+        return origReadPage(path, pageIndex);
+      };
+
+      await cache.markPageDirtyNoRead("/file", 5);
+
+      expect(readPageCalls).toBe(0);
+      expect(cache.isDirty("/file", 5)).toBe(true);
+      expect(cache.has("/file", 5)).toBe(true);
+    });
+
+    it("creates a zero-filled page on cache miss", async () => {
+      await cache.markPageDirtyNoRead("/file", 3);
+
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/file", buf, 0, PAGE_SIZE, 3 * PAGE_SIZE, 4 * PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        expect(buf[i]).toBe(0);
+      }
+    });
+
+    it("reuses existing cached page when already loaded", async () => {
+      await cache.write("/file", fillBuf(PAGE_SIZE, 0xAB), 0, PAGE_SIZE, 0, 0);
+      await cache.flushFile("/file");
+
+      expect(cache.isDirty("/file", 0)).toBe(false);
+      await cache.markPageDirtyNoRead("/file", 0);
+      expect(cache.isDirty("/file", 0)).toBe(true);
+
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xAB);
+    });
+
+    it("sentinel page survives flush + eviction round-trip", async () => {
+      await cache.markPageDirtyNoRead("/file", 10);
+
+      await cache.flushAll();
+      expect(cache.isDirty("/file", 10)).toBe(false);
+
+      await cache.evictFile("/file");
+      expect(cache.has("/file", 10)).toBe(false);
+
+      const stored = await backend.readPage("/file", 10);
+      expect(stored).not.toBeNull();
+      expect(stored!.every((b: number) => b === 0)).toBe(true);
+    });
+  });
+
+  describe("markPageDirty", () => {
+    it("loads existing data from backend when page is not cached", async () => {
+      await backend.writePage("/file", 2, fillBuf(PAGE_SIZE, 0xCD));
+
+      await cache.markPageDirty("/file", 2);
+
+      expect(cache.isDirty("/file", 2)).toBe(true);
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/file", buf, 0, PAGE_SIZE, 2 * PAGE_SIZE, 3 * PAGE_SIZE);
+      expect(buf[0]).toBe(0xCD);
+    });
+  });
 });

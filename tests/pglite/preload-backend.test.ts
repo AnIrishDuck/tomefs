@@ -246,6 +246,135 @@ describe("PGlite + PreloadBackend persistence (MemoryBackend remote)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Auto-flush: syncToFs propagates to remote without manual flush()
+// ---------------------------------------------------------------------------
+
+describe("PGlite + PreloadBackend auto-flush (ethos §10)", () => {
+  it("syncToFs alone persists data to remote backend @fast", async () => {
+    const remote = new MemoryBackend();
+
+    // Session 1: create data, sync WITHOUT manual flush()
+    const h1 = await createPreloadHarness(remote);
+    await h1.pg.query(
+      `CREATE TABLE autoflush (id SERIAL PRIMARY KEY, msg TEXT)`,
+    );
+    await h1.pg.query(
+      `INSERT INTO autoflush (msg) VALUES ('alpha'), ('beta')`,
+    );
+    await h1.syncToFs();
+    // Explicitly NOT calling h1.flush() — auto-flush should handle it
+    await h1.destroy();
+
+    // Verify remote backend has data (not just PreloadBackend's memory)
+    const files = await remote.listFiles();
+    expect(files.length).toBeGreaterThan(0);
+
+    // Session 2: fresh PGlite on same remote — data should survive
+    const h2 = await createPreloadHarness(remote);
+    const result = await h2.pg.query(
+      `SELECT msg FROM autoflush ORDER BY id`,
+    );
+    expect(result.rows).toEqual([{ msg: "alpha" }, { msg: "beta" }]);
+  });
+
+  it("pg.close() auto-flushes to remote backend", async () => {
+    const remote = new MemoryBackend();
+
+    // Session 1: create data, close PGlite (which calls closeFs → syncfs → auto-flush)
+    const h1 = await createPreloadHarness(remote);
+    await h1.pg.query(
+      `CREATE TABLE closeflush (id SERIAL PRIMARY KEY, val INT)`,
+    );
+    await h1.pg.query(`INSERT INTO closeflush (val) VALUES (42), (99)`);
+    // Only call close — no syncToFs or flush. closeFs should handle everything.
+    await h1.destroy();
+
+    // Verify remote has data
+    const files = await remote.listFiles();
+    expect(files.length).toBeGreaterThan(0);
+
+    // Session 2: verify round-trip
+    const h2 = await createPreloadHarness(remote);
+    const result = await h2.pg.query(
+      `SELECT val FROM closeflush ORDER BY id`,
+    );
+    expect(result.rows).toEqual([{ val: 42 }, { val: 99 }]);
+  });
+
+  it("multiple sync cycles without manual flush", async () => {
+    const remote = new MemoryBackend();
+
+    // Cycle 1: create + sync (auto-flush)
+    const h1 = await createPreloadHarness(remote);
+    await h1.pg.query(`CREATE TABLE cycles (id SERIAL PRIMARY KEY, n INT)`);
+    await h1.pg.query(`INSERT INTO cycles (n) VALUES (1)`);
+    await h1.syncToFs();
+    await h1.destroy();
+
+    // Cycle 2: extend + sync (auto-flush)
+    const h2 = await createPreloadHarness(remote);
+    await h2.pg.query(`INSERT INTO cycles (n) VALUES (2)`);
+    await h2.syncToFs();
+    await h2.destroy();
+
+    // Cycle 3: verify all data from both cycles
+    const h3 = await createPreloadHarness(remote);
+    const result = await h3.pg.query(`SELECT n FROM cycles ORDER BY id`);
+    expect(result.rows).toEqual([{ n: 1 }, { n: 2 }]);
+  });
+
+  it("auto-flush under cache pressure persists correctly", async () => {
+    const remote = new MemoryBackend();
+
+    // Write enough data to cause cache evictions with tiny cache
+    const h1 = await createPreloadHarness(remote, 8);
+    await h1.pg.query(
+      `CREATE TABLE pressure_af (id SERIAL PRIMARY KEY, data TEXT)`,
+    );
+    for (let i = 0; i < 15; i++) {
+      await h1.pg.query(`INSERT INTO pressure_af (data) VALUES ($1)`, [
+        `row-${i}-${"z".repeat(200)}`,
+      ]);
+    }
+    await h1.syncToFs();
+    // No manual flush — auto-flush should propagate
+    await h1.destroy();
+
+    // Remount and verify
+    const h2 = await createPreloadHarness(remote, 8);
+    const count = await h2.pg.query(
+      `SELECT COUNT(*)::int as count FROM pressure_af`,
+    );
+    expect(count.rows[0].count).toBe(15);
+  });
+
+  it("auto-flush with IdbBackend remote @fast", async () => {
+    const dbName = `pglite-autoflush-idb-${Date.now()}`;
+
+    // Session 1: write through IDB-backed PreloadBackend, only syncToFs
+    const idb1 = new IdbBackend({ dbName });
+    const h1 = await createPreloadHarness(idb1);
+    await h1.pg.query(
+      `CREATE TABLE idb_af (id SERIAL PRIMARY KEY, name TEXT)`,
+    );
+    await h1.pg.query(
+      `INSERT INTO idb_af (name) VALUES ('widget'), ('gadget')`,
+    );
+    await h1.syncToFs();
+    // No manual flush
+    await h1.destroy();
+
+    // Session 2: fresh PreloadBackend on same IDB
+    const idb2 = new IdbBackend({ dbName });
+    const h2 = await createPreloadHarness(idb2);
+    const result = await h2.pg.query(
+      `SELECT name FROM idb_af ORDER BY id`,
+    );
+    expect(result.rows).toEqual([{ name: "widget" }, { name: "gadget" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Cache pressure with PreloadBackend
 // ---------------------------------------------------------------------------
 
