@@ -89,15 +89,29 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
     };
   };
 
-  // Override syncToFs to flush tomefs
-  adapter.syncToFs = async (_relaxedDurability?: boolean) => {
-    if (!moduleFS) return;
-    return new Promise<void>((resolve, reject) => {
+  // Sync tomefs dirty state to the backend, then flush to persistent storage
+  // if the backend supports it. PreloadBackend has a two-phase persistence
+  // model: syncfs writes to its in-memory store, then flush() propagates to
+  // the underlying async backend (IDB/OPFS). Without this auto-flush, data
+  // written through PreloadBackend would never reach persistent storage.
+  // SyncMemoryBackend and SabClient don't have flush(), so the check is a
+  // no-op for those backends.
+  const syncAndFlush = async () => {
+    await new Promise<void>((resolve, reject) => {
       moduleFS.syncfs(false, (err: Error | null) => {
         if (err) reject(err);
         else resolve();
       });
     });
+    if (typeof (backend as any).flush === "function") {
+      await (backend as any).flush();
+    }
+  };
+
+  // Override syncToFs to flush tomefs + propagate to persistent storage
+  adapter.syncToFs = async (_relaxedDurability?: boolean) => {
+    if (!moduleFS) return;
+    await syncAndFlush();
   };
 
   // Override closeFs to persist all state before shutdown.
@@ -106,12 +120,7 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
   const originalCloseFs = adapter.closeFs.bind(adapter);
   adapter.closeFs = async () => {
     if (moduleFS) {
-      await new Promise<void>((resolve, reject) => {
-        moduleFS.syncfs(false, (err: Error | null) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
+      await syncAndFlush();
     }
     return originalCloseFs();
   };

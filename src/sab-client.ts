@@ -380,33 +380,62 @@ export class SabClient implements SyncStorageBackend {
     return allFiles;
   }
 
+  deleteAll(paths: string[]): void {
+    if (paths.length === 0) return;
+
+    if (paths.length <= this.maxBatchMetas) {
+      this.call(OpCode.DELETE_ALL, { paths });
+      return;
+    }
+
+    for (let i = 0; i < paths.length; i += this.maxBatchMetas) {
+      this.call(OpCode.DELETE_ALL, {
+        paths: paths.slice(i, i + this.maxBatchMetas),
+      });
+    }
+  }
+
   syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): void {
     if (pages.length === 0 && metas.length === 0) return;
 
-    // Fast path: everything fits in a single SAB call.
+    // Fast path: try to fit everything in a single atomic SAB call.
     // This is the common case — steady-state syncfs writes a handful of
     // dirty pages + their metadata, well within the 1 MB SAB buffer.
-    // Check both pages AND metas fit within their respective limits —
-    // each limit is computed assuming the full buffer is available for
-    // that payload type, so combining both in one message could overflow
-    // if either is near its limit.
+    //
+    // Both maxBatchPages and maxBatchMetas are computed assuming the full
+    // buffer is available for just that payload type. When both pages and
+    // metas are present, the combined payload may exceed the buffer even
+    // though each passes its independent limit check. We catch the buffer
+    // overflow from encodeMessage (thrown before the worker is signaled)
+    // and fall back to chunked calls.
     if (pages.length <= this.maxBatchPages && metas.length <= this.maxBatchMetas) {
-      const pageMeta = pages.map((p) => ({
-        path: p.path,
-        pageIndex: p.pageIndex,
-        dataLen: p.data.length,
-      }));
-      const chunks = pages.map((p) => p.data);
-      this.call(OpCode.SYNC_ALL, { pages: pageMeta, metas }, chunks);
-      return;
+      try {
+        const pageMeta = pages.map((p) => ({
+          path: p.path,
+          pageIndex: p.pageIndex,
+          dataLen: p.data.length,
+        }));
+        const chunks = pages.map((p) => p.data);
+        this.call(OpCode.SYNC_ALL, { pages: pageMeta, metas }, chunks);
+        return;
+      } catch (e) {
+        // If the combined payload overflowed the buffer, fall through to
+        // the chunked path. encodeMessage throws before signaling the
+        // worker, so the bridge is still in IDLE state and safe to reuse.
+        // Re-throw non-overflow errors (e.g., worker timeout, decode errors).
+        if (!(e instanceof Error && e.message.includes("SAB buffer overflow"))) {
+          throw e;
+        }
+      }
     }
 
-    // Fallback: too many pages for a single call. Use separate writePages
-    // + writeMetas calls. This loses single-transaction atomicity for the
-    // IDB backend, but is needed to avoid SAB buffer overflow.
+    // Fallback: too large for a single call. Use separate writePages
+    // + writeMetas calls (each handles its own chunking). This loses
+    // single-transaction atomicity for the IDB backend, but is needed
+    // to avoid SAB buffer overflow.
     this.writePages(pages);
     if (metas.length > 0) {
       this.writeMetas(metas);

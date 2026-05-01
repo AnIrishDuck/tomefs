@@ -444,5 +444,9 @@ function createTrackingBackend(
       inner.writePages(pages);
       inner.writeMetas(metas);
     },
+    deleteAll(paths: string[]): void {
+      log.push(`deleteAll:${paths.join(",")}`);
+      inner.deleteAll(paths);
+    },
   };
 }

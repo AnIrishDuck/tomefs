@@ -574,6 +574,179 @@ describe("IdbBackend", () => {
   // Edge cases
   // -------------------------------------------------------------------
 
+  // -------------------------------------------------------------------
+  // Transaction abort handling
+  // -------------------------------------------------------------------
+
+  describe("transaction abort handling", () => {
+    async function openTestDb(name: string): Promise<IDBDatabase> {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(name, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains("pages"))
+            db.createObjectStore("pages");
+          if (!db.objectStoreNames.contains("file_meta"))
+            db.createObjectStore("file_meta");
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function destroyTestDb(name: string, db: IDBDatabase): Promise<void> {
+      db.close();
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(name);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    it("onabort rejects when abort fires after request completes @fast", async () => {
+      const dbName = `tomefs-abort-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+
+      const promise = new Promise<void>((resolve, reject) => {
+        const tx = db.transaction("pages", "readwrite");
+        const store = tx.objectStore("pages");
+        const req = store.put(new Uint8Array(8), ["test", 0]);
+
+        req.onsuccess = () => {
+          tx.abort();
+        };
+
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () =>
+          reject(tx.error || new Error("IDB transaction aborted"));
+      });
+
+      await expect(promise).rejects.toThrow();
+
+      await destroyTestDb(dbName, db);
+    });
+
+    it("without onabort the promise would not settle on abort @fast", async () => {
+      const dbName = `tomefs-abort-nohandler-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+
+      const events: string[] = [];
+      new Promise<void>((resolve, reject) => {
+        const tx = db.transaction("pages", "readwrite");
+        const store = tx.objectStore("pages");
+        const req = store.put(new Uint8Array(8), ["test", 0]);
+
+        req.onsuccess = () => {
+          tx.abort();
+        };
+
+        tx.oncomplete = () => {
+          events.push("complete");
+          resolve();
+        };
+        tx.onerror = () => {
+          events.push("error");
+          reject(tx.error);
+        };
+        // Deliberately NO onabort — simulates the old code
+        tx.addEventListener("abort", () => {
+          events.push("abort");
+        });
+      });
+
+      // Let microtasks settle
+      await new Promise((r) => setTimeout(r, 50));
+
+      // The abort event fired but neither complete nor error did —
+      // without onabort, the Promise hangs forever.
+      expect(events).toContain("abort");
+      expect(events).not.toContain("complete");
+      expect(events).not.toContain("error");
+
+      await destroyTestDb(dbName, db);
+    });
+
+    it("IdbBackend writePage rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-abort-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writePage("/file", 0, filledPage(0x01));
+
+      db.close();
+
+      await expect(
+        b.writePage("/file", 1, filledPage(0x02)),
+      ).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
+
+    it("IdbBackend syncAll rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-syncall-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writePage("/file", 0, filledPage(0x01));
+
+      db.close();
+
+      await expect(
+        b.syncAll(
+          [{ path: "/file", pageIndex: 1, data: filledPage(0x02) }],
+          [{ path: "/file", meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 } }],
+        ),
+      ).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
+
+    it("IdbBackend readMeta rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-readmeta-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writeMeta("/file", { size: 0, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      db.close();
+
+      await expect(b.readMeta("/file")).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
+
+    it("IdbBackend listFiles rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-listfiles-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writeMeta("/file", { size: 0, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      db.close();
+
+      await expect(b.listFiles()).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
+  });
+
   describe("edge cases", () => {
     it("handles paths with special characters", async () => {
       const path = "/base/16384/12345";

@@ -502,8 +502,64 @@ export class OpfsBackend implements StorageBackend {
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void> {
     // OPFS has no multi-operation transactions, so execute sequentially.
-    await this.writePages(pages);
+    // Write metadata BEFORE pages so that a crash mid-sync leaves metadata
+    // pointing at stale/missing pages (recoverable via maxPageIndex on
+    // remount) rather than orphaned page directories with no metadata
+    // (permanently leaked storage, invisible to listFiles/orphan cleanup).
+    // IDB doesn't have this problem — its syncAll uses a single atomic
+    // multi-store transaction.
     await this.writeMetas(metas);
+    await this.writePages(pages);
+  }
+
+  /**
+   * Remove page directories that have no corresponding metadata entry.
+   *
+   * OPFS syncAll is non-atomic: if the process crashes after writing pages
+   * but before writing metadata (or before this fix, which reversed the
+   * ordering), page directories can be left behind with no way to discover
+   * them — listFiles() only iterates metadata entries.
+   *
+   * This method cross-references the pages/ and meta/ directories and
+   * removes any pages/<hex-path> directory that has no matching
+   * meta/<hex-path> entry. Safe to call at any time; no-op if there are
+   * no orphans.
+   *
+   * Returns the number of orphaned page directories removed.
+   */
+  async cleanupOrphanedPages(): Promise<number> {
+    await this.init();
+
+    // Collect all hex-encoded names that have metadata entries.
+    const metaNames = new Set<string>();
+    for await (const name of (this.metaDir as IterableDirectoryHandle).keys()) {
+      metaNames.add(name);
+    }
+
+    // Find page directories with no corresponding metadata.
+    const orphans: string[] = [];
+    for await (const name of (this.pagesDir as IterableDirectoryHandle).keys()) {
+      if (!metaNames.has(name)) {
+        orphans.push(name);
+      }
+    }
+
+    // Remove orphaned page directories.
+    for (const name of orphans) {
+      try {
+        await this.pagesDir!.removeEntry(name, { recursive: true });
+      } catch (err) {
+        if (!isNotFoundError(err)) throw err;
+      }
+    }
+
+    return orphans.length;
+  }
+
+  async deleteAll(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+    await this.deleteFiles(paths);
+    await this.deleteMetas(paths);
   }
 
   /**
