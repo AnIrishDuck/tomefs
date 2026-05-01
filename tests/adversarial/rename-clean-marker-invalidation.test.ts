@@ -171,8 +171,11 @@ class CrashBackend implements SyncStorageBackend {
     this.writeMetas(metas);
   }
   deleteAll(paths: string[]) {
-    for (const p of paths) { this.tick(); this.inner.deleteFile(p); }
-    for (const p of paths) { this.tick(); this.inner.deleteMeta(p); }
+    for (const p of paths) {
+      this.tick();
+      this.inner.deleteFile(p);
+      this.inner.deleteMeta(p);
+    }
   }
 }
 
