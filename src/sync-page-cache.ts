@@ -512,13 +512,19 @@ export class SyncPageCache {
   /**
    * Clear dirty flags for pages previously returned by collectDirtyPages.
    *
-   * Only clears pages that are still in the cache and still dirty —
-   * pages dirtied between collectDirtyPages and commitDirtyPages are
-   * preserved for the next sync cycle.
+   * Only clears pages that are still in the cache and still dirty.
+   * Pages at DIFFERENT keys dirtied between collect and commit are
+   * preserved. However, if the SAME page (same path + pageIndex) is
+   * re-dirtied between collect and commit, the dirty flag is cleared
+   * unconditionally — there is no generation counter to distinguish
+   * "dirty from before collect" vs "newly dirty." This is safe because
+   * the collect→syncAll→commit sequence in tomefs syncfs is fully
+   * synchronous (SAB bridge), so no writes can interleave.
    */
   commitDirtyPages(
     pages: Array<{ path: string; pageIndex: number }>,
   ): void {
+    let committed = 0;
     for (const { path, pageIndex } of pages) {
       const key = pageKeyStr(path, pageIndex);
       const page = this.cache.get(key);
@@ -530,9 +536,10 @@ export class SyncPageCache {
           fileSet.delete(key);
           if (fileSet.size === 0) this.dirtyFileKeys.delete(path);
         }
+        committed++;
       }
     }
-    this._flushes += pages.length;
+    this._flushes += committed;
   }
 
   /**
@@ -701,6 +708,27 @@ export class SyncPageCache {
    */
   markPageDirty(path: string, pageIndex: number): void {
     const page = this.getPage(path, pageIndex);
+    if (!page.dirty) {
+      page.dirty = true;
+      this.trackDirty(path, page.key);
+    }
+  }
+
+  /**
+   * Ensure a page exists in the cache and is marked dirty, without reading
+   * from the backend on cache miss.
+   *
+   * Used by resizeFileStorage when growing a file via allocate(). The
+   * sentinel page is always beyond the current file extent, so it cannot
+   * exist in the backend — the readPage call would be a wasted SAB bridge
+   * round-trip returning null. This skips that read and creates a zero-
+   * filled page directly.
+   *
+   * IMPORTANT: Only safe for pages known to not exist in the backend.
+   * For pages that may have existing data, use markPageDirty() instead.
+   */
+  markPageDirtyNoRead(path: string, pageIndex: number): void {
+    const page = this.getPageNoRead(path, pageIndex);
     if (!page.dirty) {
       page.dirty = true;
       this.trackDirty(path, page.key);
@@ -917,6 +945,140 @@ export class SyncPageCache {
   private releaseBuffer(buf: Uint8Array): void {
     if (this.bufferPool.length < 64) {
       this.bufferPool.push(buf);
+    }
+  }
+
+  /**
+   * Validate internal index consistency. Throws if any invariant is violated.
+   *
+   * Checks that the five concurrent data structures (cache, mruPage,
+   * filePages, dirtyKeys, dirtyFileKeys) are mutually consistent. Intended
+   * for use in fuzz tests to catch index corruption that doesn't immediately
+   * manifest as incorrect data but degrades performance or leaks memory.
+   */
+  assertInvariants(): void {
+    // 1. Cache size within bounds
+    if (this.cache.size > this.maxPages) {
+      throw new Error(
+        `cache size ${this.cache.size} exceeds maxPages ${this.maxPages}`,
+      );
+    }
+
+    // 2. No evicted pages in the cache
+    for (const [key, page] of this.cache) {
+      if (page.evicted) {
+        throw new Error(`evicted page ${key} still in cache`);
+      }
+    }
+
+    // 3. Every dirty key exists in cache with dirty=true
+    for (const key of this.dirtyKeys) {
+      const page = this.cache.get(key);
+      if (!page) {
+        throw new Error(`dirtyKeys contains ${key} not in cache`);
+      }
+      if (!page.dirty) {
+        throw new Error(`dirtyKeys contains ${key} but page.dirty is false`);
+      }
+    }
+
+    // 4. Every page with dirty=true is in dirtyKeys
+    for (const [key, page] of this.cache) {
+      if (page.dirty && !this.dirtyKeys.has(key)) {
+        throw new Error(`page ${key} is dirty but not in dirtyKeys`);
+      }
+    }
+
+    // 5. filePages covers exactly the keys in cache
+    const filePagesUnion = new Set<string>();
+    for (const [path, keys] of this.filePages) {
+      for (const key of keys) {
+        if (filePagesUnion.has(key)) {
+          throw new Error(`filePages key ${key} appears under multiple paths`);
+        }
+        filePagesUnion.add(key);
+        const page = this.cache.get(key);
+        if (!page) {
+          throw new Error(
+            `filePages[${path}] contains ${key} not in cache`,
+          );
+        }
+        if (page.path !== path) {
+          throw new Error(
+            `filePages[${path}] contains ${key} but page.path is ${page.path}`,
+          );
+        }
+      }
+    }
+    for (const key of this.cache.keys()) {
+      if (!filePagesUnion.has(key)) {
+        throw new Error(`cache key ${key} not tracked in filePages`);
+      }
+    }
+
+    // 6. dirtyFileKeys is consistent with dirtyKeys
+    const dirtyFileKeysUnion = new Set<string>();
+    for (const [path, keys] of this.dirtyFileKeys) {
+      if (keys.size === 0) {
+        throw new Error(
+          `dirtyFileKeys[${path}] is empty (should be deleted)`,
+        );
+      }
+      for (const key of keys) {
+        dirtyFileKeysUnion.add(key);
+        if (!this.dirtyKeys.has(key)) {
+          throw new Error(
+            `dirtyFileKeys[${path}] contains ${key} not in dirtyKeys`,
+          );
+        }
+        const page = this.cache.get(key);
+        if (page && page.path !== path) {
+          throw new Error(
+            `dirtyFileKeys[${path}] contains ${key} but page.path is ${page.path}`,
+          );
+        }
+      }
+      const fileKeys = this.filePages.get(path);
+      if (fileKeys) {
+        for (const key of keys) {
+          if (!fileKeys.has(key)) {
+            throw new Error(
+              `dirtyFileKeys[${path}] contains ${key} not in filePages[${path}]`,
+            );
+          }
+        }
+      }
+    }
+    for (const key of this.dirtyKeys) {
+      if (!dirtyFileKeysUnion.has(key)) {
+        throw new Error(
+          `dirtyKeys contains ${key} not tracked in dirtyFileKeys`,
+        );
+      }
+    }
+
+    // 7. mruPage (if set) is in the cache
+    if (this.mruPage !== null) {
+      if (!this.cache.has(this.mruPage.key)) {
+        throw new Error(
+          `mruPage ${this.mruPage.key} not in cache`,
+        );
+      }
+    }
+
+    // 8. Page key/path/pageIndex consistency
+    for (const [key, page] of this.cache) {
+      if (page.key !== key) {
+        throw new Error(
+          `cache key ${key} but page.key is ${page.key}`,
+        );
+      }
+      const expectedKey = pageKeyStr(page.path, page.pageIndex);
+      if (key !== expectedKey) {
+        throw new Error(
+          `page key ${key} doesn't match pageKeyStr(${page.path}, ${page.pageIndex}) = ${expectedKey}`,
+        );
+      }
     }
   }
 }

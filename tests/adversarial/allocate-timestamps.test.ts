@@ -1,122 +1,171 @@
 /**
- * Adversarial tests: allocate() POSIX timestamp compliance.
+ * Adversarial tests: allocate() timestamp updates (POSIX compliance).
  *
- * posix_fallocate(3p) requires mtime and ctime to be updated when the file
- * size changes. PostgreSQL uses posix_fallocate for WAL segment pre-allocation
- * and may check modification times for checkpoint/archival logic.
+ * POSIX posix_fallocate(3p) specifies: "If the size of the file is changed
+ * by posix_fallocate(), the last file modification and last file status
+ * change timestamps of the file shall be updated accordingly."
  *
- * These tests only run when TOMEFS_BACKEND=tomefs (MEMFS doesn't implement
- * allocate — it throws EOPNOTSUPP).
+ * Before the fix, allocate() extended file size and marked metadata dirty
+ * but never updated mtime/ctime. This caused stale timestamps on files
+ * extended via fallocate — a real issue for PostgreSQL, which uses
+ * posix_fallocate for WAL segment pre-allocation and checks modification
+ * times for checkpoint/archival logic.
+ *
+ * Ethos §2 (real POSIX semantics), §9 (adversarial differential testing).
  */
-import {
-  createFS,
-  encode,
-  O,
-  SEEK_SET,
-  type FSHarness,
-} from "../harness/emscripten-fs.js";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+import { describe, it, expect } from "vitest";
+import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
+import { createTomeFS } from "../../src/tomefs.js";
+import { PAGE_SIZE } from "../../src/types.js";
 
-const describeIfTomefs =
-  process.env.TOMEFS_BACKEND === "tomefs" ? describe : describe.skip;
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
-describeIfTomefs("adversarial: allocate() timestamps (ethos §2)", () => {
-  let h: FSHarness;
+const O = {
+  RDONLY: 0,
+  WRONLY: 1,
+  RDWR: 2,
+  CREAT: 64,
+  TRUNC: 512,
+} as const;
 
-  beforeEach(async () => {
-    h = await createFS();
+const MOUNT = "/tome";
+
+async function mountTome(backend: SyncMemoryBackend, maxPages = 64) {
+  const { default: createModule } = await import(
+    join(__dirname, "../harness/emscripten_fs.mjs")
+  );
+  const Module = await createModule();
+  const FS = Module.FS;
+  const tomefs = createTomeFS(FS, { backend, maxPages });
+  FS.mkdir(MOUNT);
+  FS.mount(tomefs, {}, MOUNT);
+  return { FS, tomefs };
+}
+
+function syncfs(FS: any, tomefs: any) {
+  tomefs.syncfs(FS.lookupPath(MOUNT).node.mount, false, (err: any) => {
+    if (err) throw err;
   });
+}
 
-  it("allocate updates mtime when file grows @fast", async () => {
-    const { FS } = h;
-    const stream = FS.open("/alloc-ts", O.RDWR | O.CREAT, 0o666);
+describe("adversarial: allocate timestamp updates", () => {
+  it("allocate updates mtime and ctime when file size changes @fast", async () => {
+    const backend = new SyncMemoryBackend();
+    const { FS } = await mountTome(backend);
 
-    const before = FS.fstat(stream.fd);
-    const beforeMtime = before.mtime.getTime();
+    const stream = FS.open(`${MOUNT}/wal`, O.RDWR | O.CREAT, 0o666);
+    const statBefore = FS.fstat(stream.fd);
+    const mtimeBefore = statBefore.mtime.getTime();
+    const ctimeBefore = statBefore.ctime.getTime();
 
-    await new Promise((r) => setTimeout(r, 20));
+    // Small delay to ensure timestamp difference is measurable
+    await new Promise((r) => setTimeout(r, 10));
 
-    stream.stream_ops.allocate(stream, 0, 8192);
+    // Extend file via allocate
+    stream.stream_ops.allocate(stream, 0, 3 * PAGE_SIZE);
 
-    const after = FS.fstat(stream.fd);
-    expect(after.size).toBe(8192);
-    expect(after.mtime.getTime()).toBeGreaterThan(beforeMtime);
+    const statAfter = FS.fstat(stream.fd);
+    expect(statAfter.size).toBe(3 * PAGE_SIZE);
+    expect(statAfter.mtime.getTime()).toBeGreaterThan(mtimeBefore);
+    expect(statAfter.ctime.getTime()).toBeGreaterThan(ctimeBefore);
 
     FS.close(stream);
   });
 
-  it("allocate updates ctime when file grows @fast", async () => {
-    const { FS } = h;
-    const stream = FS.open("/alloc-ctime", O.RDWR | O.CREAT, 0o666);
+  it("allocate does not update timestamps when size unchanged @fast", async () => {
+    const backend = new SyncMemoryBackend();
+    const { FS } = await mountTome(backend);
 
-    const before = FS.fstat(stream.fd);
-    const beforeCtime = before.ctime.getTime();
+    // Create file with some data
+    const stream = FS.open(`${MOUNT}/file`, O.RDWR | O.CREAT, 0o666);
+    const data = new Uint8Array(PAGE_SIZE * 2);
+    FS.write(stream, data, 0, data.length, 0);
 
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 10));
 
-    stream.stream_ops.allocate(stream, 0, 4096);
+    const statBefore = FS.fstat(stream.fd);
+    const mtimeBefore = statBefore.mtime.getTime();
 
-    const after = FS.fstat(stream.fd);
-    expect(after.ctime.getTime()).toBeGreaterThan(beforeCtime);
+    // Allocate within current size — no-op
+    stream.stream_ops.allocate(stream, 0, PAGE_SIZE);
 
-    FS.close(stream);
-  });
-
-  it("allocate does not update timestamps when size unchanged", () => {
-    const { FS } = h;
-    const stream = FS.open("/alloc-noop", O.RDWR | O.CREAT, 0o666);
-
-    FS.write(stream, encode("x".repeat(100)), 0, 100);
-    const before = FS.fstat(stream.fd);
-
-    // Allocate within existing size — should be a no-op
-    stream.stream_ops.allocate(stream, 0, 50);
-
-    const after = FS.fstat(stream.fd);
-    expect(after.size).toBe(100);
-    expect(after.mtime.getTime()).toBe(before.mtime.getTime());
+    const statAfter = FS.fstat(stream.fd);
+    expect(statAfter.size).toBe(PAGE_SIZE * 2); // unchanged
+    expect(statAfter.mtime.getTime()).toBe(mtimeBefore); // unchanged
 
     FS.close(stream);
   });
 
-  it("allocate extending beyond existing data updates timestamps", async () => {
-    const { FS } = h;
-    const stream = FS.open("/alloc-extend", O.RDWR | O.CREAT, 0o666);
+  it("allocate timestamps persist across syncfs + remount @fast", async () => {
+    const backend = new SyncMemoryBackend();
+    let allocateTime: number;
 
-    FS.write(stream, encode("data"), 0, 4);
-    const stat1 = FS.fstat(stream.fd);
-    expect(stat1.size).toBe(4);
+    // Mount, allocate, capture timestamp, syncfs
+    {
+      const { FS, tomefs } = await mountTome(backend);
+      const stream = FS.open(`${MOUNT}/wal`, O.RDWR | O.CREAT, 0o666);
 
-    await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 10));
 
-    stream.stream_ops.allocate(stream, 0, 16384);
-    const stat2 = FS.fstat(stream.fd);
-    expect(stat2.size).toBe(16384);
-    expect(stat2.mtime.getTime()).toBeGreaterThan(stat1.mtime.getTime());
-    expect(stat2.ctime.getTime()).toBeGreaterThan(stat1.ctime.getTime());
+      stream.stream_ops.allocate(stream, 0, 2 * PAGE_SIZE);
+      allocateTime = FS.fstat(stream.fd).mtime.getTime();
+      FS.close(stream);
+      syncfs(FS, tomefs);
+    }
 
-    // Original data should be preserved
-    FS.llseek(stream, 0, SEEK_SET);
-    const buf = new Uint8Array(4);
-    FS.read(stream, buf, 0, 4);
-    expect(new TextDecoder().decode(buf)).toBe("data");
+    // Remount and verify timestamps survived
+    {
+      const { FS } = await mountTome(backend);
+      const stat = FS.stat(`${MOUNT}/wal`);
+      expect(stat.mtime.getTime()).toBe(allocateTime);
+    }
+  });
+
+  it("allocate then write: write timestamp overwrites allocate timestamp @fast", async () => {
+    const backend = new SyncMemoryBackend();
+    const { FS } = await mountTome(backend);
+
+    const stream = FS.open(`${MOUNT}/wal`, O.RDWR | O.CREAT, 0o666);
+
+    // Allocate to pre-extend
+    stream.stream_ops.allocate(stream, 0, 3 * PAGE_SIZE);
+    const allocateTime = FS.fstat(stream.fd).mtime.getTime();
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Write some data — should update timestamp again
+    const data = new Uint8Array(100);
+    data.fill(0x42);
+    FS.write(stream, data, 0, 100, 0);
+
+    const statAfter = FS.fstat(stream.fd);
+    expect(statAfter.mtime.getTime()).toBeGreaterThan(allocateTime);
 
     FS.close(stream);
   });
 
-  it("allocate with offset updates timestamps correctly", async () => {
-    const { FS } = h;
-    const stream = FS.open("/alloc-offset", O.RDWR | O.CREAT, 0o666);
+  it("multiple allocate calls update timestamps each time @fast", async () => {
+    const backend = new SyncMemoryBackend();
+    const { FS } = await mountTome(backend);
 
-    FS.write(stream, encode("x".repeat(100)), 0, 100);
-    const before = FS.fstat(stream.fd);
+    const stream = FS.open(`${MOUNT}/wal`, O.RDWR | O.CREAT, 0o666);
 
-    await new Promise((r) => setTimeout(r, 20));
+    stream.stream_ops.allocate(stream, 0, PAGE_SIZE);
+    const time1 = FS.fstat(stream.fd).mtime.getTime();
 
-    // offset + length > current size, so file must grow
-    stream.stream_ops.allocate(stream, 100, 200);
-    const after = FS.fstat(stream.fd);
-    expect(after.size).toBe(300);
-    expect(after.mtime.getTime()).toBeGreaterThan(before.mtime.getTime());
+    await new Promise((r) => setTimeout(r, 10));
+
+    stream.stream_ops.allocate(stream, 0, 2 * PAGE_SIZE);
+    const time2 = FS.fstat(stream.fd).mtime.getTime();
+    expect(time2).toBeGreaterThan(time1);
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    stream.stream_ops.allocate(stream, 0, 4 * PAGE_SIZE);
+    const time3 = FS.fstat(stream.fd).mtime.getTime();
+    expect(time3).toBeGreaterThan(time2);
 
     FS.close(stream);
   });

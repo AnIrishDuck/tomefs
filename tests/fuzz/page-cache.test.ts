@@ -1,18 +1,20 @@
 /**
- * Differential fuzz tests for SyncPageCache in isolation.
+ * Differential fuzz tests for the async PageCache in isolation.
  *
- * Generates random sequences of page cache operations and executes them
- * against both the real SyncPageCache (with a SyncMemoryBackend) and a
+ * Mirrors tests/fuzz/sync-page-cache.test.ts but exercises the async
+ * PageCache (which wraps an async StorageBackend). The async variant
+ * has `await` points in getPage, ensureCapacity, evictOne, and
+ * batchEvict that introduce different control flow compared to the
+ * synchronous SyncPageCache. These tests verify that the five
+ * concurrent data structures (cache Map, mruPage, filePages index,
+ * dirtyKeys set, dirtyFileKeys map) remain consistent across await
+ * boundaries.
+ *
+ * Generates random sequences of page cache operations and executes
+ * them against both the real PageCache (with a MemoryBackend) and a
  * simple Map-based reference model. After each operation, compares
  * observable state (read data, dirty counts, file contents after flush)
  * to verify the cache behaves identically to the reference.
- *
- * This catches bugs in the five concurrent data structures the cache
- * manages (cache Map, mruPage, filePages index, dirtyKeys set,
- * dirtyFileKeys map) that higher-level fuzz tests through the full
- * tomefs layer might miss — the tomefs layer adds its own logic for
- * metadata, node management, and persistence that can mask or compensate
- * for cache-level inconsistencies.
  *
  * Uses a seeded PRNG for reproducibility — failing seeds can be replayed.
  * Runs at multiple cache pressure levels to maximize eviction coverage.
@@ -23,12 +25,14 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { PageCache } from "../../src/page-cache.js";
 import { SyncPageCache } from "../../src/sync-page-cache.js";
+import { MemoryBackend } from "../../src/memory-backend.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE, pageKeyStr } from "../../src/types.js";
 
 // ---------------------------------------------------------------
-// Seeded PRNG (xorshift128+) — same as differential.test.ts
+// Seeded PRNG (xorshift128+) — same as other fuzz tests
 // ---------------------------------------------------------------
 
 class Rng {
@@ -66,8 +70,6 @@ class Rng {
     return arr[this.int(arr.length)];
   }
 
-  /** Returns a buffer filled with a deterministic pattern.
-   *  Uses a single RNG call for the seed value to avoid O(n) PRNG calls. */
   bytes(length: number): Uint8Array {
     const buf = new Uint8Array(length);
     const seed = this.next();
@@ -82,15 +84,8 @@ class Rng {
 // Reference model: simple Map-based page store
 // ---------------------------------------------------------------
 
-/**
- * Tracks expected file sizes and page data for comparison with SyncPageCache.
- * All operations are trivial Map manipulations — no LRU, no eviction, no
- * batching — so correctness is self-evident.
- */
 class ReferenceModel {
-  /** Maps "path\0pageIndex" → page data (copy). */
   private pages = new Map<string, Uint8Array>();
-  /** Maps path → file size (logical). */
   fileSizes = new Map<string, number>();
 
   private key(path: string, pageIndex: number): string {
@@ -159,7 +154,6 @@ class ReferenceModel {
           offset + bytesRead,
         );
       } else {
-        // No page → zeros (already zero in fresh Uint8Array, but be explicit)
         buffer.fill(0, offset + bytesRead, offset + bytesRead + bytesInPage);
       }
 
@@ -176,7 +170,6 @@ class ReferenceModel {
     for (let i = 0; i < pageCount; i++) {
       this.pages.delete(this.key(path, i));
     }
-    // Also delete any pages beyond the tracked size (from prior renames etc.)
     for (const key of this.pages.keys()) {
       if (key.startsWith(path + "\0")) {
         this.pages.delete(key);
@@ -187,9 +180,7 @@ class ReferenceModel {
 
   renameFile(oldPath: string, newPath: string): void {
     if (oldPath === newPath) return;
-    // Delete destination first
     this.deleteFile(newPath);
-    // Move pages
     const toAdd: Array<[string, Uint8Array]> = [];
     for (const [key, data] of this.pages) {
       if (key.startsWith(oldPath + "\0")) {
@@ -201,7 +192,6 @@ class ReferenceModel {
     for (const [key, data] of toAdd) {
       this.pages.set(key, data);
     }
-    // Move size
     const size = this.fileSizes.get(oldPath) ?? 0;
     this.fileSizes.delete(oldPath);
     this.fileSizes.set(newPath, size);
@@ -210,7 +200,6 @@ class ReferenceModel {
   truncate(path: string, newSize: number): void {
     const oldSize = this.fileSizes.get(path) ?? 0;
     if (newSize < oldSize) {
-      // Shrink: zero tail of last surviving page, delete pages beyond
       const neededPages = newSize > 0 ? Math.ceil(newSize / PAGE_SIZE) : 0;
       const tailOffset = newSize % PAGE_SIZE;
       if (tailOffset > 0 && neededPages > 0) {
@@ -220,17 +209,14 @@ class ReferenceModel {
           page.fill(0, tailOffset);
         }
       }
-      // Delete pages beyond the new size
       const maxOldPages = oldSize > 0 ? Math.ceil(oldSize / PAGE_SIZE) : 0;
       for (let i = neededPages; i < maxOldPages; i++) {
         this.pages.delete(this.key(path, i));
       }
     }
-    // For grow: new pages are implicitly zero (read returns zeros)
     this.fileSizes.set(path, newSize);
   }
 
-  /** Read a page directly for verification. */
   getPage(path: string, pageIndex: number): Uint8Array {
     return this.pages.get(this.key(path, pageIndex)) ?? new Uint8Array(PAGE_SIZE);
   }
@@ -289,85 +275,70 @@ function pickOp(rng: Rng): OpType {
 
 const FILE_POOL = ["/a", "/b", "/c", "/d", "/e"];
 
-// Reusable read buffers to reduce allocation pressure
 const READ_BUF_1 = new Uint8Array(PAGE_SIZE * 3);
 const READ_BUF_2 = new Uint8Array(PAGE_SIZE * 3);
 
-function runFuzzSession(
+async function runFuzzSession(
   seed: number,
   maxPages: number,
   opCount: number,
-): void {
+): Promise<void> {
   const rng = new Rng(seed);
-  const backend = new SyncMemoryBackend();
-  const cache = new SyncPageCache(backend, maxPages);
+  const backend = new MemoryBackend();
+  const cache = new PageCache(backend, maxPages);
   const model = new ReferenceModel();
 
-  // Track which files have been created (have data)
   const activeFiles = new Set<string>();
 
   for (let step = 0; step < opCount; step++) {
     const op = pickOp(rng);
 
     try {
-      // Validate index consistency before and after each operation.
-      // Catches corruption in the five concurrent data structures
-      // (cache, mruPage, filePages, dirtyKeys, dirtyFileKeys) that
-      // doesn't immediately manifest as incorrect data.
-      cache.assertInvariants();
-
       switch (op) {
         case "write": {
-          // Sub-page write at random position within a file
           const path = rng.pick(FILE_POOL);
           const fileSize = model.fileSizes.get(path) ?? 0;
-          // Cap max position to 4 pages to keep files small
           const maxPos = Math.min(Math.max(fileSize, PAGE_SIZE * 2), PAGE_SIZE * 4);
           const position = rng.int(maxPos);
-          // Cap write size to quarter page to keep operations fast
           const length = rng.int(PAGE_SIZE / 4) + 1;
           const data = rng.bytes(length);
 
-          cache.write(path, data, 0, length, position, fileSize);
+          await cache.write(path, data, 0, length, position, fileSize);
           model.write(path, data, 0, length, position);
           activeFiles.add(path);
           break;
         }
 
         case "writeFull": {
-          // Full-page-aligned write (exercises skip-backend-read optimization)
           const path = rng.pick(FILE_POOL);
           const fileSize = model.fileSizes.get(path) ?? 0;
           const pageIndex = rng.int(4);
           const position = pageIndex * PAGE_SIZE;
           const data = rng.bytes(PAGE_SIZE);
 
-          cache.write(path, data, 0, PAGE_SIZE, position, fileSize);
+          await cache.write(path, data, 0, PAGE_SIZE, position, fileSize);
           model.write(path, data, 0, PAGE_SIZE, position);
           activeFiles.add(path);
           break;
         }
 
         case "writeMulti": {
-          // Multi-page write spanning 2-3 pages
           const path = rng.pick(FILE_POOL);
           const fileSize = model.fileSizes.get(path) ?? 0;
           const startPage = rng.int(3);
           const pageOffset = rng.int(PAGE_SIZE);
           const position = startPage * PAGE_SIZE + pageOffset;
-          // Write just enough to cross a page boundary (PAGE_SIZE + 1 to 2*PAGE_SIZE)
           const crossLen = PAGE_SIZE - pageOffset + 1 + rng.int(PAGE_SIZE);
           const length = Math.min(crossLen, PAGE_SIZE * 2);
           const data = rng.bytes(length);
 
-          cache.write(path, data, 0, length, position, fileSize);
+          await cache.write(path, data, 0, length, position, fileSize);
           model.write(path, data, 0, length, position);
           activeFiles.add(path);
           break;
         }
 
         case "read": {
-          // Read and compare data
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
           const fileSize = model.fileSizes.get(path) ?? 0;
@@ -379,7 +350,7 @@ function runFuzzSession(
 
           READ_BUF_1.fill(0, 0, length);
           READ_BUF_2.fill(0, 0, length);
-          const cacheRead = cache.read(path, READ_BUF_1, 0, length, position, fileSize);
+          const cacheRead = await cache.read(path, READ_BUF_1, 0, length, position, fileSize);
           const modelRead = model.read(path, READ_BUF_2, 0, length, position);
 
           expect(cacheRead).toBe(modelRead);
@@ -388,7 +359,6 @@ function runFuzzSession(
         }
 
         case "readMulti": {
-          // Multi-page read spanning 2+ pages
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
           const fileSize = model.fileSizes.get(path) ?? 0;
@@ -401,7 +371,7 @@ function runFuzzSession(
 
           READ_BUF_1.fill(0, 0, length);
           READ_BUF_2.fill(0, 0, length);
-          const cacheRead = cache.read(path, READ_BUF_1, 0, length, position, fileSize);
+          const cacheRead = await cache.read(path, READ_BUF_1, 0, length, position, fileSize);
           const modelRead = model.read(path, READ_BUF_2, 0, length, position);
 
           expect(cacheRead).toBe(modelRead);
@@ -410,7 +380,6 @@ function runFuzzSession(
         }
 
         case "getPage": {
-          // Direct page access and comparison
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
           const fileSize = model.fileSizes.get(path) ?? 0;
@@ -418,7 +387,7 @@ function runFuzzSession(
           const pageCount = Math.ceil(fileSize / PAGE_SIZE);
           const pageIndex = rng.int(pageCount);
 
-          const cachedPage = cache.getPage(path, pageIndex);
+          const cachedPage = await cache.getPage(path, pageIndex);
           const expected = model.getPage(path, pageIndex);
           expect(cachedPage.data).toEqual(expected);
           break;
@@ -427,24 +396,21 @@ function runFuzzSession(
         case "flushFile": {
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
-          cache.flushFile(path);
+          await cache.flushFile(path);
           break;
         }
 
         case "flushAll": {
-          cache.flushAll();
+          await cache.flushAll();
           break;
         }
 
         case "collectCommit": {
-          // Two-phase dirty commit: collect → commit
           const dirty = cache.collectDirtyPages();
-          // Dirty count should remain positive until commit
           if (dirty.length > 0) {
             expect(cache.dirtyCount).toBeGreaterThanOrEqual(dirty.length);
           }
-          // Write to backend (simulates what tomefs syncfs does)
-          backend.writePages(dirty);
+          await backend.writePages(dirty);
           cache.commitDirtyPages(dirty);
           expect(cache.dirtyCount).toBe(0);
           break;
@@ -453,7 +419,7 @@ function runFuzzSession(
         case "deleteFile": {
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
-          cache.deleteFile(path);
+          await cache.deleteFile(path);
           model.deleteFile(path);
           activeFiles.delete(path);
           break;
@@ -465,7 +431,7 @@ function runFuzzSession(
           const newPath = rng.pick(FILE_POOL);
           if (oldPath === newPath) break;
 
-          cache.renameFile(oldPath, newPath);
+          await cache.renameFile(oldPath, newPath);
           model.renameFile(oldPath, newPath);
           activeFiles.delete(oldPath);
           activeFiles.add(newPath);
@@ -476,24 +442,21 @@ function runFuzzSession(
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
           const fileSize = model.fileSizes.get(path) ?? 0;
-          // Mix of shrink and grow (cap at 4 pages to keep files small)
           const newSize = rng.int(2) === 0
-            ? rng.int(Math.max(fileSize, 1)) // shrink
-            : Math.min(fileSize + rng.int(PAGE_SIZE), PAGE_SIZE * 4); // grow
+            ? rng.int(Math.max(fileSize, 1))
+            : Math.min(fileSize + rng.int(PAGE_SIZE), PAGE_SIZE * 4);
           if (newSize === fileSize) break;
 
           if (newSize < fileSize) {
-            // Shrink: zero tail, invalidate pages, delete from backend
-            cache.zeroTailAfterTruncate(path, newSize);
+            await cache.zeroTailAfterTruncate(path, newSize);
             const neededPages = newSize > 0 ? Math.ceil(newSize / PAGE_SIZE) : 0;
             cache.invalidatePagesFrom(path, neededPages);
-            backend.deletePagesFrom(path, neededPages);
+            await backend.deletePagesFrom(path, neededPages);
           } else {
-            // Grow: mark sentinel page dirty
             const lastPageIdx = Math.ceil(newSize / PAGE_SIZE) - 1;
             const firstNewPage = fileSize > 0 ? Math.ceil(fileSize / PAGE_SIZE) : 0;
             if (lastPageIdx >= firstNewPage) {
-              cache.markPageDirty(path, lastPageIdx);
+              await cache.markPageDirty(path, lastPageIdx);
             }
           }
           model.truncate(path, newSize);
@@ -503,14 +466,13 @@ function runFuzzSession(
         case "evictFile": {
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
-          cache.evictFile(path);
-          // Data should still be readable (reloaded from backend on next access)
+          await cache.evictFile(path);
           const fileSize = model.fileSizes.get(path) ?? 0;
           if (fileSize > 0) {
             const readLen = Math.min(fileSize, PAGE_SIZE);
             const cacheBuf = new Uint8Array(readLen);
             const modelBuf = new Uint8Array(readLen);
-            cache.read(path, cacheBuf, 0, readLen, 0, fileSize);
+            await cache.read(path, cacheBuf, 0, readLen, 0, fileSize);
             model.read(path, modelBuf, 0, readLen, 0);
             expect(cacheBuf).toEqual(modelBuf);
           }
@@ -520,20 +482,14 @@ function runFuzzSession(
         case "markPageDirty": {
           const path = rng.pick(FILE_POOL);
           const pageIndex = rng.int(4);
-          cache.markPageDirty(path, pageIndex);
-          // markPageDirty on the cache doesn't change data — it just ensures
-          // the page exists and is dirty. The model doesn't need updating.
-          // But we need to track it if it creates a new file.
+          await cache.markPageDirty(path, pageIndex);
           if (!model.fileSizes.has(path)) {
-            // The page was created but with zero data. The model should know
-            // about this file's pages for verification.
             model.fileSizes.set(path, 0);
           }
           activeFiles.add(path);
           break;
         }
       }
-      cache.assertInvariants();
     } catch (e) {
       throw new Error(
         `Seed ${seed}, step ${step}, op ${op} failed: ${(e as Error).message}`,
@@ -541,32 +497,26 @@ function runFuzzSession(
     }
   }
 
-  // Final invariant check and verification: flush everything and compare all files
-  cache.assertInvariants();
-  cache.flushAll();
+  await cache.flushAll();
   for (const path of activeFiles) {
-    verifyBackendFile(backend, model, path);
+    await verifyBackendFile(backend, model, path);
   }
 }
 
-/**
- * Verify that all pages of a file in the backend match the reference model.
- */
-function verifyBackendFile(
-  backend: SyncMemoryBackend,
+async function verifyBackendFile(
+  backend: MemoryBackend,
   model: ReferenceModel,
   path: string,
-): void {
+): Promise<void> {
   const fileSize = model.fileSizes.get(path) ?? 0;
   const pageCount = fileSize > 0 ? Math.ceil(fileSize / PAGE_SIZE) : 0;
 
   for (let i = 0; i < pageCount; i++) {
-    const backendPage = backend.readPage(path, i);
+    const backendPage = await backend.readPage(path, i);
     const modelPage = model.getPage(path, i);
     if (backendPage) {
       expect(backendPage).toEqual(modelPage);
     } else {
-      // No backend page means all zeros
       expect(modelPage).toEqual(new Uint8Array(PAGE_SIZE));
     }
   }
@@ -576,64 +526,327 @@ function verifyBackendFile(
 // Test cases
 // ---------------------------------------------------------------
 
-describe("SyncPageCache differential fuzz", () => {
-  // Large cache (no eviction pressure) — exercises basic correctness
+describe("PageCache (async) differential fuzz", () => {
   describe("large cache (64 pages)", () => {
     const MAX_PAGES = 64;
     const OPS = 200;
 
     for (let seed = 1; seed <= 5; seed++) {
-      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache) @fast`, () => {
-        runFuzzSession(seed, MAX_PAGES, OPS);
+      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache) @fast`, async () => {
+        await runFuzzSession(seed, MAX_PAGES, OPS);
       });
     }
   });
 
-  // Medium cache (moderate eviction) — exercises LRU + dirty flush on eviction
   describe("medium cache (8 pages)", () => {
     const MAX_PAGES = 8;
     const OPS = 200;
 
     for (let seed = 100; seed <= 110; seed++) {
       const tag = seed <= 102 ? " @fast" : "";
-      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)${tag}`, () => {
-        runFuzzSession(seed, MAX_PAGES, OPS);
+      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)${tag}`, async () => {
+        await runFuzzSession(seed, MAX_PAGES, OPS);
       });
     }
   });
 
-  // Tiny cache (extreme eviction pressure) — exercises batch eviction, dirty tracking
   describe("tiny cache (3 pages)", () => {
     const MAX_PAGES = 3;
     const OPS = 150;
 
     for (let seed = 200; seed <= 208; seed++) {
-      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)`, () => {
-        runFuzzSession(seed, MAX_PAGES, OPS);
+      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)`, async () => {
+        await runFuzzSession(seed, MAX_PAGES, OPS);
       });
     }
   });
 
-  // Long-running sessions with moderate pressure — exercises index consistency
   describe("extended sessions (16-page cache, 500 ops)", () => {
     const MAX_PAGES = 16;
     const OPS = 500;
 
     for (let seed = 300; seed <= 304; seed++) {
-      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)`, () => {
-        runFuzzSession(seed, MAX_PAGES, OPS);
+      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)`, async () => {
+        await runFuzzSession(seed, MAX_PAGES, OPS);
       });
     }
   });
 
-  // Minimal cache (2 pages) — nearly every access evicts
   describe("minimal cache (2 pages)", () => {
     const MAX_PAGES = 2;
     const OPS = 100;
 
     for (let seed = 400; seed <= 404; seed++) {
-      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)`, () => {
-        runFuzzSession(seed, MAX_PAGES, OPS);
+      it(`seed ${seed} (${OPS} ops, ${MAX_PAGES}-page cache)`, async () => {
+        await runFuzzSession(seed, MAX_PAGES, OPS);
+      });
+    }
+  });
+});
+
+// ---------------------------------------------------------------
+// Parity tests: async PageCache vs sync SyncPageCache
+//
+// Run the same PRNG-generated operations through both implementations
+// and verify identical backend state. Catches any behavioral drift
+// between the async and sync variants.
+// ---------------------------------------------------------------
+
+type ParityOpType =
+  | "write"
+  | "writeFull"
+  | "writeMulti"
+  | "flushFile"
+  | "flushAll"
+  | "deleteFile"
+  | "renameFile"
+  | "truncate"
+  | "evictFile"
+  | "markPageDirty";
+
+const PARITY_OP_WEIGHTS: Array<[ParityOpType, number]> = [
+  ["write", 25],
+  ["writeFull", 10],
+  ["writeMulti", 10],
+  ["flushFile", 5],
+  ["flushAll", 3],
+  ["deleteFile", 4],
+  ["renameFile", 4],
+  ["truncate", 5],
+  ["evictFile", 2],
+  ["markPageDirty", 3],
+];
+
+function pickParityOp(rng: Rng): ParityOpType {
+  const total = PARITY_OP_WEIGHTS.reduce((s, [, w]) => s + w, 0);
+  let r = rng.int(total);
+  for (const [op, weight] of PARITY_OP_WEIGHTS) {
+    r -= weight;
+    if (r < 0) return op;
+  }
+  return "write";
+}
+
+async function runParitySession(
+  seed: number,
+  maxPages: number,
+  opCount: number,
+): Promise<void> {
+  const asyncBackend = new MemoryBackend();
+  const syncBackend = new SyncMemoryBackend();
+  const asyncCache = new PageCache(asyncBackend, maxPages);
+  const syncCache = new SyncPageCache(syncBackend, maxPages);
+
+  const fileSizes = new Map<string, number>();
+  const activeFiles = new Set<string>();
+
+  // Two independent RNGs with the same seed — one for each cache.
+  // Both caches see the exact same sequence of operations.
+  const rng = new Rng(seed);
+
+  for (let step = 0; step < opCount; step++) {
+    const op = pickParityOp(rng);
+
+    try {
+      switch (op) {
+        case "write": {
+          const path = rng.pick(FILE_POOL);
+          const fileSize = fileSizes.get(path) ?? 0;
+          const maxPos = Math.min(Math.max(fileSize, PAGE_SIZE * 2), PAGE_SIZE * 4);
+          const position = rng.int(maxPos);
+          const length = rng.int(PAGE_SIZE / 4) + 1;
+          const data = rng.bytes(length);
+
+          const asyncResult = await asyncCache.write(path, data, 0, length, position, fileSize);
+          const syncResult = syncCache.write(path, data, 0, length, position, fileSize);
+          expect(asyncResult).toEqual(syncResult);
+          fileSizes.set(path, asyncResult.newFileSize);
+          activeFiles.add(path);
+          break;
+        }
+
+        case "writeFull": {
+          const path = rng.pick(FILE_POOL);
+          const fileSize = fileSizes.get(path) ?? 0;
+          const pageIndex = rng.int(4);
+          const position = pageIndex * PAGE_SIZE;
+          const data = rng.bytes(PAGE_SIZE);
+
+          const asyncResult = await asyncCache.write(path, data, 0, PAGE_SIZE, position, fileSize);
+          const syncResult = syncCache.write(path, data, 0, PAGE_SIZE, position, fileSize);
+          expect(asyncResult).toEqual(syncResult);
+          fileSizes.set(path, asyncResult.newFileSize);
+          activeFiles.add(path);
+          break;
+        }
+
+        case "writeMulti": {
+          const path = rng.pick(FILE_POOL);
+          const fileSize = fileSizes.get(path) ?? 0;
+          const startPage = rng.int(3);
+          const pageOffset = rng.int(PAGE_SIZE);
+          const position = startPage * PAGE_SIZE + pageOffset;
+          const crossLen = PAGE_SIZE - pageOffset + 1 + rng.int(PAGE_SIZE);
+          const length = Math.min(crossLen, PAGE_SIZE * 2);
+          const data = rng.bytes(length);
+
+          const asyncResult = await asyncCache.write(path, data, 0, length, position, fileSize);
+          const syncResult = syncCache.write(path, data, 0, length, position, fileSize);
+          expect(asyncResult).toEqual(syncResult);
+          fileSizes.set(path, asyncResult.newFileSize);
+          activeFiles.add(path);
+          break;
+        }
+
+        case "flushFile": {
+          if (activeFiles.size === 0) break;
+          const path = rng.pick([...activeFiles]);
+          await asyncCache.flushFile(path);
+          syncCache.flushFile(path);
+          break;
+        }
+
+        case "flushAll": {
+          await asyncCache.flushAll();
+          syncCache.flushAll();
+          break;
+        }
+
+        case "deleteFile": {
+          if (activeFiles.size === 0) break;
+          const path = rng.pick([...activeFiles]);
+          await asyncCache.deleteFile(path);
+          syncCache.deleteFile(path);
+          fileSizes.delete(path);
+          activeFiles.delete(path);
+          break;
+        }
+
+        case "renameFile": {
+          if (activeFiles.size === 0) break;
+          const oldPath = rng.pick([...activeFiles]);
+          const newPath = rng.pick(FILE_POOL);
+          if (oldPath === newPath) break;
+
+          await asyncCache.renameFile(oldPath, newPath);
+          syncCache.renameFile(oldPath, newPath);
+          const size = fileSizes.get(oldPath) ?? 0;
+          fileSizes.delete(oldPath);
+          fileSizes.set(newPath, size);
+          activeFiles.delete(oldPath);
+          activeFiles.add(newPath);
+          break;
+        }
+
+        case "truncate": {
+          if (activeFiles.size === 0) break;
+          const path = rng.pick([...activeFiles]);
+          const fileSize = fileSizes.get(path) ?? 0;
+          const newSize = rng.int(2) === 0
+            ? rng.int(Math.max(fileSize, 1))
+            : Math.min(fileSize + rng.int(PAGE_SIZE), PAGE_SIZE * 4);
+          if (newSize === fileSize) break;
+
+          if (newSize < fileSize) {
+            await asyncCache.zeroTailAfterTruncate(path, newSize);
+            syncCache.zeroTailAfterTruncate(path, newSize);
+            const neededPages = newSize > 0 ? Math.ceil(newSize / PAGE_SIZE) : 0;
+            asyncCache.invalidatePagesFrom(path, neededPages);
+            syncCache.invalidatePagesFrom(path, neededPages);
+            await asyncBackend.deletePagesFrom(path, neededPages);
+            syncBackend.deletePagesFrom(path, neededPages);
+          } else {
+            const lastPageIdx = Math.ceil(newSize / PAGE_SIZE) - 1;
+            const firstNewPage = fileSize > 0 ? Math.ceil(fileSize / PAGE_SIZE) : 0;
+            if (lastPageIdx >= firstNewPage) {
+              await asyncCache.markPageDirty(path, lastPageIdx);
+              syncCache.markPageDirty(path, lastPageIdx);
+            }
+          }
+          fileSizes.set(path, newSize);
+          break;
+        }
+
+        case "evictFile": {
+          if (activeFiles.size === 0) break;
+          const path = rng.pick([...activeFiles]);
+          await asyncCache.evictFile(path);
+          syncCache.evictFile(path);
+          break;
+        }
+
+        case "markPageDirty": {
+          const path = rng.pick(FILE_POOL);
+          const pageIndex = rng.int(4);
+          await asyncCache.markPageDirty(path, pageIndex);
+          syncCache.markPageDirty(path, pageIndex);
+          if (!fileSizes.has(path)) {
+            fileSizes.set(path, 0);
+          }
+          activeFiles.add(path);
+          break;
+        }
+      }
+    } catch (e) {
+      throw new Error(
+        `Parity seed ${seed}, step ${step}, op ${op} failed: ${(e as Error).message}`,
+      );
+    }
+  }
+
+  // Flush both caches and compare backend state
+  await asyncCache.flushAll();
+  syncCache.flushAll();
+
+  for (const path of activeFiles) {
+    const fileSize = fileSizes.get(path) ?? 0;
+    const pageCount = fileSize > 0 ? Math.ceil(fileSize / PAGE_SIZE) : 0;
+
+    for (let i = 0; i < pageCount; i++) {
+      const asyncPage = await asyncBackend.readPage(path, i);
+      const syncPage = syncBackend.readPage(path, i);
+
+      if (asyncPage === null && syncPage === null) continue;
+      expect(asyncPage).not.toBeNull();
+      expect(syncPage).not.toBeNull();
+      expect(
+        asyncPage!,
+        `Backend parity mismatch at ${path}:${i} (seed ${seed})`,
+      ).toEqual(syncPage!);
+    }
+  }
+}
+
+describe("PageCache/SyncPageCache parity fuzz", () => {
+  describe("large cache (64 pages)", () => {
+    for (let seed = 1; seed <= 3; seed++) {
+      it(`seed ${seed} (200 ops, 64-page cache) @fast`, async () => {
+        await runParitySession(seed, 64, 200);
+      });
+    }
+  });
+
+  describe("medium cache (8 pages)", () => {
+    for (let seed = 100; seed <= 105; seed++) {
+      const tag = seed <= 101 ? " @fast" : "";
+      it(`seed ${seed} (200 ops, 8-page cache)${tag}`, async () => {
+        await runParitySession(seed, 8, 200);
+      });
+    }
+  });
+
+  describe("tiny cache (3 pages)", () => {
+    for (let seed = 200; seed <= 205; seed++) {
+      it(`seed ${seed} (150 ops, 3-page cache)`, async () => {
+        await runParitySession(seed, 3, 150);
+      });
+    }
+  });
+
+  describe("extended (16 pages, 500 ops)", () => {
+    for (let seed = 300; seed <= 302; seed++) {
+      it(`seed ${seed} (500 ops, 16-page cache)`, async () => {
+        await runParitySession(seed, 16, 500);
       });
     }
   });
