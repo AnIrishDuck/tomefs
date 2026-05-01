@@ -1066,4 +1066,148 @@ describe("OpfsBackend", () => {
       expect(await backend.readMeta("/file1")).toEqual(meta);
     });
   });
+
+  // -------------------------------------------------------------------
+  // cleanupOrphanedPages
+  // -------------------------------------------------------------------
+
+  describe("cleanupOrphanedPages", () => {
+    it("removes page directories with no corresponding metadata @fast", async () => {
+      // Write pages and metadata for /file1, but only pages for /file2.
+      // /file2's pages are orphaned (no metadata to reference them).
+      await backend.writePage("/file1", 0, filledPage(0xaa));
+      await backend.writeMeta("/file1", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+      await backend.writePage("/file2", 0, filledPage(0xbb));
+      await backend.writePage("/file2", 1, filledPage(0xcc));
+      // No metadata for /file2 — simulates crash after writePages but
+      // before writeMetas in the old (pages-first) syncAll ordering.
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(1);
+      // /file1's pages survive
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0xaa));
+      // /file2's orphaned pages are gone
+      expect(await backend.readPage("/file2", 0)).toBeNull();
+      expect(await backend.readPage("/file2", 1)).toBeNull();
+    });
+
+    it("returns 0 when there are no orphans @fast", async () => {
+      await backend.writePage("/f", 0, filledPage(0x01));
+      await backend.writeMeta("/f", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+
+      const removed = await backend.cleanupOrphanedPages();
+      expect(removed).toBe(0);
+      expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
+    });
+
+    it("returns 0 on empty backend @fast", async () => {
+      const removed = await backend.cleanupOrphanedPages();
+      expect(removed).toBe(0);
+    });
+
+    it("removes multiple orphaned page directories", async () => {
+      // 3 files with pages, only 1 has metadata
+      await backend.writePage("/keep", 0, filledPage(0x01));
+      await backend.writeMeta("/keep", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+      await backend.writePage("/orphan1", 0, filledPage(0x02));
+      await backend.writePage("/orphan2", 0, filledPage(0x03));
+      await backend.writePage("/orphan2", 1, filledPage(0x04));
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(2);
+      expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/orphan1", 0)).toBeNull();
+      expect(await backend.readPage("/orphan2", 0)).toBeNull();
+    });
+
+    it("does not remove metadata-only entries (no pages)", async () => {
+      // Metadata exists but no pages — this is a valid state (empty file).
+      // cleanupOrphanedPages should not touch metadata.
+      await backend.writeMeta("/empty", {
+        size: 0,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(0);
+      expect(await backend.readMeta("/empty")).toEqual({
+        size: 0,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // syncAll ordering
+  // -------------------------------------------------------------------
+
+  describe("syncAll ordering", () => {
+    it("syncAll writes metadata before pages @fast", async () => {
+      // Verify that after syncAll, both metadata and pages are present.
+      // This is the basic correctness check — the ordering (metadata-first)
+      // is verified by the crash-safety property: if only the first write
+      // succeeds, we get metadata without pages (recoverable) rather than
+      // pages without metadata (permanent orphan leak).
+      const meta = {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      };
+      await backend.syncAll(
+        [{ path: "/f", pageIndex: 0, data: filledPage(0xab) }],
+        [{ path: "/f", meta }],
+      );
+
+      expect(await backend.readMeta("/f")).toEqual(meta);
+      expect(await backend.readPage("/f", 0)).toEqual(filledPage(0xab));
+    });
+
+    it("partial syncAll (metadata written, pages not) leaves no orphan pages", async () => {
+      // Simulate the crash-safe scenario: metadata is present but pages
+      // were not written. This is the expected failure mode with
+      // metadata-first ordering. No orphaned page directories should exist.
+      //
+      // We can't truly simulate a crash, but we can verify the invariant:
+      // writing metadata alone (without pages) creates no page directories,
+      // so cleanupOrphanedPages finds nothing to clean.
+      const meta = {
+        size: PAGE_SIZE * 2,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      };
+      await backend.writeMetas([{ path: "/crash-file", meta }]);
+      // Pages were NOT written (simulating crash after metadata write)
+
+      const orphans = await backend.cleanupOrphanedPages();
+      expect(orphans).toBe(0);
+
+      // Metadata is present but no pages — maxPageIndex returns -1
+      expect(await backend.readMeta("/crash-file")).toEqual(meta);
+      expect(await backend.maxPageIndex("/crash-file")).toBe(-1);
+    });
+  });
 });

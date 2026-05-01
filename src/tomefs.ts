@@ -100,7 +100,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   // Set on mount (crash recovery may have left orphans) and cleared after
   // a successful orphan cleanup pass in syncfs. Operations that directly
   // modify backend metadata (rename, unlink-with-open-fds) re-set this
-  // flag since a crash between their backend writes could leave orphans.
+  // flag via invalidateCleanMarker() since a crash between their backend
+  // writes could leave orphans.
   //
   // On mount, this is set to true by default. If the backend has a clean-
   // shutdown marker (written at the end of a successful syncfs), we know
@@ -114,6 +115,34 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    *  Set when the marker is consumed during mount (restoreTree) and
    *  cleared after a successful syncfs writes it back. */
   let needsCleanMarker = false;
+
+  /**
+   * Invalidate the clean-shutdown marker before a multi-step backend
+   * operation (rename, unlink-with-open-fds). These operations perform
+   * multiple non-atomic backend writes — if the process crashes between
+   * them, stale metadata may remain. Without invalidation, the clean
+   * marker from the previous syncfs would tell the next mount that the
+   * backend is consistent when it isn't.
+   *
+   * Only deletes the marker from the backend — does NOT set
+   * needsOrphanCleanup. If the operation completes successfully, no
+   * orphan cleanup is needed for the current session (the operation
+   * handles its own cleanup). The marker deletion only matters if a
+   * crash occurs mid-operation: the next mount won't find a marker
+   * and will force orphan cleanup.
+   *
+   * The next syncfs re-writes the marker as part of its metadata batch,
+   * restoring the clean state. Cost: 1 deleteMeta call per rename/unlink
+   * cycle (amortized — subsequent calls before the next syncfs are no-ops
+   * because needsCleanMarker is already true).
+   */
+  function invalidateCleanMarker(): void {
+    if (!needsCleanMarker) {
+      // Marker is in the backend — delete it for crash safety.
+      backend.deleteMeta(CLEAN_MARKER_PATH);
+      needsCleanMarker = true;
+    }
+  }
 
   /**
    * Set of nodes with dirty metadata (not yet persisted to the backend).
@@ -165,14 +194,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const firstPage = (position / PAGE_SIZE) | 0;
     const pageOffset = position - firstPage * PAGE_SIZE;
     if (pageOffset + toRead <= PAGE_SIZE) {
-      let page = node._pages?.[firstPage];
-      if (page && page.evicted) {
+      // node._pages is always initialized (never undefined), so direct
+      // array access avoids optional-chain overhead on every read.
+      let page = node._pages[firstPage];
+      if (page !== undefined && page.evicted) {
         node._pages[firstPage] = undefined;
         page = undefined;
       }
-      if (!page) {
+      if (page === undefined) {
         page = pageCache.getPage(node.storagePath, firstPage);
-        if (!node._pages) node._pages = [];
         node._pages[firstPage] = page;
       }
       buffer.set(
@@ -224,7 +254,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
     // Populate per-node page table from pages now in cache, so subsequent
     // reads at the same positions use the fast path above.
-    if (!node._pages) node._pages = [];
     for (let p = firstPage; p <= lastPage; p++) {
       if (!node._pages[p]) {
         node._pages[p] = pageCache.getPage(node.storagePath, p);
@@ -252,12 +281,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const firstPage = (position / PAGE_SIZE) | 0;
     const pageOffset = position - firstPage * PAGE_SIZE;
     if (pageOffset + length <= PAGE_SIZE) {
-      let page = node._pages?.[firstPage];
-      if (page && page.evicted) {
+      let page = node._pages[firstPage];
+      if (page !== undefined && page.evicted) {
         node._pages[firstPage] = undefined;
         page = undefined;
       }
-      if (!page) {
+      if (page === undefined) {
         // Skip backend read for pages beyond the current file extent —
         // they don't exist in the backend, so readPage would be a wasted
         // SAB bridge round-trip returning null.
@@ -271,7 +300,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         page = needsRead
           ? pageCache.getPage(node.storagePath, firstPage)
           : pageCache.getPageNoRead(node.storagePath, firstPage);
-        if (!node._pages) node._pages = [];
         node._pages[firstPage] = page;
       }
       page.data.set(
@@ -337,7 +365,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
     // Populate per-node page table from pages now in cache, so subsequent
     // writes at the same positions use the fast path above.
-    if (!node._pages) node._pages = [];
     for (let p = firstPage; p <= lastPage; p++) {
       if (!node._pages[p]) {
         node._pages[p] = pageCache.getPage(node.storagePath, p);
@@ -356,7 +383,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
     if (newSize === 0) {
       // Reset per-node page table — all pages are being deleted.
-      node._pages = undefined;
+      node._pages = [];
       pageCache.deleteFile(path);
       node.usedBytes = 0;
       return;
@@ -366,7 +393,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // Shrink: reset per-node page table — truncation invalidates pages
       // beyond the new size, and zeroTailAfterTruncate may reload the
       // last surviving page (replacing the cached CachedPage reference).
-      node._pages = undefined;
+      node._pages = [];
       // Zero the tail of the last surviving page, then invalidate beyond
       const neededPages = Math.ceil(newSize / PAGE_SIZE);
       pageCache.zeroTailAfterTruncate(path, newSize);
@@ -389,7 +416,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const firstNewPage = node.usedBytes > 0 ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
       const lastPageIdx = Math.ceil(newSize / PAGE_SIZE) - 1;
       if (lastPageIdx >= firstNewPage) {
-        pageCache.markPageDirty(path, lastPageIdx);
+        pageCache.markPageDirtyNoRead(path, lastPageIdx);
       }
     }
 
@@ -467,6 +494,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // (since old_node === new_node), causing data loss on last close.
     if (new_node && new_node === old_node) return;
 
+    // Invalidate the clean-shutdown marker before performing multi-step
+    // backend operations. All rename code paths (file, directory, symlink)
+    // involve at least two backend writes — if the process crashes between
+    // them, stale metadata at the old path could persist. Invalidating the
+    // marker ensures orphan cleanup runs on the next mount.
+    invalidateCleanMarker();
+
     if (new_node) {
       if (FS.isDir(old_node.mode)) {
         for (const _i in new_node.contents) {
@@ -495,7 +529,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           });
           pageCache.renameFile(targetStoragePath, tempPath);
           new_node.storagePath = tempPath;
-          new_node._pages = undefined;
+          new_node._pages = [];
           new_node.unlinked = true;
         } else {
           pageCache.deleteFile(targetStoragePath);
@@ -542,7 +576,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       });
       pageCache.renameFile(oldStoragePath, newStoragePath);
       old_node.storagePath = newStoragePath;
-      old_node._pages = undefined;
+      old_node._pages = [];
       backend.deleteMeta(oldStoragePath);
     } else if (FS.isDir(old_node.mode)) {
       // Move directory metadata to the new path before recursing into
@@ -607,6 +641,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // original storagePath is free for reuse by new files or renames.
         // Without this, a new file at the same path would share page cache
         // entries with the unlinked node, causing data corruption.
+        invalidateCleanMarker();
         const originalPath = node.storagePath;
         const tempPath = `/__deleted_${nextPathId++}`;
         // Write marker metadata BEFORE renaming pages. This ensures that
@@ -625,7 +660,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         });
         pageCache.renameFile(originalPath, tempPath);
         node.storagePath = tempPath;
-        node._pages = undefined;
+        node._pages = [];
         backend.deleteMeta(originalPath);
       }
       // Only remove from tracking if no open fds — syncfs needs to
@@ -794,7 +829,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     for (const { child, oldPath, newPath } of pageRenames) {
       pageCache.renameFile(oldPath, newPath);
       child.storagePath = newPath;
-      child._pages = undefined;
+      child._pages = [];
     }
 
     // Delete old metadata last.
@@ -908,6 +943,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
           pageCache.deleteFile(node.storagePath);
           backend.deleteMeta(node.storagePath); // removes /__deleted_* marker
           allFileNodes.delete(node);
+          // Clean up dirty tracking. If the file was written to via fd after
+          // unlinking (valid POSIX pattern for temp files), markMetaDirty
+          // re-added it to dirtyMetaNodes. Without cleanup, the dead node
+          // lingers in the set — never persisted (incremental syncfs skips
+          // unlinked+closed nodes) but iterated on every sync, leaking
+          // memory and wasting cycles in long-running sessions.
+          if (node._metaDirty) {
+            node._metaDirty = false;
+            dirtyMetaNodes.delete(node);
+          }
         }
         // Dirty pages remain in the cache and are flushed by syncfs or
         // eviction. POSIX close() does not guarantee persistence — that
@@ -921,6 +966,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       const oldSize = node.usedBytes;
       resizeFileStorage(node, Math.max(oldSize, offset + length));
       if (node.usedBytes !== oldSize) {
+        node.mtime = node.ctime = Date.now();
         markMetaDirty(node);
       }
     },
@@ -1462,8 +1508,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               }
             }
             if (orphanPaths.length > 0) {
-              backend.deleteFiles(orphanPaths);
-              backend.deleteMetas(orphanPaths);
+              backend.deleteAll(orphanPaths);
             }
             needsOrphanCleanup = false;
           }
@@ -1498,7 +1543,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // indexed by page number. Provides O(1) direct page access,
         // bypassing string key construction and Map lookup in the cache.
         // Stale entries (evicted pages) are detected via CachedPage.evicted.
-        node._pages = undefined;
+        // Initialized eagerly to avoid optional-chain overhead on every read.
+        node._pages = [];
         // Assign a unique storage path for page cache keying
         node.storagePath = parent
           ? computeStoragePath(parent, name)

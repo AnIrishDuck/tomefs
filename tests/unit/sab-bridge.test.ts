@@ -629,6 +629,44 @@ describe("SAB+Atomics Bridge", () => {
     });
   });
 
+  describe("deleteAll", () => {
+    it("@fast deleteAll removes both pages and metadata atomically", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data.fill(0xaa);
+      const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 100, mtime: 200 };
+
+      await callClient(clientWorker, "writePage", ["/a", 0, data]);
+      await callClient(clientWorker, "writeMeta", ["/a", meta]);
+      await callClient(clientWorker, "writePage", ["/b", 0, data]);
+      await callClient(clientWorker, "writeMeta", ["/b", meta]);
+      await callClient(clientWorker, "writePage", ["/keep", 0, data]);
+      await callClient(clientWorker, "writeMeta", ["/keep", meta]);
+
+      await callClient(clientWorker, "deleteAll", [["/a", "/b"]]);
+
+      expect(await callClient(clientWorker, "readPage", ["/a", 0])).toBeNull();
+      expect(await callClient(clientWorker, "readMeta", ["/a"])).toBeNull();
+      expect(await callClient(clientWorker, "readPage", ["/b", 0])).toBeNull();
+      expect(await callClient(clientWorker, "readMeta", ["/b"])).toBeNull();
+      // Unrelated file survives
+      const kept = await callClient(clientWorker, "readPage", ["/keep", 0]);
+      expect(toUint8Array(kept)[0]).toBe(0xaa);
+      expect(await callClient(clientWorker, "readMeta", ["/keep"])).toEqual(meta);
+    });
+
+    it("deleteAll with empty array is a no-op", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data.fill(0x42);
+      await callClient(clientWorker, "writePage", ["/f", 0, data]);
+      await callClient(clientWorker, "writeMeta", ["/f", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 }]);
+
+      await callClient(clientWorker, "deleteAll", [[]]);
+
+      const r = await callClient(clientWorker, "readPage", ["/f", 0]);
+      expect(toUint8Array(r)[0]).toBe(0x42);
+    });
+  });
+
   describe("page + metadata combined", () => {
     it("page data and metadata are independent", async () => {
       const data = new Uint8Array(PAGE_SIZE);

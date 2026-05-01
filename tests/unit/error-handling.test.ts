@@ -124,6 +124,11 @@ class FailingSyncBackend implements SyncStorageBackend {
     this.writePages(pages);
     this.writeMetas(metas);
   }
+
+  deleteAll(paths: string[]): void {
+    this.deleteFiles(paths);
+    this.deleteMetas(paths);
+  }
 }
 
 /**
@@ -241,6 +246,11 @@ class FailingAsyncBackend implements StorageBackend {
   ): Promise<void> {
     await this.writePages(pages);
     await this.writeMetas(metas);
+  }
+
+  async deleteAll(paths: string[]): Promise<void> {
+    await this.deleteFiles(paths);
+    await this.deleteMetas(paths);
   }
 }
 

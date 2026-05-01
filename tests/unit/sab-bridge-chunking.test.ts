@@ -390,6 +390,51 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       }
     });
 
+    it("@fast syncAll with combined pages + metas overflowing buffer falls back gracefully", async () => {
+      // With the small buffer (12 KB data region), maxBatchPages=1 and
+      // maxBatchMetas=16. A single page passes the pages check (1 <= 1),
+      // and 16 metas passes the metas check (16 <= 16). But each limit
+      // assumes the FULL buffer for its payload type. With ~185-char paths,
+      // the combined payload is ~12.5 KB: 8192 bytes of page binary data +
+      // ~4.3 KB of JSON metadata, exceeding the 12 KB data region.
+      //
+      // Before the fix, this would throw "SAB buffer overflow" from
+      // encodeMessage. After the fix, syncAll catches the overflow and
+      // falls back to separate writePages + writeMetas calls.
+      const longPath = (i: number) =>
+        `/deeply/nested/directory/structure/that/inflates/json/size` +
+        `_padding_to_make_this_much_longer_abcdefghijklmnopqrstuvwxyz_0123456789_abcdefghijklmnopqrstuvwxyz_extra_padding_here` +
+        `/entry_${String(i).padStart(3, "0")}`;
+
+      const pages = [{ path: longPath(0), pageIndex: 0, data: fillPage(0xee) }];
+      const metas = Array.from({ length: 16 }, (_, i) => ({
+        path: longPath(i),
+        meta: {
+          size: i === 0 ? PAGE_SIZE : 0,
+          mode: 0o100644,
+          ctime: 1100 + i,
+          mtime: 1200 + i,
+        } as FileMeta,
+      }));
+
+      // Should succeed via fallback — not throw
+      await callClient(clientWorker, "syncAll", [pages, metas]);
+
+      // Verify page data survived
+      const page = toUint8Array(
+        await callClient(clientWorker, "readPage", [longPath(0), 0]),
+      );
+      expect(page[0]).toBe(0xee);
+
+      // Verify all 16 metas survived
+      const paths = metas.map((m) => m.path);
+      const readMetas = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+      for (let i = 0; i < 16; i++) {
+        expect(readMetas[i]).not.toBeNull();
+        expect(readMetas[i]!.mtime).toBe(1200 + i);
+      }
+    });
+
     it("syncAll multi-file pages + metas all survive", async () => {
       const pages = [
         { path: "/x", pageIndex: 0, data: fillPage(0x10) },
