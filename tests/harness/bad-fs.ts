@@ -5,7 +5,7 @@
  * specific behavior. The conformance test suite should catch each defect —
  * if it doesn't, the test lacks discriminating power for that class of bug.
  *
- * See plans/conformance-test-plan.md for the full defect inventory.
+ * See plans/ethos.md §4 (BadFS Validation) for the design rationale.
  */
 
 import {

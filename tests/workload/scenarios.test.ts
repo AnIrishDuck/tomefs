@@ -5,7 +5,7 @@
  * not just individual POSIX operations. Each scenario runs at multiple cache
  * sizes to force different eviction paths.
  *
- * See plans/workload-scenario-plan.md for the full design.
+ * See plans/ethos.md §8 (Workload Scenarios) for the design rationale.
  */
 
 import {

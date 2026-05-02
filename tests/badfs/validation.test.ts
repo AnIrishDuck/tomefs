@@ -6,7 +6,7 @@
  * against a BadFS wrapper. The defect should cause specific tests to fail
  * while other tests continue to pass.
  *
- * See plans/conformance-test-plan.md § BadFS Validation.
+ * See plans/ethos.md §4 (BadFS Validation) for the design rationale.
  */
 import { createBadFS, type DefectId } from "../harness/bad-fs.js";
 import {
