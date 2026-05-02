@@ -172,6 +172,8 @@ type Op =
   | { type: "mmapRead"; fdId: number; length: number; position: number }
   | { type: "mmapWrite"; fdId: number; length: number; position: number; data: Uint8Array }
   | { type: "allocateFd"; fdId: number; offset: number; length: number }
+  | { type: "readAt"; path: string; position: number; length: number }
+  | { type: "readFdAt"; fdId: number; position: number; length: number }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -194,6 +196,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["createFile", 20],
     ["mkdir", 10],
     ["writeAt", allFiles.length > 0 ? 15 : 0],
+    ["readAt", allFiles.length > 0 ? 12 : 0],
     ["readFile", allFiles.length > 0 ? 10 : 0],
     ["truncate", allFiles.length > 0 ? 10 : 0],
     ["renameFile", allFiles.length > 0 ? 10 : 0],
@@ -210,6 +213,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["readThroughSymlink", validSymlinks.length > 0 ? 6 : 0],
     ["openFd", allFiles.length > 0 && model.openFds.size < 4 ? 8 : 0],
     ["readFd", model.openFds.size > 0 ? 8 : 0],
+    ["readFdAt", model.openFds.size > 0 ? 10 : 0],
     ["writeFd", model.openFds.size > 0 ? 8 : 0],
     ["closeFd", model.openFds.size > 0 ? 6 : 0],
     ["dupFd", model.openFds.size > 0 && model.openFds.size < 8 ? 6 : 0],
@@ -264,6 +268,17 @@ function generateOp(rng: Rng, model: FSModel): Op {
       const size = rng.pick(sizeChoices);
       const data = rng.bytes(size);
       return { type: "writeAt", path, offset, data };
+    }
+
+    case "readAt": {
+      const path = rng.pick(allFiles);
+      const currentSize = model.files.get(path) ?? 0;
+      if (currentSize === 0) return { type: "readFile", path };
+      const position = rng.int(currentSize);
+      const maxLen = currentSize - position;
+      const lengthChoices = [1, 50, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1, Math.min(maxLen, PAGE_SIZE * 2)].filter(l => l > 0 && l <= maxLen);
+      const length = lengthChoices.length > 0 ? rng.pick(lengthChoices) : maxLen;
+      return { type: "readAt", path, position, length };
     }
 
     case "readFile": {
@@ -377,6 +392,19 @@ function generateOp(rng: Rng, model: FSModel): Op {
     case "readFd": {
       const fds = [...model.openFds.keys()];
       return { type: "readFd", fdId: rng.pick(fds) };
+    }
+
+    case "readFdAt": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const fdInfo = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fdInfo.currentPath) ?? 0;
+      if (currentSize === 0) return { type: "readFd", fdId };
+      const position = rng.int(currentSize);
+      const maxLen = currentSize - position;
+      const lengthChoices = [1, 50, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1, Math.min(maxLen, PAGE_SIZE * 2)].filter(l => l > 0 && l <= maxLen);
+      const length = lengthChoices.length > 0 ? rng.pick(lengthChoices) : maxLen;
+      return { type: "readFdAt", fdId, position, length };
     }
 
     case "writeFd": {
@@ -537,10 +565,23 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
 
       case "writeAt": {
         const s = FS.open(op.path, O.RDWR);
-        FS.write(s, op.data, 0, op.data.length, op.offset);
+        // Exercise non-zero buffer offset: deterministic padding derived
+        // from data length (doesn't consume RNG, preserves seed stability)
+        const waBufOff = op.data.length % 13;
+        const waBuf = new Uint8Array(waBufOff + op.data.length);
+        waBuf.set(op.data, waBufOff);
+        FS.write(s, waBuf, waBufOff, op.data.length, op.offset);
         const stat = FS.stat(op.path);
         FS.close(s);
         return { error: null, size: stat.size };
+      }
+
+      case "readAt": {
+        const s = FS.open(op.path, O.RDONLY);
+        const buf = new Uint8Array(op.length);
+        FS.read(s, buf, 0, op.length, op.position);
+        FS.close(s);
+        return { error: null, data: buf, size: op.length };
       }
 
       case "readFile": {
@@ -642,17 +683,34 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         if (!stream) return { error: "no-fd" };
         // Read entire file from position 0 using fstat for size
         const fstatResult = FS.fstat(stream.fd ?? stream);
-        const buf = new Uint8Array(fstatResult.size);
+        // Exercise non-zero buffer offset: deterministic padding derived
+        // from file size (doesn't consume RNG, preserves seed stability)
+        const rfBufOff = fstatResult.size % 11;
+        const buf = new Uint8Array(rfBufOff + fstatResult.size);
         if (fstatResult.size > 0) {
-          FS.read(stream, buf, 0, fstatResult.size, 0);
+          FS.read(stream, buf, rfBufOff, fstatResult.size, 0);
         }
-        return { error: null, data: buf, size: fstatResult.size };
+        const data = buf.slice(rfBufOff, rfBufOff + fstatResult.size);
+        return { error: null, data, size: fstatResult.size };
+      }
+
+      case "readFdAt": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        const buf = new Uint8Array(op.length);
+        FS.read(stream, buf, 0, op.length, op.position);
+        return { error: null, data: buf, size: op.length };
       }
 
       case "writeFd": {
         const stream = fdStreams?.get(op.fdId);
         if (!stream) return { error: "no-fd" };
-        FS.write(stream, op.data, 0, op.data.length, op.offset);
+        // Exercise non-zero buffer offset: deterministic padding derived
+        // from data length (doesn't consume RNG, preserves seed stability)
+        const wfBufOff = op.data.length % 17;
+        const wfBuf = new Uint8Array(wfBufOff + op.data.length);
+        wfBuf.set(op.data, wfBufOff);
+        FS.write(stream, wfBuf, wfBufOff, op.data.length, op.offset);
         const fstatResult = FS.fstat(stream.fd ?? stream);
         return { error: null, size: fstatResult.size };
       }
@@ -682,7 +740,10 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
 
       case "appendWrite": {
         const s = FS.open(op.path, O.WRONLY | O.APPEND);
-        FS.write(s, op.data, 0, op.data.length);
+        const awBufOff = op.data.length % 19;
+        const awBuf = new Uint8Array(awBufOff + op.data.length);
+        awBuf.set(op.data, awBufOff);
+        FS.write(s, awBuf, awBufOff, op.data.length);
         const stat = FS.stat(op.path);
         FS.close(s);
         return { error: null, size: stat.size };
@@ -928,7 +989,7 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
       }
       break;
     }
-    // readFd, readlink, readThroughSymlink, seekFd, mmapRead don't modify file state
+    // readAt, readFd, readFdAt, readlink, readThroughSymlink, seekFd, mmapRead don't modify file state
     // mmapWrite modifies file contents via msync but doesn't change size
   }
 }
@@ -940,6 +1001,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] createFile(${op.path}, ${op.data.length}B)`;
     case "writeAt":
       return `[${index}] writeAt(${op.path}, offset=${op.offset}, ${op.data.length}B)`;
+    case "readAt":
+      return `[${index}] readAt(${op.path}, pos=${op.position}, len=${op.length})`;
     case "readFile":
       return `[${index}] readFile(${op.path})`;
     case "truncate":
@@ -974,6 +1037,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] openFd(${op.path}, fdId=${op.fdId})`;
     case "readFd":
       return `[${index}] readFd(fdId=${op.fdId})`;
+    case "readFdAt":
+      return `[${index}] readFdAt(fdId=${op.fdId}, pos=${op.position}, len=${op.length})`;
     case "writeFd":
       return `[${index}] writeFd(fdId=${op.fdId}, offset=${op.offset}, ${op.data.length}B)`;
     case "closeFd":
@@ -1302,7 +1367,7 @@ async function runFuzzSequence(
     }
 
     // For read operations, compare returned data
-    if ((op.type === "readFile" || op.type === "readThroughSymlink" || op.type === "readlink" || op.type === "readFd" || op.type === "mmapRead") && !memResult.error && memResult.data && tomeResult.data) {
+    if ((op.type === "readFile" || op.type === "readAt" || op.type === "readThroughSymlink" || op.type === "readlink" || op.type === "readFd" || op.type === "readFdAt" || op.type === "mmapRead") && !memResult.error && memResult.data && tomeResult.data) {
       expect(tomeResult.data.length, `${desc}: read length mismatch`).toBe(memResult.data.length);
       for (let j = 0; j < memResult.data.length; j++) {
         if (memResult.data[j] !== tomeResult.data[j]) {
@@ -1469,6 +1534,34 @@ describe("fuzz: randomized differential testing", () => {
     }, 30_000);
   });
 
+  describe("positioned read operations (pread)", () => {
+    // Seeds chosen to exercise readAt and readFdAt — positioned reads at
+    // specific offsets within files. These target the per-node page table
+    // fast path for single-page reads, cross-page boundary reads, and
+    // cache miss handling when reading evicted pages. Postgres uses pread
+    // as its primary read I/O pattern.
+
+    it("seed 10001 tiny cache @fast", async () => {
+      await runFuzzSequence(10001, 120, 4);
+    }, 30_000);
+
+    it("seed 10002 tiny cache", async () => {
+      await runFuzzSequence(10002, 120, 4);
+    }, 30_000);
+
+    it("seed 10003 small cache", async () => {
+      await runFuzzSequence(10003, 150, 16);
+    }, 30_000);
+
+    it("seed 10004 tiny cache", async () => {
+      await runFuzzSequence(10004, 120, 4);
+    }, 30_000);
+
+    it("seed 10005 medium cache", async () => {
+      await runFuzzSequence(10005, 150, 64);
+    }, 30_000);
+  });
+
   describe("allocate operations (fallocate)", () => {
     // Seeds chosen to exercise allocate (fallocate) paths. These create
     // sparse files that interact with the page cache: only the last page
@@ -1488,4 +1581,5 @@ describe("fuzz: randomized differential testing", () => {
       await runFuzzSequence(54321, 150, 16);
     }, 30_000);
   });
+
 });

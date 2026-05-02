@@ -120,14 +120,12 @@ class TransientFailureBackend implements StorageBackend {
   }
   async deleteMeta(path: string) { return this.inner.deleteMeta(path); }
   async deleteMetas(paths: string[]) { return this.inner.deleteMetas(paths); }
+  async deleteAll(paths: string[]) { return this.inner.deleteAll(paths); }
   async syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ) {
     return this.inner.syncAll(pages, metas);
-  }
-  async deleteAll(paths: string[]) {
-    return this.inner.deleteAll(paths);
   }
 }
 

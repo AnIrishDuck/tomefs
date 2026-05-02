@@ -479,12 +479,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (new_name.length > NAME_MAX) {
       throw new FS.ErrnoError(ENAMETOOLONG);
     }
+
+    invalidateCleanMarker();
+
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
     } catch (_e) {
       // Target doesn't exist — that's fine
     }
+
+    // POSIX: "If the old argument and the new argument both refer to links
+    // to the same existing file, rename() shall return successfully and
+    // perform no other action." Emscripten's FS.rename already checks this
+    // (early return when old_node === new_node), but we guard here too:
+    // without this, the target cleanup path would set old_node.unlinked=true
+    // (since old_node === new_node), causing data loss on last close.
+    if (new_node && new_node === old_node) return;
 
     // Invalidate the clean-shutdown marker before performing multi-step
     // backend operations. All rename code paths (file, directory, symlink)
@@ -625,6 +636,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const node = parent.contents[name];
     if (node && FS.isFile(node.mode)) {
       node.unlinked = true;
+      invalidateCleanMarker();
       if (node.openCount === 0) {
         pageCache.deleteFile(node.storagePath);
         backend.deleteMeta(node.storagePath);
@@ -750,10 +762,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const metaWrites: Array<{ path: string; meta: FileMeta }> = [];
     const metaDeletes: string[] = [];
     const pageRenames: Array<{ child: any; oldPath: string; newPath: string }> = [];
+    const visitedNodes: any[] = [];
 
     function collect(node: any, oldBase: string, newBase: string): void {
       for (const childName of Object.keys(node.contents)) {
         const child = node.contents[childName];
+        visitedNodes.push(child);
         if (FS.isFile(child.mode)) {
           const oldPath = child.storagePath;
           const newPath = newBase + oldPath.substring(oldBase.length);
@@ -827,6 +841,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Delete old metadata last.
     if (metaDeletes.length > 0) {
       backend.deleteMetas(metaDeletes);
+    }
+
+    // Clear dirty flags — metadata was just written from live node state.
+    // Without this, the next incremental syncfs re-persists all descendants.
+    for (const node of visitedNodes) {
+      if (node._metaDirty) {
+        node._metaDirty = false;
+        dirtyMetaNodes.delete(node);
+      }
     }
   }
 

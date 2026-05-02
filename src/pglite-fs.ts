@@ -119,10 +119,16 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
   // must re-persist both pages AND metadata — not just flush pages.
   const originalCloseFs = adapter.closeFs.bind(adapter);
   adapter.closeFs = async () => {
+    let syncError: Error | null = null;
     if (moduleFS) {
-      await syncAndFlush();
+      try {
+        await syncAndFlush();
+      } catch (e) {
+        syncError = e as Error;
+      }
     }
-    return originalCloseFs();
+    await originalCloseFs();
+    if (syncError) throw syncError;
   };
 
   // Expose internals for testing

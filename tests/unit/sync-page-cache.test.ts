@@ -266,6 +266,192 @@ describe("SyncPageCache", () => {
     });
   });
 
+  describe("invalidatePagesFrom dirty index cleanup", () => {
+    it("invalidatePagesFrom clears dirty flags for invalidated pages", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write 4 pages — all dirty
+      for (let i = 0; i < 4; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(i + 1);
+        cache.write("/file", data, 0, PAGE_SIZE, i * PAGE_SIZE, i * PAGE_SIZE);
+      }
+      expect(cache.dirtyCount).toBe(4);
+
+      // Invalidate from page 2 — pages 2-3 should be removed from dirty tracking
+      cache.invalidatePagesFrom("/file", 2);
+      expect(cache.dirtyCount).toBe(2);
+      expect(cache.isDirty("/file", 0)).toBe(true);
+      expect(cache.isDirty("/file", 1)).toBe(true);
+      expect(cache.isDirty("/file", 2)).toBe(false);
+      expect(cache.isDirty("/file", 3)).toBe(false);
+    });
+
+    it("invalidatePagesFrom then flushAll: only surviving pages flushed", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write 4 pages
+      for (let i = 0; i < 4; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(i + 1);
+        cache.write("/file", data, 0, PAGE_SIZE, i * PAGE_SIZE, i * PAGE_SIZE);
+      }
+
+      // Invalidate pages 2+ (simulating truncation)
+      cache.invalidatePagesFrom("/file", 2);
+
+      // Flush all — only pages 0 and 1 should be written to backend
+      const flushed = cache.flushAll();
+      expect(flushed).toBe(2);
+
+      // Verify only pages 0-1 are in the backend
+      expect(backend.readPage("/file", 0)).not.toBeNull();
+      expect(backend.readPage("/file", 1)).not.toBeNull();
+    });
+
+    it("invalidatePagesFrom with mixed dirty/clean pages", () => {
+      const cache = new SyncPageCache(backend, 8);
+
+      // Write 4 pages and flush them all (clean in cache)
+      for (let i = 0; i < 4; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(i + 1);
+        cache.write("/file", data, 0, PAGE_SIZE, i * PAGE_SIZE, i * PAGE_SIZE);
+      }
+      cache.flushAll();
+      expect(cache.dirtyCount).toBe(0);
+
+      // Dirty only pages 1 and 3
+      const data1 = new Uint8Array(PAGE_SIZE);
+      data1.fill(0xaa);
+      cache.write("/file", data1, 0, PAGE_SIZE, PAGE_SIZE, 4 * PAGE_SIZE);
+      const data3 = new Uint8Array(PAGE_SIZE);
+      data3.fill(0xbb);
+      cache.write("/file", data3, 0, PAGE_SIZE, 3 * PAGE_SIZE, 4 * PAGE_SIZE);
+      expect(cache.dirtyCount).toBe(2);
+
+      // Invalidate from page 2 — removes page 2 (clean) and page 3 (dirty)
+      cache.invalidatePagesFrom("/file", 2);
+      expect(cache.dirtyCount).toBe(1); // only page 1 remains dirty
+      expect(cache.isDirty("/file", 1)).toBe(true);
+      expect(cache.isDirty("/file", 3)).toBe(false);
+    });
+
+    it("invalidatePagesFrom from page 0 clears all dirty pages for file", () => {
+      const cache = new SyncPageCache(backend, 8);
+      for (let i = 0; i < 3; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data.fill(i + 1);
+        cache.write("/file", data, 0, PAGE_SIZE, i * PAGE_SIZE, i * PAGE_SIZE);
+      }
+      // Also dirty a different file
+      cache.write("/other", new Uint8Array(PAGE_SIZE).fill(0xff), 0, PAGE_SIZE, 0, 0);
+      expect(cache.dirtyCount).toBe(4);
+
+      cache.invalidatePagesFrom("/file", 0);
+      // Only /other's dirty page should remain
+      expect(cache.dirtyCount).toBe(1);
+      expect(cache.isDirty("/other", 0)).toBe(true);
+    });
+
+    it("invalidatePagesFrom then write to surviving page: dirty flag preserved", () => {
+      const cache = new SyncPageCache(backend, 8);
+      // Write 3 pages
+      for (let i = 0; i < 3; i++) {
+        cache.write("/file", new Uint8Array(PAGE_SIZE).fill(i), 0, PAGE_SIZE, i * PAGE_SIZE, i * PAGE_SIZE);
+      }
+
+      // Invalidate from page 2
+      cache.invalidatePagesFrom("/file", 2);
+
+      // Write to page 1 (surviving page) — should still be dirty
+      const newData = new Uint8Array(PAGE_SIZE);
+      newData.fill(0xdd);
+      cache.write("/file", newData, 0, PAGE_SIZE, PAGE_SIZE, 2 * PAGE_SIZE);
+
+      // Collect and verify only pages 0-1 are in the dirty set
+      const dirty = cache.collectDirtyPages();
+      expect(dirty.length).toBe(2);
+      const dirtyIndices = dirty
+        .filter((p) => p.path === "/file")
+        .map((p) => p.pageIndex)
+        .sort();
+      expect(dirtyIndices).toEqual([0, 1]);
+    });
+  });
+
+  describe("cross-page read with partial eviction", () => {
+    it("batch read stitches cached and reloaded pages correctly", () => {
+      const cache = new SyncPageCache(backend, 3);
+
+      // Write 3 pages with distinct patterns
+      for (let p = 0; p < 3; p++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        for (let i = 0; i < PAGE_SIZE; i++) {
+          data[i] = ((p + 1) * 31 + i * 7) & 0xff;
+        }
+        cache.write("/file", data, 0, PAGE_SIZE, p * PAGE_SIZE, p * PAGE_SIZE);
+      }
+      cache.flushAll();
+
+      // Evict page 0 by loading other files (3-page cache)
+      cache.getPage("/other1", 0);
+      expect(cache.has("/file", 0)).toBe(false);
+      expect(cache.has("/file", 1)).toBe(true); // still cached
+
+      // Read across page 0→1 boundary — page 0 reloaded, page 1 from cache
+      const readBuf = new Uint8Array(512);
+      const readStart = PAGE_SIZE - 256;
+      const fileSize = 3 * PAGE_SIZE;
+      const n = cache.read("/file", readBuf, 0, 512, readStart, fileSize);
+      expect(n).toBe(512);
+
+      // Verify data from page 0 (reloaded from backend)
+      for (let i = 0; i < 256; i++) {
+        const pos = readStart + i;
+        const expected = (1 * 31 + pos * 7) & 0xff;
+        expect(readBuf[i]).toBe(expected);
+      }
+      // Verify data from page 1 (still in cache)
+      for (let i = 256; i < 512; i++) {
+        const pos = (readStart + i) - PAGE_SIZE;
+        const expected = (2 * 31 + pos * 7) & 0xff;
+        expect(readBuf[i]).toBe(expected);
+      }
+    });
+
+    it("write spanning evicted + cached pages: both updated correctly", () => {
+      const cache = new SyncPageCache(backend, 3);
+
+      // Write 2 pages and flush
+      cache.write("/file", new Uint8Array(PAGE_SIZE).fill(0xaa), 0, PAGE_SIZE, 0, 0);
+      cache.write("/file", new Uint8Array(PAGE_SIZE).fill(0xbb), 0, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE);
+      cache.flushAll();
+
+      // Evict page 0
+      cache.getPage("/other1", 0);
+      cache.getPage("/other2", 0);
+      expect(cache.has("/file", 0)).toBe(false);
+
+      // Write across page boundary (page 0 must be reloaded for partial write)
+      const crossData = new Uint8Array(256);
+      crossData.fill(0xcc);
+      cache.write("/file", crossData, 0, 256, PAGE_SIZE - 128, 2 * PAGE_SIZE);
+
+      // Read back and verify
+      const readBuf = new Uint8Array(256);
+      cache.read("/file", readBuf, 0, 256, PAGE_SIZE - 128, 2 * PAGE_SIZE);
+      for (let i = 0; i < 256; i++) {
+        expect(readBuf[i]).toBe(0xcc);
+      }
+
+      // Verify non-overlapping regions are preserved
+      const headBuf = new Uint8Array(100);
+      cache.read("/file", headBuf, 0, 100, 0, 2 * PAGE_SIZE);
+      for (let i = 0; i < 100; i++) {
+        expect(headBuf[i]).toBe(0xaa);
+      }
+    });
+  });
+
   describe("deleteFile", () => {
     it("removes pages from cache and backend", () => {
       const cache = new SyncPageCache(backend, 4);

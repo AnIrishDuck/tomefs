@@ -493,8 +493,9 @@ describe("SAB bridge: timeout", () => {
       callClient(clientWorker, "readPage", ["/slow", 0]),
     ).rejects.toThrow(/SAB bridge timeout/);
 
-    // Wait for the slow backend operation to complete so the worker settles
-    await new Promise((r) => setTimeout(r, 2500));
+    // No sleep needed — SabClient.recoverFromTimeout() automatically waits
+    // for the worker to finish the stale request before encoding the next one.
+    // This prevents the concurrent-write race that would corrupt the shared buffer.
 
     // Now make it fast again
     slowBackend.readDelay = 0;
@@ -507,6 +508,51 @@ describe("SAB bridge: timeout", () => {
     const buf = toUint8Array(result);
     expect(buf[0]).toBe(0x42);
   }, 10000);
+
+  it("immediate retry after timeout does not corrupt data", async () => {
+    // Write known data through the bridge first
+    slowBackend.readDelay = 0;
+    const original = new Uint8Array(PAGE_SIZE);
+    original[0] = 0xaa;
+    original[PAGE_SIZE - 1] = 0xbb;
+    await callClient(clientWorker, "writePage", ["/data", 0, original]);
+
+    // Trigger a timeout on a slow read
+    slowBackend.readDelay = 2000;
+    await expect(
+      callClient(clientWorker, "readPage", ["/data", 0]),
+    ).rejects.toThrow(/SAB bridge timeout/);
+
+    // Immediately retry without any sleep — the recovery logic in SabClient
+    // waits for the worker's stale response to complete before writing the
+    // new request, preventing concurrent writes to the shared buffer.
+    slowBackend.readDelay = 0;
+    const result = await callClient(clientWorker, "readPage", ["/data", 0]);
+    const buf = toUint8Array(result);
+    expect(buf[0]).toBe(0xaa);
+    expect(buf[PAGE_SIZE - 1]).toBe(0xbb);
+  }, 10000);
+
+  it("multiple consecutive timeouts recover correctly", async () => {
+    slowBackend.readDelay = 2000;
+
+    // Two consecutive timeouts
+    await expect(
+      callClient(clientWorker, "readPage", ["/t1", 0]),
+    ).rejects.toThrow(/SAB bridge timeout/);
+
+    await expect(
+      callClient(clientWorker, "readPage", ["/t2", 0]),
+    ).rejects.toThrow(/SAB bridge timeout/);
+
+    // Now succeed
+    slowBackend.readDelay = 0;
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0x55;
+    await callClient(clientWorker, "writePage", ["/recovered", 0, data]);
+    const result = await callClient(clientWorker, "readPage", ["/recovered", 0]);
+    expect(toUint8Array(result)[0]).toBe(0x55);
+  }, 30000);
 
   it("fast operations succeed within timeout", async () => {
     // No delay — should complete well within 200ms
