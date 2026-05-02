@@ -5,5 +5,6 @@ export default defineConfig({
     globals: true,
     testTimeout: 30000,
     include: ["tests/**/*.test.ts"],
+    pool: "threads",
   },
 });
