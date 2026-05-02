@@ -486,6 +486,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // Target doesn't exist — that's fine
     }
 
+    // POSIX: "If the old argument and the new argument both refer to links
+    // to the same existing file, rename() shall return successfully and
+    // perform no other action." Emscripten's FS.rename already checks this
+    // (early return when old_node === new_node), but we guard here too:
+    // without this, the target cleanup path would set old_node.unlinked=true
+    // (since old_node === new_node), causing data loss on last close.
+    if (new_node && new_node === old_node) return;
+
     // Invalidate the clean-shutdown marker before performing multi-step
     // backend operations. All rename code paths (file, directory, symlink)
     // involve at least two backend writes — if the process crashes between

@@ -103,11 +103,18 @@ interface SymlinkState {
   target: string;
 }
 
+/** Shared file position: duped FDs share the same position object (POSIX semantics). */
+interface SharedPosition {
+  value: number;
+}
+
 interface OpenFdState {
   /** Model path of the open file. */
   path: string;
-  /** Current stream position. */
-  position: number;
+  /** Shared stream position — dup'd FDs reference the same object. */
+  position: SharedPosition;
+  /** True when the file has been unlinked while this fd was open. */
+  orphaned: boolean;
 }
 
 interface FSModel {
@@ -118,6 +125,10 @@ interface FSModel {
   openFds: Map<number, OpenFdState>;
   /** Counter for unique fd slot ids. */
   nextFdId: number;
+  /** Paths that were unlinked while FDs were open. Tracked to verify
+   *  cleanup: after close + syncfs + remount, no /__deleted_* entries
+   *  should remain in the backend. */
+  orphanedFdCount: number;
 }
 
 function newModel(): FSModel {
@@ -127,6 +138,7 @@ function newModel(): FSModel {
     symlinks: new Map(),
     openFds: new Map(),
     nextFdId: 0,
+    orphanedFdCount: 0,
   };
 }
 
@@ -380,7 +392,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
         offset = rng.int(fileSize + PAGE_SIZE + 1);
       } else {
         // SEEK_CUR: relative to current position, keep non-negative result
-        const maxForward = fileSize + PAGE_SIZE - fd.position;
+        const maxForward = fileSize + PAGE_SIZE - fd.position.value;
         offset = rng.int(Math.max(1, maxForward + 1));
       }
       return { type: "seekFd", fdId, offset, whence };
@@ -676,11 +688,17 @@ function updateModel(model: FSModel, op: Op): void {
     case "renameFile": {
       const file = model.files.get(op.oldPath);
       if (!file) break;
+      // POSIX: rename(a, a) where both refer to the same file is a no-op.
+      if (op.oldPath === op.newPath) break;
       // If destination has an existing file, FDs pointing at it become orphaned
-      // (their inode is being replaced, but the FD still references the old inode)
+      // (the target inode is replaced, but the FD still references the old inode).
+      // In tomefs, the target gets moved to /__deleted_* if it has open FDs.
       if (model.files.has(op.newPath)) {
-        for (const [fdId, fd] of [...model.openFds]) {
-          if (fd.path === op.newPath) model.openFds.delete(fdId);
+        for (const fd of model.openFds.values()) {
+          if (fd.path === op.newPath && !fd.orphaned) {
+            fd.orphaned = true;
+            model.orphanedFdCount++;
+          }
         }
       }
       model.files.delete(op.newPath);
@@ -688,20 +706,27 @@ function updateModel(model: FSModel, op: Op): void {
       model.symlinks.delete(op.newPath);
       model.files.delete(op.oldPath);
       model.files.set(op.newPath, file);
-      // Update any open FDs pointing at the source path to follow the rename
+      // Update any non-orphaned FDs pointing at the source path to follow the rename
       for (const fd of model.openFds.values()) {
-        if (fd.path === op.oldPath) fd.path = op.newPath;
+        if (fd.path === op.oldPath && !fd.orphaned) fd.path = op.newPath;
       }
       break;
     }
 
-    case "unlink":
+    case "unlink": {
       model.files.delete(op.path);
-      // Remove any open FDs pointing at the unlinked path (data is orphaned)
-      for (const [fdId, fd] of [...model.openFds]) {
-        if (fd.path === op.path) model.openFds.delete(fdId);
+      // Mark FDs as orphaned instead of removing them. This matches POSIX
+      // semantics: unlinked files remain accessible through open FDs until
+      // the last FD closes. The data won't survive remount, but the FD
+      // operations (write, seek, close) must not crash.
+      for (const fd of model.openFds.values()) {
+        if (fd.path === op.path && !fd.orphaned) {
+          fd.orphaned = true;
+          model.orphanedFdCount++;
+        }
       }
       break;
+    }
 
     case "mkdir":
       model.dirs.set(op.path, { mode: 0o40777 });
@@ -724,10 +749,14 @@ function updateModel(model: FSModel, op: Op): void {
     case "renameSymlink": {
       const symlink = model.symlinks.get(op.oldPath);
       if (!symlink) break;
+      if (op.oldPath === op.newPath) break;
       // If destination has an existing file, FDs pointing at it become orphaned
       if (model.files.has(op.newPath)) {
-        for (const [fdId, fd] of [...model.openFds]) {
-          if (fd.path === op.newPath) model.openFds.delete(fdId);
+        for (const fd of model.openFds.values()) {
+          if (fd.path === op.newPath && !fd.orphaned) {
+            fd.orphaned = true;
+            model.orphanedFdCount++;
+          }
         }
       }
       model.files.delete(op.newPath);
@@ -794,7 +823,7 @@ function updateModel(model: FSModel, op: Op): void {
     }
 
     case "openFd": {
-      model.openFds.set(op.fdId, { path: op.path, position: 0 });
+      model.openFds.set(op.fdId, { path: op.path, position: { value: 0 }, orphaned: false });
       model.nextFdId = op.fdId + 1;
       break;
     }
@@ -802,16 +831,19 @@ function updateModel(model: FSModel, op: Op): void {
     case "writeFd": {
       const fd = model.openFds.get(op.fdId);
       if (!fd) break;
+      if (fd.orphaned) {
+        fd.position.value += op.data.length;
+        break;
+      }
       const file = model.files.get(fd.path);
       if (!file) break;
-      const pos = fd.position;
+      const pos = fd.position.value;
       const newSize = Math.max(file.data.length, pos + op.data.length);
       const newData = new Uint8Array(newSize);
       newData.set(file.data);
       newData.set(op.data, pos);
       file.data = newData;
-      fd.position = pos + op.data.length;
-      // Write via fd updates mtime
+      fd.position.value = pos + op.data.length;
       file.mtime = null;
       break;
     }
@@ -819,17 +851,29 @@ function updateModel(model: FSModel, op: Op): void {
     case "seekFd": {
       const fd = model.openFds.get(op.fdId);
       if (!fd) break;
+      if (fd.orphaned) {
+        if (op.whence === SEEK_SET) {
+          fd.position.value = op.offset;
+        } else if (op.whence === SEEK_CUR) {
+          fd.position.value = fd.position.value + op.offset;
+        }
+        break;
+      }
       const file = model.files.get(fd.path);
       if (!file) break;
       if (op.whence === SEEK_SET) {
-        fd.position = op.offset;
+        fd.position.value = op.offset;
       } else if (op.whence === SEEK_CUR) {
-        fd.position = fd.position + op.offset;
+        fd.position.value = fd.position.value + op.offset;
       }
       break;
     }
 
     case "closeFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (fd?.orphaned) {
+        model.orphanedFdCount--;
+      }
       model.openFds.delete(op.fdId);
       break;
     }
@@ -837,7 +881,8 @@ function updateModel(model: FSModel, op: Op): void {
     case "dupFd": {
       const srcFd = model.openFds.get(op.srcFdId);
       if (!srcFd) break;
-      model.openFds.set(op.newFdId, { path: srcFd.path, position: srcFd.position });
+      model.openFds.set(op.newFdId, { path: srcFd.path, position: srcFd.position, orphaned: srcFd.orphaned });
+      // position is a shared reference — dup'd FDs share the same position object (POSIX dup semantics)
       model.nextFdId = op.newFdId + 1;
       break;
     }
@@ -845,6 +890,7 @@ function updateModel(model: FSModel, op: Op): void {
     case "ftruncateFd": {
       const fd = model.openFds.get(op.fdId);
       if (!fd) break;
+      if (fd.orphaned) break;
       const file = model.files.get(fd.path);
       if (!file) break;
       if (op.size < file.data.length) {
@@ -975,6 +1021,59 @@ function syncfs(rawFS: any): void {
 // ---------------------------------------------------------------
 // Verification: compare FS state against model after remount
 // ---------------------------------------------------------------
+
+/**
+ * Verify backend structural integrity after syncfs + remount.
+ *
+ * Checks that the backend contains no leaked entries:
+ * - No /__deleted_* metadata (orphaned unlink markers not cleaned up by close)
+ * - No orphaned pages (pages without corresponding metadata)
+ * - Page extent matches metadata size for each file
+ *
+ * These invariants are invisible to FS-level verification (restoreTree
+ * filters out /__deleted_* entries and adjusts sizes). Without backend
+ * verification, leaked entries accumulate silently — causing memory
+ * growth, slower syncfs (needsOrphanCleanup stays true), and
+ * performance degradation.
+ */
+function verifyBackendIntegrity(
+  backend: SyncMemoryBackend,
+  model: FSModel,
+  context: string,
+): void {
+  const backendFiles = backend.listFiles();
+
+  // No /__deleted_* entries should remain after close + syncfs.
+  // These are created by unlink/rename when FDs are open, and cleaned
+  // up by close() when the last FD closes.
+  const deletedEntries = backendFiles.filter((p) => p.startsWith("/__deleted_"));
+  expect(
+    deletedEntries.length,
+    `${context}: leaked /__deleted_* metadata entries: [${deletedEntries.join(", ")}]`,
+  ).toBe(0);
+
+  // Every backend metadata entry (excluding internal markers) should
+  // correspond to a file, directory, or symlink in the model.
+  const liveEntries = backendFiles.filter(
+    (p) => !p.startsWith("/__deleted_") && p !== "/__tomefs_clean",
+  );
+  for (const path of liveEntries) {
+    const meta = backend.readMeta(path);
+    if (!meta) continue;
+    const typeMode = meta.mode & 0o170000;
+    if (typeMode === 0o100000) {
+      // Regular file: verify page extent matches metadata size
+      const maxIdx = backend.maxPageIndex(path);
+      const expectedLastPage = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) - 1 : -1;
+      if (maxIdx > expectedLastPage) {
+        throw new Error(
+          `${context}: file ${path} has pages beyond metadata size ` +
+          `(maxPageIndex=${maxIdx}, expected<=${expectedLastPage}, meta.size=${meta.size})`,
+        );
+      }
+    }
+  }
+}
 
 function verifyAfterRemount(
   rawFS: any,
@@ -1121,6 +1220,10 @@ function closeAllFds(
     } catch {
       // Ignore errors from already-closed or invalid streams
     }
+    const fd = model.openFds.get(fdId);
+    if (fd?.orphaned) {
+      model.orphanedFdCount--;
+    }
     model.openFds.delete(fdId);
   }
   streams.clear();
@@ -1178,9 +1281,10 @@ async function runPersistenceRoundtrip(
       instance = await createTomeFSInstance(backend, maxPages);
       streams = new Map();
 
-      // Verify all data survived the roundtrip
+      // Verify backend structural integrity before remount
       const context = `remount after op ${i} (seed ${seed})`;
       try {
+        verifyBackendIntegrity(backend, model, context);
         verifyAfterRemount(instance.rawFS, model, context);
       } catch (e) {
         // Include recent ops for debugging
@@ -1197,8 +1301,16 @@ async function runPersistenceRoundtrip(
 
   // Final roundtrip: persist and verify one last time
   syncfs(instance.rawFS);
-  instance = await createTomeFSInstance(backend, maxPages);
   const context = `final remount (seed ${seed})`;
+  try {
+    verifyBackendIntegrity(backend, model, context);
+  } catch (e) {
+    const recentOps = ops.slice(Math.max(0, ops.length - 20));
+    throw new Error(
+      `${(e as Error).message}\n\nRecent ops:\n${recentOps.join("\n")}`,
+    );
+  }
+  instance = await createTomeFSInstance(backend, maxPages);
   try {
     verifyAfterRemount(instance.rawFS, model, context);
   } catch (e) {
@@ -1354,6 +1466,28 @@ describe("fuzz: persistence roundtrip testing", () => {
 
     it("seed 90004, large cache, msync + truncate + allocate", async () => {
       await runPersistenceRoundtrip(90004, 80, 4096, 20);
+    }, 30_000);
+  });
+
+  describe("unlink with open FDs — write to unlinked files + backend cleanup", () => {
+    it("seed 120001, tiny cache, unlink+write+close+remount @fast", async () => {
+      await runPersistenceRoundtrip(120001, 80, 4, 10);
+    }, 30_000);
+
+    it("seed 120002, small cache, interleaved unlink and FD writes", async () => {
+      await runPersistenceRoundtrip(120002, 100, 16, 15);
+    }, 30_000);
+
+    it("seed 120003, tiny cache, frequent remount with orphaned FDs", async () => {
+      await runPersistenceRoundtrip(120003, 60, 4, 5);
+    }, 30_000);
+
+    it("seed 120004, medium cache, long sequence with unlink churn", async () => {
+      await runPersistenceRoundtrip(120004, 150, 64, 20);
+    }, 60_000);
+
+    it("seed 120005, tiny cache, rename-over-target with open FDs @fast", async () => {
+      await runPersistenceRoundtrip(120005, 80, 4, 10);
     }, 30_000);
   });
 
