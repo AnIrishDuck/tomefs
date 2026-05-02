@@ -368,11 +368,12 @@ describe("clean marker invalidation on unlink with open fds", () => {
     // Clean marker should exist
     expect(backend.readMeta(CLEAN_MARKER_PATH)).not.toBeNull();
 
-    // Unlink without open fds — single backend operation, no crash window
+    // Unlink without open fds — still involves multiple backend operations
+    // (page deletion + meta deletion), so marker is invalidated for crash safety
     FS.unlink(`${MOUNT}/no-fd.txt`);
 
-    // Clean marker should still exist (no multi-step operation)
-    expect(backend.readMeta(CLEAN_MARKER_PATH)).not.toBeNull();
+    // Clean marker should be deleted (multi-step backend operation)
+    expect(backend.readMeta(CLEAN_MARKER_PATH)).toBeNull();
   });
 });
 

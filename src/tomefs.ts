@@ -479,6 +479,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (new_name.length > NAME_MAX) {
       throw new FS.ErrnoError(ENAMETOOLONG);
     }
+
+    invalidateCleanMarker();
+
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
@@ -633,6 +636,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const node = parent.contents[name];
     if (node && FS.isFile(node.mode)) {
       node.unlinked = true;
+      invalidateCleanMarker();
       if (node.openCount === 0) {
         pageCache.deleteFile(node.storagePath);
         backend.deleteMeta(node.storagePath);
