@@ -1272,6 +1272,9 @@ async function runPersistenceRoundtrip(
       // Close all open FDs before syncfs (FDs don't survive remount)
       closeAllFds(instance.rawFS, model, streams);
 
+      // Validate page cache index consistency before persist
+      instance.tomefs.pageCache.assertInvariants();
+
       // Persist current state
       syncfs(instance.rawFS);
 
@@ -1280,6 +1283,9 @@ async function runPersistenceRoundtrip(
       // backend, creating nodes, verifying page counts, and computing file sizes.
       instance = await createTomeFSInstance(backend, maxPages);
       streams = new Map();
+
+      // Validate page cache index consistency after restore
+      instance.tomefs.pageCache.assertInvariants();
 
       // Verify backend structural integrity before remount
       const context = `remount after op ${i} (seed ${seed})`;
@@ -1299,6 +1305,9 @@ async function runPersistenceRoundtrip(
   // Close any remaining FDs before final roundtrip
   closeAllFds(instance.rawFS, model, streams);
 
+  // Validate page cache before final persist
+  instance.tomefs.pageCache.assertInvariants();
+
   // Final roundtrip: persist and verify one last time
   syncfs(instance.rawFS);
   const context = `final remount (seed ${seed})`;
@@ -1311,6 +1320,7 @@ async function runPersistenceRoundtrip(
     );
   }
   instance = await createTomeFSInstance(backend, maxPages);
+  instance.tomefs.pageCache.assertInvariants();
   try {
     verifyAfterRemount(instance.rawFS, model, context);
   } catch (e) {
