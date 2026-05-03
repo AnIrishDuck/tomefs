@@ -170,6 +170,116 @@ describe("persistence (Batch 6)", () => {
     expect(stat2.mtime.getTime()).toBe(mtime1);
   });
 
+  it("all three timestamps (atime, mtime, ctime) persist across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    const stream = FS.open(`${MOUNT}/allts`, O.RDWR | O.CREAT, 0o666);
+    FS.write(stream, encode("timestamps"), 0, 10);
+    FS.close(stream);
+    const stat1 = FS.stat(`${MOUNT}/allts`);
+    const atime1 = stat1.atime.getTime();
+    const mtime1 = stat1.mtime.getTime();
+    const ctime1 = stat1.ctime.getTime();
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    const stat2 = FS2.stat(`${MOUNT}/allts`);
+    expect(stat2.atime.getTime()).toBe(atime1);
+    expect(stat2.mtime.getTime()).toBe(mtime1);
+    expect(stat2.ctime.getTime()).toBe(ctime1);
+  });
+
+  it("utime-modified timestamps persist across remount @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    const stream = FS.open(`${MOUNT}/utimed`, O.RDWR | O.CREAT, 0o666);
+    FS.write(stream, encode("data"), 0, 4);
+    FS.close(stream);
+
+    FS.utime(`${MOUNT}/utimed`, 1000000, 2000000);
+    const stat1 = FS.stat(`${MOUNT}/utimed`);
+    expect(stat1.atime.getTime()).toBe(1000000);
+    expect(stat1.mtime.getTime()).toBe(2000000);
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    const stat2 = FS2.stat(`${MOUNT}/utimed`);
+    expect(stat2.atime.getTime()).toBe(1000000);
+    expect(stat2.mtime.getTime()).toBe(2000000);
+  });
+
+  it("directory timestamps persist across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    FS.mkdir(`${MOUNT}/tsdir`, 0o755);
+    FS.utime(`${MOUNT}/tsdir`, 3000000, 4000000);
+    const stat1 = FS.stat(`${MOUNT}/tsdir`);
+    expect(stat1.atime.getTime()).toBe(3000000);
+    expect(stat1.mtime.getTime()).toBe(4000000);
+    const ctime1 = stat1.ctime.getTime();
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    const stat2 = FS2.stat(`${MOUNT}/tsdir`);
+    expect(stat2.atime.getTime()).toBe(3000000);
+    expect(stat2.mtime.getTime()).toBe(4000000);
+    expect(stat2.ctime.getTime()).toBe(ctime1);
+  });
+
+  it("ctime updates from chmod persist across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    const stream = FS.open(`${MOUNT}/chts`, O.RDWR | O.CREAT, 0o644);
+    FS.write(stream, encode("x"), 0, 1);
+    FS.close(stream);
+    const before = FS.stat(`${MOUNT}/chts`);
+    const ctimeBefore = before.ctime.getTime();
+
+    // Small delay to ensure ctime changes
+    const later = ctimeBefore + 100;
+    FS.utime(`${MOUNT}/chts`, later, later);
+    FS.chmod(`${MOUNT}/chts`, 0o600);
+    const after = FS.stat(`${MOUNT}/chts`);
+    const ctimeAfter = after.ctime.getTime();
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    const stat2 = FS2.stat(`${MOUNT}/chts`);
+    expect(stat2.ctime.getTime()).toBe(ctimeAfter);
+    expect(stat2.mode & 0o777).toBe(0o600);
+  });
+
+  it("symlink timestamps persist across remount", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    FS.writeFile(`${MOUNT}/symtarget`, "target-data");
+    FS.symlink(`${MOUNT}/symtarget`, `${MOUNT}/symts`);
+    const lstat1 = FS.lstat(`${MOUNT}/symts`);
+    const ctime1 = lstat1.ctime.getTime();
+    const mtime1 = lstat1.mtime.getTime();
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    const lstat2 = FS2.lstat(`${MOUNT}/symts`);
+    expect(lstat2.ctime.getTime()).toBe(ctime1);
+    expect(lstat2.mtime.getTime()).toBe(mtime1);
+    const target = FS2.readlink(`${MOUNT}/symts`);
+    expect(target).toBe(`${MOUNT}/symtarget`);
+  });
+
+  it("multiple files with distinct utime values persist independently", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+    for (let i = 0; i < 5; i++) {
+      const s = FS.open(`${MOUNT}/ts${i}`, O.RDWR | O.CREAT, 0o666);
+      FS.write(s, encode(`f${i}`), 0, 2);
+      FS.close(s);
+      FS.utime(`${MOUNT}/ts${i}`, (i + 1) * 1000000, (i + 1) * 2000000);
+    }
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+    for (let i = 0; i < 5; i++) {
+      const stat = FS2.stat(`${MOUNT}/ts${i}`);
+      expect(stat.atime.getTime()).toBe((i + 1) * 1000000);
+      expect(stat.mtime.getTime()).toBe((i + 1) * 2000000);
+    }
+  });
+
   it("multiple files persist independently @fast", async () => {
     const { FS, tomefs } = await mountTome(backend);
     for (const name of ["a", "b", "c"]) {
