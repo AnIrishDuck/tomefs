@@ -480,8 +480,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       throw new FS.ErrnoError(ENAMETOOLONG);
     }
 
-    invalidateCleanMarker();
-
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
@@ -645,7 +643,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // original storagePath is free for reuse by new files or renames.
         // Without this, a new file at the same path would share page cache
         // entries with the unlinked node, causing data corruption.
-        invalidateCleanMarker();
         const originalPath = node.storagePath;
         const tempPath = `/__deleted_${nextPathId++}`;
         // Write marker metadata BEFORE renaming pages. This ensures that

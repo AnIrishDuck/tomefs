@@ -458,4 +458,122 @@ describe("adversarial: clean-shutdown marker invalidation", () => {
       h.FS.close(fd);
     }
   });
+
+  // -------------------------------------------------------------------
+  // Self-rename: no-op must NOT invalidate marker
+  // -------------------------------------------------------------------
+
+  it("self-rename does not invalidate clean marker @fast", async () => {
+    const backend = new SyncMemoryBackend();
+
+    // Session 1: create file, sync, establish clean marker
+    {
+      const { FS } = await createHarness(backend);
+      const data = encode("self-rename data");
+      const fd = FS.open(`${MOUNT}/same`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      FS.write(fd, data, 0, data.length, 0);
+      FS.close(fd);
+      syncfs(FS);
+    }
+
+    // Session 2: remount, syncfs to re-establish marker, then self-rename
+    {
+      const { FS } = await createHarness(backend);
+      // restoreTree consumes the marker on mount; syncfs re-writes it
+      syncfs(FS);
+      expect(backend.readMeta(CLEAN_MARKER)).not.toBeNull();
+
+      FS.rename(`${MOUNT}/same`, `${MOUNT}/same`);
+
+      // Self-rename is a POSIX no-op — marker must survive
+      expect(backend.readMeta(CLEAN_MARKER)).not.toBeNull();
+
+      // File data must be intact
+      const fd = FS.open(`${MOUNT}/same`, O.RDONLY);
+      const buf = new Uint8Array(100);
+      const n = FS.read(fd, buf, 0, 100, 0);
+      expect(decode(buf, n)).toBe("self-rename data");
+      FS.close(fd);
+    }
+  });
+
+  it("self-rename preserves data through persistence roundtrip @fast", async () => {
+    const backend = new SyncMemoryBackend();
+
+    {
+      const { FS } = await createHarness(backend);
+      const data = encode("survives self-rename + roundtrip");
+      const fd = FS.open(`${MOUNT}/f`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      FS.write(fd, data, 0, data.length, 0);
+      FS.close(fd);
+      syncfs(FS);
+    }
+
+    // Self-rename + syncfs + remount
+    {
+      const { FS } = await createHarness(backend);
+      FS.rename(`${MOUNT}/f`, `${MOUNT}/f`);
+      syncfs(FS);
+    }
+
+    // Verify data survives
+    {
+      const { FS } = await createHarness(backend);
+      const fd = FS.open(`${MOUNT}/f`, O.RDONLY);
+      const buf = new Uint8Array(100);
+      const n = FS.read(fd, buf, 0, 100, 0);
+      expect(decode(buf, n)).toBe("survives self-rename + roundtrip");
+      FS.close(fd);
+    }
+  });
+
+  it("self-rename with open fd does not invalidate marker @fast", async () => {
+    const backend = new SyncMemoryBackend();
+
+    {
+      const { FS } = await createHarness(backend);
+      const data = encode("open fd self-rename");
+      const fd = FS.open(`${MOUNT}/held`, O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+      FS.write(fd, data, 0, data.length, 0);
+      FS.close(fd);
+      syncfs(FS);
+    }
+
+    // Open fd, self-rename, verify marker and data
+    {
+      const { FS } = await createHarness(backend);
+      // restoreTree consumes the marker on mount; syncfs re-writes it
+      syncfs(FS);
+      expect(backend.readMeta(CLEAN_MARKER)).not.toBeNull();
+
+      const fd = FS.open(`${MOUNT}/held`, O.RDWR);
+
+      FS.rename(`${MOUNT}/held`, `${MOUNT}/held`);
+
+      // Marker must survive self-rename
+      expect(backend.readMeta(CLEAN_MARKER)).not.toBeNull();
+
+      // Read through the fd
+      const buf = new Uint8Array(100);
+      const n = FS.read(fd, buf, 0, 100, 0);
+      expect(decode(buf, n)).toBe("open fd self-rename");
+
+      // Write through the fd still works
+      const extra = encode(" + appended");
+      FS.write(fd, extra, 0, extra.length, n);
+      FS.close(fd);
+
+      syncfs(FS);
+    }
+
+    // Verify data persists
+    {
+      const { FS } = await createHarness(backend);
+      const fd = FS.open(`${MOUNT}/held`, O.RDONLY);
+      const buf = new Uint8Array(100);
+      const n = FS.read(fd, buf, 0, 100, 0);
+      expect(decode(buf, n)).toBe("open fd self-rename + appended");
+      FS.close(fd);
+    }
+  });
 });
