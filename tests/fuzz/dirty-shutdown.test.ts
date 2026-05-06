@@ -101,14 +101,20 @@ interface FileState {
   mode: number;
 }
 
+interface OpenFdState {
+  path: string;
+}
+
 interface FSModel {
   files: Map<string, FileState>;
   dirs: Set<string>;
   symlinks: Map<string, string>;
+  openFds: Map<number, OpenFdState>;
+  nextFdId: number;
 }
 
 function newModel(): FSModel {
-  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map() };
+  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map(), openFds: new Map(), nextFdId: 0 };
 }
 
 function snapshotModel(model: FSModel): FSModel {
@@ -116,12 +122,17 @@ function snapshotModel(model: FSModel): FSModel {
     files: new Map(),
     dirs: new Set(model.dirs),
     symlinks: new Map(model.symlinks),
+    openFds: new Map(),
+    nextFdId: model.nextFdId,
   };
   for (const [path, state] of model.files) {
     snapshot.files.set(path, {
       data: new Uint8Array(state.data),
       mode: state.mode,
     });
+  }
+  for (const [id, fd] of model.openFds) {
+    snapshot.openFds.set(id, { ...fd });
   }
   return snapshot;
 }
@@ -176,7 +187,10 @@ type Op =
   | { type: "appendWrite"; path: string; data: Uint8Array }
   | { type: "allocate"; path: string; offset: number; length: number }
   | { type: "chmod"; path: string; mode: number }
-  | { type: "mmapWrite"; path: string; offset: number; data: Uint8Array };
+  | { type: "mmapWrite"; path: string; offset: number; data: Uint8Array }
+  | { type: "openFd"; path: string; fdId: number }
+  | { type: "writeFd"; fdId: number; data: Uint8Array; offset: number }
+  | { type: "closeFd"; fdId: number };
 
 const DIR_NAMES = ["alpha", "beta", "gamma"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"];
@@ -187,6 +201,14 @@ function generateOp(rng: Rng, model: FSModel): Op {
   const allDirs = [...model.dirs].filter((d) => d !== "/");
   const allContainerDirs = [...model.dirs];
   const allSymlinks = [...model.symlinks.keys()];
+
+  // Files that have open fds — used for unlink-with-open-fd generation
+  const filesWithOpenFds = new Set<string>();
+  for (const fd of model.openFds.values()) {
+    if (model.files.has(fd.path)) filesWithOpenFds.add(fd.path);
+  }
+  // Files without open fds — safe to unlink without creating /__deleted_* markers
+  const filesWithoutOpenFds = allFiles.filter((p) => !filesWithOpenFds.has(p));
 
   const weights: Array<[string, number]> = [
     ["createFile", 20],
@@ -204,6 +226,9 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["allocate", allFiles.length > 0 ? 8 : 0],
     ["chmod", allFiles.length > 0 ? 6 : 0],
     ["mmapWrite", allFiles.length > 0 ? 6 : 0],
+    ["openFd", allFiles.length > 0 && model.openFds.size < 4 ? 8 : 0],
+    ["writeFd", model.openFds.size > 0 ? 10 : 0],
+    ["closeFd", model.openFds.size > 0 ? 6 : 0],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -325,6 +350,27 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "mmapWrite", path, offset, data };
     }
 
+    case "openFd": {
+      const path = rng.pick(allFiles);
+      const fdId = model.nextFdId;
+      return { type: "openFd", path, fdId };
+    }
+
+    case "writeFd": {
+      const fdIds = [...model.openFds.keys()];
+      const fdId = rng.pick(fdIds);
+      const fd = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fd.path)?.data.length ?? 0;
+      const offset = rng.int(currentSize + PAGE_SIZE + 1);
+      const data = rng.bytes(rng.pick([1, 50, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1]));
+      return { type: "writeFd", fdId, data, offset };
+    }
+
+    case "closeFd": {
+      const fdIds = [...model.openFds.keys()];
+      return { type: "closeFd", fdId: rng.pick(fdIds) };
+    }
+
     default:
       return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(10) };
   }
@@ -341,7 +387,7 @@ function rw(p: string): string {
   return TOME_MOUNT + p;
 }
 
-function execOp(FS: EmscriptenFS, op: Op): boolean {
+function execOp(FS: EmscriptenFS, op: Op, activeFds: Map<number, any>): boolean {
   try {
     switch (op.type) {
       case "createFile": {
@@ -404,6 +450,24 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
         buf.set(op.data);
         s.stream_ops.msync(s, buf, op.offset, op.data.length, 0);
         FS.close(s);
+        return true;
+      }
+      case "openFd": {
+        const s = FS.open(rw(op.path), O.RDWR);
+        activeFds.set(op.fdId, s);
+        return true;
+      }
+      case "writeFd": {
+        const s = activeFds.get(op.fdId);
+        if (!s) return false;
+        FS.write(s, op.data, 0, op.data.length, op.offset);
+        return true;
+      }
+      case "closeFd": {
+        const s = activeFds.get(op.fdId);
+        if (!s) return false;
+        FS.close(s);
+        activeFds.delete(op.fdId);
         return true;
       }
       default:
@@ -540,6 +604,29 @@ function updateModel(model: FSModel, op: Op): void {
       file.data.set(op.data, op.offset);
       break;
     }
+    case "openFd": {
+      model.openFds.set(op.fdId, { path: op.path });
+      model.nextFdId = op.fdId + 1;
+      break;
+    }
+    case "writeFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (!fd) break;
+      const file = model.files.get(fd.path);
+      if (!file) break;
+      const newSize = Math.max(file.data.length, op.offset + op.data.length);
+      if (newSize > file.data.length) {
+        const newData = new Uint8Array(newSize);
+        newData.set(file.data);
+        file.data = newData;
+      }
+      file.data.set(op.data, op.offset);
+      break;
+    }
+    case "closeFd": {
+      model.openFds.delete(op.fdId);
+      break;
+    }
   }
 }
 
@@ -575,6 +662,12 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] chmod(${op.path}, ${op.mode.toString(8)})`;
     case "mmapWrite":
       return `[${index}] mmapWrite(${op.path}, @${op.offset}, ${op.data.length}B)`;
+    case "openFd":
+      return `[${index}] openFd(${op.path}, fdId=${op.fdId})`;
+    case "writeFd":
+      return `[${index}] writeFd(fdId=${op.fdId}, @${op.offset}, ${op.data.length}B)`;
+    case "closeFd":
+      return `[${index}] closeFd(fdId=${op.fdId})`;
   }
 }
 
@@ -653,6 +746,15 @@ function walkAndVerifyNavigable(rawFS: any, context: string): void {
         } catch (e: any) {
           errors.push(`read(${fullPath}, ${stat.size}B) failed: ${e.message}`);
         }
+      } else if (rawFS.isLink(stat.mode)) {
+        try {
+          const target = rawFS.readlink(fullPath);
+          if (typeof target !== "string" || target.length === 0) {
+            errors.push(`readlink(${fullPath}) returned empty or non-string: ${JSON.stringify(target)}`);
+          }
+        } catch (e: any) {
+          errors.push(`readlink(${fullPath}) failed: ${e.message}`);
+        }
       }
     }
   }
@@ -699,6 +801,23 @@ function verifyCheckpointFilesReadable(
           `${context}: checkpoint file ${path} (${fileState.data.length}B at checkpoint, ${stat.size}B now) read failed: ${e.message}`,
         );
       }
+    }
+  }
+
+  for (const [path, target] of checkpoint.symlinks) {
+    const fullPath = rw(path);
+    try {
+      const lstat = rawFS.lstat(fullPath);
+      if (!rawFS.isLink(lstat.mode)) continue;
+      const recovered = rawFS.readlink(fullPath);
+      if (typeof recovered !== "string" || recovered.length === 0) {
+        throw new Error(
+          `${context}: checkpoint symlink ${path} has empty/invalid target after recovery: ${JSON.stringify(recovered)}`,
+        );
+      }
+    } catch (e: any) {
+      if (e.message?.includes("checkpoint symlink")) throw e;
+      // Symlink may have been deleted or renamed during dirty phase
     }
   }
 }
@@ -774,16 +893,23 @@ async function runDirtyShutdown(
   const model = newModel();
   const backend = new SyncMemoryBackend();
   const ops: string[] = [];
+  const activeFds = new Map<number, any>();
 
   // Phase 1: Build state and checkpoint via clean syncfs
   let instance = await mountTome(backend, maxPages);
   for (let i = 0; i < checkpointOps; i++) {
     const op = generateOp(rng, model);
     ops.push(formatOp(op, i));
-    if (execOp(instance.rawFS, op)) {
+    if (execOp(instance.rawFS, op, activeFds)) {
       updateModel(model, op);
     }
   }
+  // Close any fds from checkpoint phase before syncfs
+  for (const [fdId, s] of activeFds) {
+    try { instance.rawFS.close(s); } catch {}
+    model.openFds.delete(fdId);
+  }
+  activeFds.clear();
   doSyncfs(instance.rawFS);
   const checkpoint = snapshotModel(model);
 
@@ -792,15 +918,23 @@ async function runDirtyShutdown(
   // eagerly. Page data from writes may be flushed by close() or eviction,
   // but metadata is not updated (only syncfs writes metadata for
   // non-rename/non-unlink operations).
+  //
+  // Open fd operations exercise the critical crash-with-open-fds path:
+  // writes through fds cause cache mutations + evictions, and unlink
+  // on files with open fds creates /__deleted_* markers that restoreTree
+  // must handle during recovery.
   for (let i = 0; i < dirtyOps; i++) {
     const op = generateOp(rng, model);
     ops.push(formatOp(op, checkpointOps + i));
-    if (execOp(instance.rawFS, op)) {
+    if (execOp(instance.rawFS, op, activeFds)) {
       updateModel(model, op);
     }
   }
 
   // Phase 3: Dirty shutdown — remount without syncfs.
+  // Active fds are abandoned (simulating process crash).
+  activeFds.clear();
+  model.openFds.clear();
   try {
     instance = await mountTome(backend, maxPages);
   } catch (e: any) {
@@ -812,6 +946,7 @@ async function runDirtyShutdown(
 
   const ctxDirty = `after dirty shutdown (seed ${seed})`;
   try {
+    instance.tomefs.pageCache.assertInvariants();
     walkAndVerifyNavigable(instance.rawFS, ctxDirty);
   } catch (e: any) {
     const recentOps = ops.slice(Math.max(0, ops.length - 20));
@@ -827,10 +962,12 @@ async function runDirtyShutdown(
 
   // Phase 4: Recovery — clean syncfs to reconcile backend state.
   doSyncfs(instance.rawFS);
+  instance.tomefs.pageCache.assertInvariants();
   instance = await mountTome(backend, maxPages);
 
   const ctxRecovery = `after recovery sync (seed ${seed})`;
   try {
+    instance.tomefs.pageCache.assertInvariants();
     verifyCleanState(instance.rawFS, backend, ctxRecovery);
   } catch (e: any) {
     const recentOps = ops.slice(Math.max(0, ops.length - 20));
@@ -840,10 +977,12 @@ async function runDirtyShutdown(
   // Phase 5: Verify stability — another roundtrip should produce
   // identical results (recovery didn't introduce new inconsistencies).
   doSyncfs(instance.rawFS);
+  instance.tomefs.pageCache.assertInvariants();
   instance = await mountTome(backend, maxPages);
 
   const ctxStable = `after stability check (seed ${seed})`;
   try {
+    instance.tomefs.pageCache.assertInvariants();
     verifyCleanState(instance.rawFS, backend, ctxStable);
   } catch (e: any) {
     const recentOps = ops.slice(Math.max(0, ops.length - 20));
@@ -935,48 +1074,69 @@ describe("fuzz: dirty shutdown recovery", () => {
       const rng = new Rng(76001);
       const model = newModel();
       const backend = new SyncMemoryBackend();
+      const activeFds = new Map<number, any>();
 
       // Cycle 1: build up state, sync, dirty ops, crash
       let instance = await mountTome(backend, 8);
       for (let i = 0; i < 20; i++) {
         const op = generateOp(rng, model);
-        if (execOp(instance.rawFS, op)) updateModel(model, op);
+        if (execOp(instance.rawFS, op, activeFds)) updateModel(model, op);
       }
+      for (const [fdId, s] of activeFds) {
+        try { instance.rawFS.close(s); } catch {}
+        model.openFds.delete(fdId);
+      }
+      activeFds.clear();
       doSyncfs(instance.rawFS);
 
       for (let i = 0; i < 15; i++) {
         const op = generateOp(rng, model);
-        if (execOp(instance.rawFS, op)) updateModel(model, op);
+        if (execOp(instance.rawFS, op, activeFds)) updateModel(model, op);
       }
+      activeFds.clear();
+      model.openFds.clear();
       instance = await mountTome(backend, 8);
+      instance.tomefs.pageCache.assertInvariants();
       walkAndVerifyNavigable(instance.rawFS, "cycle 1 dirty");
 
       // Cycle 2: recover, more work, sync, dirty ops, crash
       doSyncfs(instance.rawFS);
       for (let i = 0; i < 15; i++) {
         const op = generateOp(rng, model);
-        if (execOp(instance.rawFS, op)) updateModel(model, op);
+        if (execOp(instance.rawFS, op, activeFds)) updateModel(model, op);
       }
+      for (const [fdId, s] of activeFds) {
+        try { instance.rawFS.close(s); } catch {}
+        model.openFds.delete(fdId);
+      }
+      activeFds.clear();
       doSyncfs(instance.rawFS);
       for (let i = 0; i < 15; i++) {
         const op = generateOp(rng, model);
-        if (execOp(instance.rawFS, op)) updateModel(model, op);
+        if (execOp(instance.rawFS, op, activeFds)) updateModel(model, op);
       }
+      activeFds.clear();
+      model.openFds.clear();
       instance = await mountTome(backend, 8);
+      instance.tomefs.pageCache.assertInvariants();
       walkAndVerifyNavigable(instance.rawFS, "cycle 2 dirty");
 
       // Cycle 3: one more recovery + dirty shutdown
       doSyncfs(instance.rawFS);
       for (let i = 0; i < 10; i++) {
         const op = generateOp(rng, model);
-        if (execOp(instance.rawFS, op)) updateModel(model, op);
+        if (execOp(instance.rawFS, op, activeFds)) updateModel(model, op);
       }
+      activeFds.clear();
+      model.openFds.clear();
       instance = await mountTome(backend, 8);
+      instance.tomefs.pageCache.assertInvariants();
       walkAndVerifyNavigable(instance.rawFS, "cycle 3 dirty");
 
       // Final recovery — must produce a stable, clean filesystem
       doSyncfs(instance.rawFS);
       instance = await mountTome(backend, 8);
+      instance.tomefs.pageCache.assertInvariants();
       verifyCleanState(instance.rawFS, backend, "final recovery (seed 76001)");
     }, 60_000);
   });
