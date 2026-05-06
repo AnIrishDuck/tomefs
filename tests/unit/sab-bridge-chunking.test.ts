@@ -324,7 +324,7 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       expect(meta.mtime).toBe(200);
     });
 
-    it("@fast syncAll with 5 pages falls back to writePages + writeMetas", async () => {
+    it("@fast syncAll with 5 pages uses chunked SYNC_ALL calls", async () => {
       const pages = Array.from({ length: 5 }, (_, i) => ({
         path: "/syncmulti",
         pageIndex: i,
@@ -351,9 +351,9 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       expect(meta.size).toBe(5 * PAGE_SIZE);
     });
 
-    it("syncAll with many metas falls back to chunked writeMetas", async () => {
-      // 1 page + 20 metas. With the fix, metas.length (20) > maxBatchMetas (16)
-      // triggers the fallback path which chunks metas into [16, 4].
+    it("syncAll with many metas uses chunked SYNC_ALL calls", async () => {
+      // 1 page + 20 metas. metas.length (20) > maxBatchMetas (16) triggers
+      // the chunked path: page+meta co-located, remaining metas in batches.
       const pages = [{ path: "/file0", pageIndex: 0, data: fillPage(0xdd) }];
       const metas = Array.from({ length: 20 }, (_, i) => ({
         path: `/file${i}`,
@@ -390,7 +390,7 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       }
     });
 
-    it("@fast syncAll with combined pages + metas overflowing buffer falls back gracefully", async () => {
+    it("@fast syncAll with combined pages + metas overflowing buffer uses chunked fallback", async () => {
       // With the small buffer (12 KB data region), maxBatchPages=1 and
       // maxBatchMetas=16. A single page passes the pages check (1 <= 1),
       // and 16 metas passes the metas check (16 <= 16). But each limit
@@ -465,6 +465,90 @@ describe("SAB bridge: batch chunking with small buffer", () => {
       expect(xMeta.size).toBe(2 * PAGE_SIZE);
       const yMeta = (await callClient(clientWorker, "readMeta", ["/y"])) as FileMeta;
       expect(yMeta.size).toBe(PAGE_SIZE);
+    });
+
+    it("@fast chunked syncAll: many files with pages + metas-only entries", async () => {
+      // With maxBatchPages=1, each page requires its own SYNC_ALL chunk.
+      // This tests that per-file page+meta co-location works across
+      // many files, and that metas-only entries (directories, symlinks)
+      // are correctly sent in a final batch.
+      const pages = Array.from({ length: 6 }, (_, i) => ({
+        path: `/cs_${i % 3}`,
+        pageIndex: Math.floor(i / 3),
+        data: fillPage(0x30 + i),
+      }));
+
+      // 3 file metas (paired with pages) + 5 directory metas (no pages)
+      const metas = [
+        ...Array.from({ length: 3 }, (_, i) => ({
+          path: `/cs_${i}`,
+          meta: { size: 2 * PAGE_SIZE, mode: 0o100644, ctime: 1300, mtime: 1400 + i } as FileMeta,
+        })),
+        ...Array.from({ length: 5 }, (_, i) => ({
+          path: `/dir_${i}`,
+          meta: { size: 0, mode: 0o040755, ctime: 1500, mtime: 1600 + i } as FileMeta,
+        })),
+      ];
+
+      await callClient(clientWorker, "syncAll", [pages, metas]);
+
+      // Verify all 6 pages across 3 files
+      for (let f = 0; f < 3; f++) {
+        const result = toPageArray(
+          await callClient(clientWorker, "readPages", [`/cs_${f}`, [0, 1]]),
+        );
+        expect(result[0]![0]).toBe(0x30 + f);
+        expect(result[1]![0]).toBe(0x30 + 3 + f);
+      }
+
+      // Verify file metas
+      for (let f = 0; f < 3; f++) {
+        const meta = (await callClient(clientWorker, "readMeta", [`/cs_${f}`])) as FileMeta;
+        expect(meta.size).toBe(2 * PAGE_SIZE);
+        expect(meta.mtime).toBe(1400 + f);
+      }
+
+      // Verify directory metas (metas-only entries)
+      for (let d = 0; d < 5; d++) {
+        const meta = (await callClient(clientWorker, "readMeta", [`/dir_${d}`])) as FileMeta;
+        expect(meta.mode).toBe(0o040755);
+        expect(meta.mtime).toBe(1600 + d);
+      }
+    });
+
+    it("chunked syncAll: pages only (no metas)", async () => {
+      const pages = Array.from({ length: 4 }, (_, i) => ({
+        path: "/ponly",
+        pageIndex: i,
+        data: fillPage(0x40 + i),
+      }));
+
+      await callClient(clientWorker, "syncAll", [pages, []]);
+
+      const result = toPageArray(
+        await callClient(clientWorker, "readPages", ["/ponly", [0, 1, 2, 3]]),
+      );
+      for (let i = 0; i < 4; i++) {
+        expect(result[i]![0]).toBe(0x40 + i);
+      }
+    });
+
+    it("chunked syncAll: metas only (no pages)", async () => {
+      // 25 metas with no pages — forces metas-only chunking
+      // (maxBatchMetas=16, so 2 chunks: [16, 9])
+      const metas = Array.from({ length: 25 }, (_, i) => ({
+        path: `/monly_${i}`,
+        meta: { size: 0, mode: 0o040755, ctime: 1700, mtime: 1800 + i } as FileMeta,
+      }));
+
+      await callClient(clientWorker, "syncAll", [[], metas]);
+
+      const paths = metas.map((m) => m.path);
+      const result = (await callClient(clientWorker, "readMetas", [paths])) as Array<FileMeta | null>;
+      for (let i = 0; i < 25; i++) {
+        expect(result[i]).not.toBeNull();
+        expect(result[i]!.mtime).toBe(1800 + i);
+      }
     });
   });
 
