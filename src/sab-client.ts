@@ -441,13 +441,119 @@ export class SabClient implements SyncStorageBackend {
       }
     }
 
-    // Fallback: too large for a single call. Use separate writePages
-    // + writeMetas calls (each handles its own chunking). This loses
-    // single-transaction atomicity for the IDB backend, but is needed
-    // to avoid SAB buffer overflow.
-    this.writePages(pages);
-    if (metas.length > 0) {
-      this.writeMetas(metas);
+    // Fallback: too large for a single call. Chunk into multiple
+    // SYNC_ALL calls, grouping each file's pages with its metadata.
+    // Each chunk goes through backend.syncAll() — a single atomic IDB
+    // transaction — preserving per-chunk atomicity instead of losing
+    // all atomicity with separate writePages + writeMetas.
+    this.syncAllChunked(pages, metas);
+  }
+
+  /**
+   * Split a large syncAll into multiple SYNC_ALL calls, each containing
+   * a subset of pages paired with their corresponding metadata.
+   *
+   * Pages for a file are grouped together, and the file's metadata entry
+   * is attached to the chunk containing that file's last page. This
+   * ensures that within each committed chunk, pages and metadata are
+   * consistent. A crash between chunks means some files are fully synced
+   * and others aren't, but no file is partially synced (pages without
+   * metadata or vice versa).
+   *
+   * Metadata entries for files without dirty pages (directories, symlinks,
+   * unmodified files with only timestamp changes) are sent in a final
+   * metas-only chunk.
+   */
+  private syncAllChunked(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): void {
+    if (pages.length === 0) {
+      // No pages — chunk metas via SYNC_ALL for consistent IDB semantics
+      for (let i = 0; i < metas.length; i += this.maxBatchMetas) {
+        this.syncAllSingleChunk([], metas.slice(i, i + this.maxBatchMetas));
+      }
+      return;
+    }
+
+    // Index metas by path for co-location with their pages
+    const metaByPath = new Map<string, { path: string; meta: FileMeta }>();
+    for (const entry of metas) {
+      metaByPath.set(entry.path, entry);
+    }
+
+    // Precompute which chunk each file's last page falls in.
+    // Pages are ordered by collection time (from dirtyKeys iteration),
+    // so a file's pages may be interleaved with other files' pages.
+    const lastChunkForPath = new Map<string, number>();
+    for (let i = 0; i < pages.length; i++) {
+      lastChunkForPath.set(
+        pages[i].path,
+        Math.floor(i / this.maxBatchPages),
+      );
+    }
+
+    // Send pages in maxBatchPages-sized chunks. Attach each file's
+    // metadata to the chunk containing that file's last page.
+    const numChunks = Math.ceil(pages.length / this.maxBatchPages);
+    const sentMetas = new Set<string>();
+
+    for (let c = 0; c < numChunks; c++) {
+      const start = c * this.maxBatchPages;
+      const end = Math.min(start + this.maxBatchPages, pages.length);
+      const pageChunk = pages.slice(start, end);
+
+      const metaChunk: Array<{ path: string; meta: FileMeta }> = [];
+      for (const page of pageChunk) {
+        if (sentMetas.has(page.path)) continue;
+        if (lastChunkForPath.get(page.path) === c) {
+          const meta = metaByPath.get(page.path);
+          if (meta) {
+            metaChunk.push(meta);
+            sentMetas.add(page.path);
+          }
+        }
+      }
+
+      this.syncAllSingleChunk(pageChunk, metaChunk);
+    }
+
+    // Send metadata for files without dirty pages (directories, symlinks,
+    // files with only timestamp or size changes)
+    const remainingMetas = metas.filter((m) => !sentMetas.has(m.path));
+    for (let i = 0; i < remainingMetas.length; i += this.maxBatchMetas) {
+      this.syncAllSingleChunk(
+        [],
+        remainingMetas.slice(i, i + this.maxBatchMetas),
+      );
+    }
+  }
+
+  /**
+   * Send a single chunk via SYNC_ALL. Falls back to separate writePages +
+   * writeMetas if the chunk still overflows (e.g., very long paths inflate
+   * JSON beyond the size estimate).
+   */
+  private syncAllSingleChunk(
+    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+    metas: Array<{ path: string; meta: FileMeta }>,
+  ): void {
+    if (pages.length === 0 && metas.length === 0) return;
+
+    try {
+      const pageMeta = pages.map((p) => ({
+        path: p.path,
+        pageIndex: p.pageIndex,
+        dataLen: p.data.length,
+      }));
+      const chunks = pages.map((p) => p.data);
+      this.call(OpCode.SYNC_ALL, { pages: pageMeta, metas }, chunks);
+    } catch (e) {
+      if (!(e instanceof Error && e.message.includes("SAB buffer overflow"))) {
+        throw e;
+      }
+      if (pages.length > 0) this.writePages(pages);
+      if (metas.length > 0) this.writeMetas(metas);
     }
   }
 
