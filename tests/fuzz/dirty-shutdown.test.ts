@@ -174,7 +174,9 @@ type Op =
   | { type: "symlink"; target: string; path: string }
   | { type: "unlinkSymlink"; path: string }
   | { type: "appendWrite"; path: string; data: Uint8Array }
-  | { type: "allocate"; path: string; offset: number; length: number };
+  | { type: "allocate"; path: string; offset: number; length: number }
+  | { type: "chmod"; path: string; mode: number }
+  | { type: "mmapWrite"; path: string; offset: number; data: Uint8Array };
 
 const DIR_NAMES = ["alpha", "beta", "gamma"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"];
@@ -200,6 +202,8 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["unlinkSymlink", allSymlinks.length > 0 ? 4 : 0],
     ["appendWrite", allFiles.length > 0 ? 10 : 0],
     ["allocate", allFiles.length > 0 ? 8 : 0],
+    ["chmod", allFiles.length > 0 ? 6 : 0],
+    ["mmapWrite", allFiles.length > 0 ? 6 : 0],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -305,6 +309,22 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "allocate", path, offset, length };
     }
 
+    case "chmod": {
+      const path = rng.pick(allFiles);
+      const mode = rng.pick([0o644, 0o755, 0o600, 0o444, 0o666]);
+      return { type: "chmod", path, mode };
+    }
+
+    case "mmapWrite": {
+      const path = rng.pick(allFiles);
+      const currentSize = model.files.get(path)?.data.length ?? 0;
+      const maxLen = Math.min(currentSize > 0 ? currentSize : PAGE_SIZE, PAGE_SIZE * 2);
+      const length = rng.pick([1, 100, Math.min(maxLen, PAGE_SIZE)]);
+      const offset = currentSize > length ? rng.int(currentSize - length + 1) : 0;
+      const data = rng.bytes(length);
+      return { type: "mmapWrite", path, offset, data };
+    }
+
     default:
       return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(10) };
   }
@@ -371,6 +391,18 @@ function execOp(FS: EmscriptenFS, op: Op): boolean {
       case "allocate": {
         const s = FS.open(rw(op.path), O.RDWR);
         s.stream_ops.allocate(s, op.offset, op.length);
+        FS.close(s);
+        return true;
+      }
+      case "chmod":
+        FS.chmod(rw(op.path), op.mode);
+        return true;
+      case "mmapWrite": {
+        const s = FS.open(rw(op.path), O.RDWR);
+        const mmapResult = s.stream_ops.mmap(s, op.data.length, op.offset, 0, 0);
+        const buf = mmapResult.ptr;
+        buf.set(op.data);
+        s.stream_ops.msync(s, buf, op.offset, op.data.length, 0);
         FS.close(s);
         return true;
       }
@@ -490,6 +522,24 @@ function updateModel(model: FSModel, op: Op): void {
       }
       break;
     }
+    case "chmod": {
+      const file = model.files.get(op.path);
+      if (!file) break;
+      file.mode = 0o100000 | op.mode;
+      break;
+    }
+    case "mmapWrite": {
+      const file = model.files.get(op.path);
+      if (!file) break;
+      const newSize = Math.max(file.data.length, op.offset + op.data.length);
+      if (newSize > file.data.length) {
+        const newData = new Uint8Array(newSize);
+        newData.set(file.data);
+        file.data = newData;
+      }
+      file.data.set(op.data, op.offset);
+      break;
+    }
   }
 }
 
@@ -521,6 +571,10 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
     case "allocate":
       return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
+    case "chmod":
+      return `[${index}] chmod(${op.path}, ${op.mode.toString(8)})`;
+    case "mmapWrite":
+      return `[${index}] mmapWrite(${op.path}, @${op.offset}, ${op.data.length}B)`;
   }
 }
 
