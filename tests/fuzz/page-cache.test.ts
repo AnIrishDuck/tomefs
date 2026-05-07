@@ -294,6 +294,8 @@ async function runFuzzSession(
     const op = pickOp(rng);
 
     try {
+      cache.assertInvariants();
+
       switch (op) {
         case "write": {
           const path = rng.pick(FILE_POOL);
@@ -490,6 +492,7 @@ async function runFuzzSession(
           break;
         }
       }
+      cache.assertInvariants();
     } catch (e) {
       throw new Error(
         `Seed ${seed}, step ${step}, op ${op} failed: ${(e as Error).message}`,
@@ -497,6 +500,7 @@ async function runFuzzSession(
     }
   }
 
+  cache.assertInvariants();
   await cache.flushAll();
   for (const path of activeFiles) {
     await verifyBackendFile(backend, model, path);
@@ -648,6 +652,9 @@ async function runParitySession(
     const op = pickParityOp(rng);
 
     try {
+      asyncCache.assertInvariants();
+      syncCache.assertInvariants();
+
       switch (op) {
         case "write": {
           const path = rng.pick(FILE_POOL);
@@ -787,12 +794,18 @@ async function runParitySession(
           break;
         }
       }
+      asyncCache.assertInvariants();
+      syncCache.assertInvariants();
     } catch (e) {
       throw new Error(
         `Parity seed ${seed}, step ${step}, op ${op} failed: ${(e as Error).message}`,
       );
     }
   }
+
+  // Final invariant check before flush
+  asyncCache.assertInvariants();
+  syncCache.assertInvariants();
 
   // Flush both caches and compare backend state
   await asyncCache.flushAll();
