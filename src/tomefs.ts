@@ -253,9 +253,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     );
 
     // Populate per-node page table from pages now in cache, so subsequent
-    // reads at the same positions use the fast path above.
+    // reads at the same positions use the fast path above. Check for stale
+    // (evicted) entries too — the multi-page warm path doesn't clear them
+    // (unlike the single-page fast path), so without this they'd persist
+    // and force every subsequent multi-page read through the cold path.
     for (let p = firstPage; p <= lastPage; p++) {
-      if (!node._pages[p]) {
+      const existing = node._pages[p];
+      if (!existing || existing.evicted) {
         node._pages[p] = pageCache.getPage(node.storagePath, p);
       }
     }
@@ -364,9 +368,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     );
 
     // Populate per-node page table from pages now in cache, so subsequent
-    // writes at the same positions use the fast path above.
+    // writes at the same positions use the fast path above. Check for stale
+    // (evicted) entries too — the multi-page warm path doesn't clear them
+    // (unlike the single-page fast path), so without this they'd persist
+    // and force every subsequent multi-page write through the cold path.
     for (let p = firstPage; p <= lastPage; p++) {
-      if (!node._pages[p]) {
+      const existing = node._pages[p];
+      if (!existing || existing.evicted) {
         node._pages[p] = pageCache.getPage(node.storagePath, p);
       }
     }
