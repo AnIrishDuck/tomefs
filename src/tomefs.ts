@@ -399,6 +399,18 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       pageCache.zeroTailAfterTruncate(path, newSize);
       pageCache.invalidatePagesFrom(path, neededPages);
       backend.deletePagesFrom(path, neededPages);
+      // For page-aligned truncation, zeroTailAfterTruncate is a no-op
+      // (tailOffset = 0) and doesn't load the last page. If that page
+      // is sparse (never materialized in cache or backend — e.g., from
+      // a prior extend), restoreTree would see maxPageIndex < lastExpected
+      // and incorrectly shrink the file. Materialize a sentinel so the
+      // page exists in the backend after syncfs.
+      if (neededPages > 0 && newSize % PAGE_SIZE === 0) {
+        const lastIdx = neededPages - 1;
+        if (!pageCache.has(path, lastIdx)) {
+          pageCache.markPageDirty(path, lastIdx);
+        }
+      }
     } else {
       // Growing: materialize only the LAST new page so it's flushed during
       // syncfs. restoreTree uses maxPageIndex to determine file extent — if
