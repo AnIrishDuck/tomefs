@@ -1,5 +1,5 @@
 import type { StorageBackend } from "./storage-backend.js";
-import { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
+import { PAGE_SIZE, PAGE_SHIFT, PAGE_MASK, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
 import type { CachedPage, CacheStats } from "./types.js";
 
 /**
@@ -171,8 +171,8 @@ export class PageCache {
     const toRead = Math.min(length, available);
     if (toRead === 0) return 0;
 
-    const firstPage = Math.floor(position / PAGE_SIZE);
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
 
     // Fast path: entire read fits within a single page (common case for
     // page-aligned I/O). Skips multi-page setup, loop, and per-iteration
@@ -187,7 +187,7 @@ export class PageCache {
     }
 
     // Multi-page path
-    const lastPage = Math.floor((position + toRead - 1) / PAGE_SIZE);
+    const lastPage = (position + toRead - 1) >>> PAGE_SHIFT;
 
     // Find cache misses — only batch when there are multiple misses
     let batchLoadedRead = 0;
@@ -231,8 +231,8 @@ export class PageCache {
     let pos = position;
 
     while (bytesRead < toRead) {
-      const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
+      const pageIndex = pos >>> PAGE_SHIFT;
+      const pageOffset = pos & PAGE_MASK;
       const bytesInPage = Math.min(PAGE_SIZE - pageOffset, toRead - bytesRead);
 
       const page = await this.getPage(path, pageIndex);
@@ -275,14 +275,14 @@ export class PageCache {
   ): Promise<{ bytesWritten: number; newFileSize: number }> {
     if (length === 0) return { bytesWritten: 0, newFileSize: currentFileSize };
 
-    const firstPage = Math.floor(position / PAGE_SIZE);
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
 
     // Pages at or beyond this index don't exist in the backend, so we can
     // skip the readPage call and create zero-filled pages directly. This
     // avoids wasted round-trips when extending files.
     const firstNewPage =
-      currentFileSize > 0 ? Math.ceil(currentFileSize / PAGE_SIZE) : 0;
+      currentFileSize > 0 ? ((currentFileSize + PAGE_MASK) >>> PAGE_SHIFT) : 0;
 
     // Fast path: entire write fits within a single page
     if (pageOffset + length <= PAGE_SIZE) {
@@ -305,7 +305,7 @@ export class PageCache {
     }
 
     // Multi-page path
-    const lastPage = Math.floor((position + length - 1) / PAGE_SIZE);
+    const lastPage = (position + length - 1) >>> PAGE_SHIFT;
 
     // For multi-page writes, batch eviction and pre-loading of cache misses.
     // Separate cache misses into pages that need backend reads vs pages
@@ -321,8 +321,8 @@ export class PageCache {
             // Skip preloading pages that will be completely overwritten —
             // every byte will be replaced, so the backend read is wasted.
             const fullyOverwritten =
-              position <= p * PAGE_SIZE &&
-              writeEnd >= (p + 1) * PAGE_SIZE;
+              position <= (p << PAGE_SHIFT) &&
+              writeEnd >= ((p + 1) << PAGE_SHIFT);
             if (!fullyOverwritten) {
               existingMissing.push(p);
             }
@@ -370,8 +370,8 @@ export class PageCache {
     let pos = position;
 
     while (bytesWritten < length) {
-      const pageIndex = Math.floor(pos / PAGE_SIZE);
-      const pageOffset = pos % PAGE_SIZE;
+      const pageIndex = pos >>> PAGE_SHIFT;
+      const pageOffset = pos & PAGE_MASK;
       const bytesInPage = Math.min(
         PAGE_SIZE - pageOffset,
         length - bytesWritten,
@@ -604,8 +604,8 @@ export class PageCache {
    * later extended without writing to the truncated region.
    */
   async zeroTailAfterTruncate(path: string, newSize: number): Promise<void> {
-    const lastPageIndex = Math.floor(newSize / PAGE_SIZE);
-    const tailOffset = newSize % PAGE_SIZE;
+    const lastPageIndex = newSize >>> PAGE_SHIFT;
+    const tailOffset = newSize & PAGE_MASK;
     if (tailOffset === 0) return;
 
     // Load the page through the cache (from backend if not cached).
