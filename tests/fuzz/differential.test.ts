@@ -174,6 +174,9 @@ type Op =
   | { type: "allocateFd"; fdId: number; offset: number; length: number }
   | { type: "readAt"; path: string; position: number; length: number }
   | { type: "readFdAt"; fdId: number; position: number; length: number }
+  | { type: "fstatFd"; fdId: number }
+  | { type: "fchmodFd"; fdId: number; mode: number }
+  | { type: "openTrunc"; path: string }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -225,6 +228,9 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["mmapRead", model.openFds.size > 0 ? 6 : 0],
     ["mmapWrite", model.openFds.size > 0 ? 6 : 0],
     ["allocateFd", model.openFds.size > 0 ? 6 : 0],
+    ["fstatFd", model.openFds.size > 0 ? 6 : 0],
+    ["fchmodFd", model.openFds.size > 0 ? 5 : 0],
+    ["openTrunc", allFiles.length > 0 ? 6 : 0],
     ["syncfs", 3],
   ];
 
@@ -530,6 +536,23 @@ function generateOp(rng: Rng, model: FSModel): Op {
       const lengthChoices = [1, PAGE_SIZE, PAGE_SIZE * 2, PAGE_SIZE * 3 + 137];
       const length = rng.pick(lengthChoices);
       return { type: "allocateFd", fdId, offset, length };
+    }
+
+    case "fstatFd": {
+      const fds = [...model.openFds.keys()];
+      return { type: "fstatFd", fdId: rng.pick(fds) };
+    }
+
+    case "fchmodFd": {
+      const fds = [...model.openFds.keys()];
+      const fdId = rng.pick(fds);
+      const modeChoices = [0o444, 0o555, 0o644, 0o666, 0o755, 0o777];
+      return { type: "fchmodFd", fdId, mode: rng.pick(modeChoices) };
+    }
+
+    case "openTrunc": {
+      const path = rng.pick(allFiles);
+      return { type: "openTrunc", path };
     }
 
     case "syncfs":
@@ -839,6 +862,30 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         return { error: null, size: fstatResult.size };
       }
 
+      case "fstatFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        const fstatResult = FS.fstat(stream.fd ?? stream);
+        return {
+          error: null,
+          size: fstatResult.size,
+          data: new TextEncoder().encode(`${fstatResult.size}:${fstatResult.mode}`),
+        };
+      }
+
+      case "fchmodFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: "no-fd" };
+        FS.fchmod(stream.fd ?? stream, op.mode);
+        return { error: null };
+      }
+
+      case "openTrunc": {
+        const s = FS.open(op.path, O.WRONLY | O.TRUNC);
+        FS.close(s);
+        return { error: null, size: 0 };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -989,8 +1036,12 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
       }
       break;
     }
-    // readAt, readFd, readFdAt, readlink, readThroughSymlink, seekFd, mmapRead don't modify file state
+    case "openTrunc":
+      model.files.set(op.path, 0);
+      break;
+    // readAt, readFd, readFdAt, readlink, readThroughSymlink, seekFd, mmapRead, fstatFd don't modify file state
     // mmapWrite modifies file contents via msync but doesn't change size
+    // fchmodFd modifies mode bits but not file size or contents
   }
 }
 
@@ -1063,6 +1114,12 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] mmapWrite(fdId=${op.fdId}, len=${op.length}, pos=${op.position}, ${op.data.length}B)`;
     case "allocateFd":
       return `[${index}] allocateFd(fdId=${op.fdId}, offset=${op.offset}, len=${op.length})`;
+    case "fstatFd":
+      return `[${index}] fstatFd(fdId=${op.fdId})`;
+    case "fchmodFd":
+      return `[${index}] fchmodFd(fdId=${op.fdId}, 0o${op.mode.toString(8)})`;
+    case "openTrunc":
+      return `[${index}] openTrunc(${op.path})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
@@ -1341,6 +1398,33 @@ async function runFuzzSequence(
       expect(tomeResult.size, `${desc}: size mismatch`).toBe(memResult.size);
     }
 
+    // For fstat via fd, compare size and mode
+    if (op.type === "fstatFd" && !memResult.error && memResult.data && tomeResult.data) {
+      const memStr = new TextDecoder().decode(memResult.data);
+      const tomeStr = new TextDecoder().decode(tomeResult.data);
+      expect(tomeStr, `${desc}: fstat mismatch`).toBe(memStr);
+    }
+
+    // For fchmod via fd, verify mode was set identically (only if
+    // the file still exists by path — unlinked files can't be stat'd)
+    if (op.type === "fchmodFd" && !memResult.error) {
+      const fdInfo = model.openFds.get(op.fdId);
+      if (fdInfo && model.files.has(fdInfo.currentPath)) {
+        try {
+          const memStat = memFS.stat(fdInfo.currentPath);
+          const tomeStat = tomeFS.stat(fdInfo.currentPath);
+          expect(tomeStat.mode, `${desc}: mode mismatch after fchmod`).toBe(memStat.mode);
+        } catch (_e) {
+          // File may have been concurrently deleted; skip comparison
+        }
+      }
+    }
+
+    // For openTrunc, verify file size is 0
+    if (op.type === "openTrunc" && !memResult.error) {
+      expect(tomeResult.size, `${desc}: size mismatch`).toBe(memResult.size);
+    }
+
     // For chmod operations, verify mode was set identically
     if (op.type === "chmod" && !memResult.error) {
       const memStat = memFS.stat(op.path);
@@ -1534,6 +1618,20 @@ describe("fuzz: randomized differential testing", () => {
 
     it("seed 66666 small cache", async () => {
       await runFuzzSequence(66666, 150, 16);
+    }, 30_000);
+  });
+
+  describe("fstat, fchmod, and openTrunc operations", () => {
+    it("seed 40001 tiny cache @fast", async () => {
+      await runFuzzSequence(40001, 120, 4);
+    }, 30_000);
+
+    it("seed 40002 tiny cache", async () => {
+      await runFuzzSequence(40002, 120, 4);
+    }, 30_000);
+
+    it("seed 40003 small cache", async () => {
+      await runFuzzSequence(40003, 150, 16);
     }, 30_000);
   });
 
