@@ -1143,21 +1143,23 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const paths = backend.listFiles();
     if (paths.length === 0) return;
 
-    // Sort paths by depth so parents are created before children
-    paths.sort((a, b) => {
-      const da = a.split("/").length;
-      const db = b.split("/").length;
-      return da - db || a.localeCompare(b);
-    });
+    // Single pass: classify all paths into live vs internal markers.
+    // Replaces 3 sequential O(n) scans (includes, some, filter) with one.
+    let hasCleanMarker = false;
+    let hasOrphans = false;
+    const livePaths: string[] = [];
+    for (const p of paths) {
+      if (p === CLEAN_MARKER_PATH) {
+        hasCleanMarker = true;
+      } else if (p.startsWith("/__deleted_")) {
+        hasOrphans = true;
+      } else {
+        livePaths.push(p);
+      }
+    }
 
-    // Check for clean-shutdown marker. If present AND no /__deleted_* orphans
+    // If clean-shutdown marker is present AND no /__deleted_* orphans
     // exist, the backend is consistent — no orphan cleanup needed on first syncfs.
-    // /__deleted_* entries are created by rename/unlink during normal operation
-    // and cleaned up by orphan cleanup. If they survive to mount time, a crash
-    // occurred between the operation and the next syncfs — the backend is dirty
-    // regardless of the marker.
-    const hasCleanMarker = paths.includes(CLEAN_MARKER_PATH);
-    const hasOrphans = paths.some((p) => p.startsWith("/__deleted_"));
     if (hasCleanMarker && !hasOrphans) {
       needsOrphanCleanup = false;
     }
@@ -1166,12 +1168,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       backend.deleteMeta(CLEAN_MARKER_PATH);
     }
 
-    // Filter out internal marker entries — /__deleted_* are orphaned pages
-    // from files that had open fds when the process crashed, and
-    // /__tomefs_clean is the shutdown marker we just consumed.
-    const livePaths = paths.filter(
-      (p) => !p.startsWith("/__deleted_") && p !== CLEAN_MARKER_PATH,
-    );
+    // Alphabetical sort guarantees parents before children: a parent path
+    // is always a strict prefix of its children's paths, and strict prefixes
+    // always sort earlier in lexicographic order. This replaces the previous
+    // depth-based sort which called split("/") on every comparison.
+    livePaths.sort();
 
     // Batch-read all metadata in a single backend call to reduce SAB bridge
     // round-trips from O(n) to O(1) during mount/restore.
@@ -1190,8 +1191,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     const fileEntries: FileEntry[] = [];
 
     // Build a path-to-node map during restoration so parent lookups are O(1)
-    // instead of O(depth). Since paths are sorted by depth, parents are always
-    // created before children.
+    // instead of O(depth). Since paths are sorted alphabetically, parents are
+    // always created before children.
     const nodeByPath = new Map<string, any>();
     nodeByPath.set("/", root);
 
@@ -1219,8 +1220,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         // Metadata already in backend — no need to re-write on next sync.
         node._metaDirty = false;
         // Parent was marked dirty by createNode's timestamp update, but
-        // restoreTree processes parents before children (depth-sorted), so
-        // parent._metaDirty will be cleared when its own entry is processed.
+        // restoreTree processes parents before children (alphabetically
+        // sorted), so parent._metaDirty will be cleared when its own entry
+        // is processed.
         // Register directory in map so children can find it in O(1)
         nodeByPath.set(path, node);
       } else if (typeMode === S_IFREG) {
