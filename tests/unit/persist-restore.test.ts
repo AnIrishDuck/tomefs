@@ -690,3 +690,120 @@ describe("persist/restore: edge cases", () => {
     }
   });
 });
+
+describe("persist/restore: alphabetical sort edge cases", () => {
+  let backend: SyncMemoryBackend;
+
+  beforeEach(() => {
+    backend = new SyncMemoryBackend();
+  });
+
+  it("restores siblings and children with similar prefixes @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // Create paths where alphabetical and depth-based ordering differ:
+    // "/a-file" (depth 1) sorts between "/a" (depth 1) and "/a/child" (depth 2)
+    // in alphabetical order, but depth sort would group "/a" and "/a-file" first.
+    FS.mkdir(`${MOUNT}/a`);
+    const s1 = FS.open(`${MOUNT}/a-file`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s1, encode("sibling"), 0, 7);
+    FS.close(s1);
+    const s2 = FS.open(`${MOUNT}/a/child`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s2, encode("nested"), 0, 6);
+    FS.close(s2);
+
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+
+    const buf = new Uint8Array(10);
+    const r1 = FS2.open(`${MOUNT}/a-file`, O.RDONLY);
+    const n1 = FS2.read(r1, buf, 0, 10);
+    FS2.close(r1);
+    expect(decode(buf, n1)).toBe("sibling");
+
+    const r2 = FS2.open(`${MOUNT}/a/child`, O.RDONLY);
+    const n2 = FS2.read(r2, buf, 0, 10);
+    FS2.close(r2);
+    expect(decode(buf, n2)).toBe("nested");
+  });
+
+  it("restores deeply nested paths correctly @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // 5-level nesting to verify deep tree reconstruction
+    FS.mkdir(`${MOUNT}/d1`);
+    FS.mkdir(`${MOUNT}/d1/d2`);
+    FS.mkdir(`${MOUNT}/d1/d2/d3`);
+    FS.mkdir(`${MOUNT}/d1/d2/d3/d4`);
+    const s = FS.open(
+      `${MOUNT}/d1/d2/d3/d4/deep`,
+      O.RDWR | O.CREAT,
+      0o666,
+    );
+    FS.write(s, encode("deep-data"), 0, 9);
+    FS.close(s);
+
+    // Also create a shallow sibling that sorts after the deep path
+    const s2 = FS.open(`${MOUNT}/z-shallow`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s2, encode("shallow"), 0, 7);
+    FS.close(s2);
+
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+
+    const buf = new Uint8Array(20);
+    const r1 = FS2.open(`${MOUNT}/d1/d2/d3/d4/deep`, O.RDONLY);
+    const n1 = FS2.read(r1, buf, 0, 20);
+    FS2.close(r1);
+    expect(decode(buf, n1)).toBe("deep-data");
+
+    const r2 = FS2.open(`${MOUNT}/z-shallow`, O.RDONLY);
+    const n2 = FS2.read(r2, buf, 0, 20);
+    FS2.close(r2);
+    expect(decode(buf, n2)).toBe("shallow");
+  });
+
+  it("restores files alongside same-prefix directories @fast", async () => {
+    const { FS, tomefs } = await mountTome(backend);
+
+    // "base" as both a directory and a prefix for sibling files
+    FS.mkdir(`${MOUNT}/base`);
+    FS.mkdir(`${MOUNT}/base/sub`);
+    const s1 = FS.open(`${MOUNT}/base/sub/inner`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s1, encode("inner"), 0, 5);
+    FS.close(s1);
+
+    // "base123" is a file that sorts after "base/" entries alphabetically
+    // (because '1' > '/' in char codes)
+    const s2 = FS.open(`${MOUNT}/base123`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s2, encode("sibling-file"), 0, 12);
+    FS.close(s2);
+
+    // "bas" is a file that sorts before "base"
+    const s3 = FS.open(`${MOUNT}/bas`, O.RDWR | O.CREAT, 0o666);
+    FS.write(s3, encode("prefix"), 0, 6);
+    FS.close(s3);
+
+    syncAndUnmount(FS, tomefs);
+
+    const { FS: FS2 } = await mountTome(backend);
+
+    const buf = new Uint8Array(20);
+    const r1 = FS2.open(`${MOUNT}/base/sub/inner`, O.RDONLY);
+    expect(FS2.read(r1, buf, 0, 20)).toBe(5);
+    FS2.close(r1);
+    expect(decode(buf, 5)).toBe("inner");
+
+    const r2 = FS2.open(`${MOUNT}/base123`, O.RDONLY);
+    expect(FS2.read(r2, buf, 0, 20)).toBe(12);
+    FS2.close(r2);
+    expect(decode(buf, 12)).toBe("sibling-file");
+
+    const r3 = FS2.open(`${MOUNT}/bas`, O.RDONLY);
+    expect(FS2.read(r3, buf, 0, 20)).toBe(6);
+    FS2.close(r3);
+    expect(decode(buf, 6)).toBe("prefix");
+  });
+});
