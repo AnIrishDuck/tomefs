@@ -177,10 +177,13 @@ describe("syncfs safety", () => {
     syncfs(FS2, t2);
     backend.stopRecording();
 
-    // All writeMeta calls should come before any deleteMeta for stale paths
+    // All data writeMeta calls should come before any deleteMeta for stale paths.
+    // Exclude the clean-shutdown marker — it's intentionally written AFTER
+    // orphan cleanup for crash safety (prevents marker + orphans coexisting).
     const ops = backend.operations;
     const lastWriteIndex = ops.reduce(
-      (max, op, i) => (op.op === "writeMeta" ? i : max),
+      (max, op, i) =>
+        op.op === "writeMeta" && op.path !== "/__tomefs_clean" ? i : max,
       -1,
     );
     const firstStaleDeleteIndex = ops.findIndex(

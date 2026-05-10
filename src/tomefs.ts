@@ -1513,14 +1513,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
             // Write dirty pages + metadata atomically via syncAll.
             // For IDB, this is a single multi-store transaction.
-            // Include clean-shutdown marker in the same batch.
-            metaBatch.push({
-              path: CLEAN_MARKER_PATH,
-              meta: { size: 0, mode: 0, ctime: Date.now(), mtime: Date.now() },
-            });
+            // Do NOT include the clean-shutdown marker here — it must be
+            // written AFTER orphan cleanup completes. If the process crashes
+            // between syncAll and deleteAll, the marker's absence ensures
+            // the next mount forces orphan cleanup instead of trusting a
+            // stale "clean" state with orphans still present.
             backend.syncAll(dirtyPages, metaBatch);
             pageCache.commitDirtyPages(dirtyPages);
-            needsCleanMarker = false;
 
             // Clear dirty flags on all nodes whose metadata was persisted.
             // Uses the dirty set instead of walking the full tree — O(dirty)
@@ -1531,8 +1530,6 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             dirtyMetaNodes.clear();
 
             // Delete metadata and orphaned page data for paths no longer in the tree.
-            // Exclude the clean-shutdown marker — it's internal bookkeeping, not
-            // an orphan. It will be re-written after this cleanup completes.
             const orphanPaths: string[] = [];
             for (const path of backend.listFiles()) {
               if (!currentPaths.has(path) && path !== CLEAN_MARKER_PATH) {
@@ -1542,6 +1539,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             if (orphanPaths.length > 0) {
               backend.deleteAll(orphanPaths);
             }
+
+            // Write the clean-shutdown marker AFTER orphan cleanup. This
+            // ordering guarantees crash safety: if the process dies before
+            // this point, the next mount won't find a marker and will force
+            // a full orphan cleanup pass — never leaving phantom files.
+            backend.writeMeta(CLEAN_MARKER_PATH, {
+              size: 0, mode: 0, ctime: Date.now(), mtime: Date.now(),
+            });
+            needsCleanMarker = false;
             needsOrphanCleanup = false;
           }
         }
