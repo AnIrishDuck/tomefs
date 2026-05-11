@@ -184,8 +184,10 @@ export class PreloadBackend implements SyncStorageBackend {
 
   readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
     this.assertInitialized();
+    if (pageIndices.length === 0) return [];
+    const prefix = path + "\0";
     return pageIndices.map((i) => {
-      const data = this.pages.get(pageKeyStr(path, i));
+      const data = this.pages.get(prefix + i);
       return data ? new Uint8Array(data) : null;
     });
   }

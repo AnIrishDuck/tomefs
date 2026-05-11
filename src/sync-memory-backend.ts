@@ -44,7 +44,12 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   }
 
   readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
-    return pageIndices.map((i) => this.readPage(path, i));
+    if (pageIndices.length === 0) return [];
+    const prefix = path + "\0";
+    return pageIndices.map((i) => {
+      const data = this.pages.get(prefix + i);
+      return data ? new Uint8Array(data) : null;
+    });
   }
 
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
