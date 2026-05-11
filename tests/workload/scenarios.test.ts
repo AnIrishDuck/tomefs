@@ -824,3 +824,150 @@ describeScenario("Scenario 13: VACUUM + concurrent reads", (h) => {
   }
   FS.close(readerFd);
 });
+
+// ---------------------------------------------------------------------------
+// Scenario 14: WAL + Checkpoint Interleave
+//
+// Simulates the core PGlite production pattern: the WAL writer appends
+// records sequentially while a checkpoint reads heap pages randomly.
+// After checkpoint completes, the WAL segment is recycled (truncated
+// to zero and rewritten from the beginning). Under small caches, WAL
+// pages and heap pages compete for cache slots, exercising eviction
+// of both clean (heap reads) and dirty (WAL writes) pages.
+//
+// Phase 1: Populate heap files + initial WAL writes
+// Phase 2: Checkpoint — read heap pages while WAL appending continues
+// Phase 3: WAL recycle — truncate WAL, rewrite from start
+// Phase 4: Second checkpoint cycle over recycled WAL
+// ---------------------------------------------------------------------------
+
+describeScenario("Scenario 14: WAL + Checkpoint Interleave @fast", (h) => {
+  const { FS } = h;
+  const HEAP_FILES = 4;
+  const HEAP_PAGES = 8; // 64 KB per heap file
+  const WAL_RECORD_SIZE = 256; // typical WAL record
+
+  // --- Phase 1: Populate heap files ---
+
+  for (let f = 0; f < HEAP_FILES; f++) {
+    writeFileData(FS, `/heap${f}`, HEAP_PAGES * PAGE_SIZE);
+  }
+
+  // Write initial WAL records (fills ~2 pages)
+  const walFd = FS.open("/wal", O.WRONLY | O.CREAT | O.TRUNC, 0o666);
+  const walRecords: Uint8Array[] = [];
+  for (let i = 0; i < 64; i++) {
+    const rec = new Uint8Array(WAL_RECORD_SIZE);
+    for (let j = 0; j < WAL_RECORD_SIZE; j++) {
+      rec[j] = ((i * 37 + j * 13 + 5) & 0xff);
+    }
+    walRecords.push(rec);
+    FS.write(walFd, rec, 0, WAL_RECORD_SIZE);
+  }
+
+  // --- Phase 2: Checkpoint — interleave heap reads with WAL writes ---
+
+  const buf = new Uint8Array(PAGE_SIZE);
+  const checkpointOrder: Array<{ file: number; page: number }> = [];
+  for (let f = 0; f < HEAP_FILES; f++) {
+    for (let p = 0; p < HEAP_PAGES; p++) {
+      checkpointOrder.push({ file: f, page: p });
+    }
+  }
+  // Scramble using a deterministic pattern (not truly random, but exercises
+  // non-sequential access which is what checkpoint does)
+  for (let i = checkpointOrder.length - 1; i > 0; i--) {
+    const j = (i * 41 + 7) % (i + 1);
+    [checkpointOrder[i], checkpointOrder[j]] = [checkpointOrder[j], checkpointOrder[i]];
+  }
+
+  let walRecIdx = walRecords.length;
+  for (const { file, page } of checkpointOrder) {
+    // Read a heap page (checkpoint)
+    const heapFd = FS.open(`/heap${file}`, O.RDONLY);
+    FS.llseek(heapFd, page * PAGE_SIZE, SEEK_SET);
+    const n = FS.read(heapFd, buf, 0, PAGE_SIZE);
+    expect(n).toBe(PAGE_SIZE);
+    const expected = generatePageData(page);
+    for (let j = 0; j < PAGE_SIZE; j++) {
+      if (buf[j] !== expected[j]) {
+        FS.close(heapFd);
+        FS.close(walFd);
+        throw new Error(
+          `Checkpoint heap read mismatch: heap${file} page ${page} offset ${j}: ` +
+          `expected ${expected[j]}, got ${buf[j]}`,
+        );
+      }
+    }
+    FS.close(heapFd);
+
+    // Append a WAL record (concurrent WAL writer)
+    const rec = new Uint8Array(WAL_RECORD_SIZE);
+    for (let j = 0; j < WAL_RECORD_SIZE; j++) {
+      rec[j] = ((walRecIdx * 37 + j * 13 + 5) & 0xff);
+    }
+    walRecords.push(rec);
+    FS.write(walFd, rec, 0, WAL_RECORD_SIZE);
+    walRecIdx++;
+  }
+  FS.close(walFd);
+
+  // Verify all WAL records
+  const walReadFd = FS.open("/wal", O.RDONLY);
+  const walBuf = new Uint8Array(WAL_RECORD_SIZE);
+  for (let i = 0; i < walRecords.length; i++) {
+    const n = FS.read(walReadFd, walBuf, 0, WAL_RECORD_SIZE);
+    expect(n).toBe(WAL_RECORD_SIZE);
+    for (let j = 0; j < WAL_RECORD_SIZE; j++) {
+      if (walBuf[j] !== walRecords[i][j]) {
+        FS.close(walReadFd);
+        throw new Error(
+          `WAL record ${i} mismatch at offset ${j}: ` +
+          `expected ${walRecords[i][j]}, got ${walBuf[j]}`,
+        );
+      }
+    }
+  }
+  FS.close(walReadFd);
+
+  // --- Phase 3: WAL recycle — truncate and rewrite from start ---
+
+  FS.truncate("/wal", 0);
+  expect(FS.stat("/wal").size).toBe(0);
+
+  const walFd2 = FS.open("/wal", O.WRONLY | O.CREAT, 0o666);
+  const recycledRecords: Uint8Array[] = [];
+  for (let i = 0; i < 48; i++) {
+    const rec = new Uint8Array(WAL_RECORD_SIZE);
+    for (let j = 0; j < WAL_RECORD_SIZE; j++) {
+      rec[j] = ((i * 53 + j * 19 + 11) & 0xff);
+    }
+    recycledRecords.push(rec);
+    FS.write(walFd2, rec, 0, WAL_RECORD_SIZE);
+  }
+  FS.close(walFd2);
+
+  // Verify recycled WAL has correct data (no stale data from pre-truncation)
+  const walRead2 = FS.open("/wal", O.RDONLY);
+  for (let i = 0; i < recycledRecords.length; i++) {
+    const n = FS.read(walRead2, walBuf, 0, WAL_RECORD_SIZE);
+    expect(n).toBe(WAL_RECORD_SIZE);
+    for (let j = 0; j < WAL_RECORD_SIZE; j++) {
+      if (walBuf[j] !== recycledRecords[i][j]) {
+        FS.close(walRead2);
+        throw new Error(
+          `Recycled WAL record ${i} mismatch at offset ${j}: ` +
+          `expected ${recycledRecords[i][j]}, got ${walBuf[j]}`,
+        );
+      }
+    }
+  }
+  FS.close(walRead2);
+
+  // --- Phase 4: Second checkpoint cycle over recycled WAL ---
+  // Re-read all heap pages to verify they survived the WAL recycling
+
+  for (let f = 0; f < HEAP_FILES; f++) {
+    verifyFileData(FS, `/heap${f}`, HEAP_PAGES * PAGE_SIZE);
+  }
+});
