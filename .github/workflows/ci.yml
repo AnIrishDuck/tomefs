@@ -8,15 +8,18 @@ on:
 
 jobs:
   build:
-    name: Build & type-check
+    name: Build & type-check (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - run: npm ci
@@ -28,15 +31,18 @@ jobs:
         run: npx tsc --noEmit
 
   smoke-tests:
-    name: Smoke tests (@fast)
+    name: Smoke tests (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - run: npm ci
@@ -48,15 +54,18 @@ jobs:
         run: TOMEFS_BACKEND=tomefs npm run test:fast
 
   full-tests:
-    name: Full test suite
+    name: Full test suite (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - run: npm ci
