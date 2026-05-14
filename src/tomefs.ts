@@ -1251,7 +1251,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         } else if (highIdx > lastPageIndex) {
           // Pages exist beyond what metadata expects — file was extended
           // after last metadata sync (crash recovery or sparse+extension).
-          fileSize = (highIdx + 1) << PAGE_SHIFT;
+          fileSize = (highIdx + 1) * PAGE_SIZE;
         } else if (highIdx === lastPageIndex) {
           // Highest page matches last expected — common case or sparse file
           // with correct extent. Trust metadata for sub-page precision.
@@ -1259,7 +1259,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         } else {
           // Highest page is below last expected — pages were lost from the
           // end (crash truncation). Adjust size to actual extent.
-          fileSize = (highIdx + 1) << PAGE_SHIFT;
+          fileSize = (highIdx + 1) * PAGE_SIZE;
         }
 
         const node = TOMEFS.createNode(parent, name, meta.mode, 0);
