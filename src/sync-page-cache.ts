@@ -323,8 +323,8 @@ export class SyncPageCache {
           // Skip preloading pages that will be completely overwritten —
           // every byte will be replaced, so the backend read is wasted.
           const fullyOverwritten =
-            position <= (p << PAGE_SHIFT) &&
-            writeEnd >= ((p + 1) << PAGE_SHIFT);
+            position <= p * PAGE_SIZE &&
+            writeEnd >= (p + 1) * PAGE_SIZE;
           if (!fullyOverwritten) {
             existingMissing.push(p);
           }
