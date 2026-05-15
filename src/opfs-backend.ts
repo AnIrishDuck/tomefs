@@ -69,6 +69,10 @@ export class OpfsBackend implements StorageBackend {
   private metaDir: FileSystemDirectoryHandle | null = null;
   private initPromise: Promise<void> | null = null;
 
+  /** Cached max page index per file for O(1) lookups after initial scan.
+   *  Populated lazily by maxPageIndex(); updated by write/delete/rename. */
+  private fileMaxIdx = new Map<string, number>();
+
   constructor(options?: OpfsBackendOptions) {
     this.root = options?.root ?? null;
   }
@@ -174,6 +178,10 @@ export class OpfsBackend implements StorageBackend {
     } finally {
       await writable.close();
     }
+    const cur = this.fileMaxIdx.get(path);
+    if (cur !== undefined && pageIndex > cur) {
+      this.fileMaxIdx.set(path, pageIndex);
+    }
   }
 
   async writePages(
@@ -220,6 +228,13 @@ export class OpfsBackend implements StorageBackend {
         );
       }),
     );
+
+    for (const { path, pageIndex } of pages) {
+      const cur = this.fileMaxIdx.get(path);
+      if (cur !== undefined && pageIndex > cur) {
+        this.fileMaxIdx.set(path, pageIndex);
+      }
+    }
   }
 
   async deleteFile(path: string): Promise<void> {
@@ -230,6 +245,7 @@ export class OpfsBackend implements StorageBackend {
     } catch (err) {
       if (!isNotFoundError(err)) throw err;
     }
+    this.fileMaxIdx.delete(path);
   }
 
   async countPages(path: string): Promise<number> {
@@ -257,6 +273,9 @@ export class OpfsBackend implements StorageBackend {
   }
 
   async maxPageIndex(path: string): Promise<number> {
+    const cached = this.fileMaxIdx.get(path);
+    if (cached !== undefined) return cached;
+
     await this.init();
     const encoded = encodePath(path);
     try {
@@ -268,9 +287,13 @@ export class OpfsBackend implements StorageBackend {
         const idx = parseInt(name, 10);
         if (idx > max) max = idx;
       }
+      this.fileMaxIdx.set(path, max);
       return max;
     } catch (err) {
-      if (isNotFoundError(err)) return -1;
+      if (isNotFoundError(err)) {
+        this.fileMaxIdx.set(path, -1);
+        return -1;
+      }
       throw err;
     }
   }
@@ -302,6 +325,10 @@ export class OpfsBackend implements StorageBackend {
     } catch (err) {
       if (!isNotFoundError(err)) throw err;
     }
+
+    const oldMax = this.fileMaxIdx.get(oldPath);
+    this.fileMaxIdx.delete(oldPath);
+    this.fileMaxIdx.delete(newPath);
 
     // Move page files from old directory to new directory.
     let oldDir: FileSystemDirectoryHandle;
@@ -381,6 +408,10 @@ export class OpfsBackend implements StorageBackend {
 
     // Remove old pages directory.
     await this.pagesDir!.removeEntry(oldEncoded, { recursive: true });
+
+    if (oldMax !== undefined && oldMax >= 0) {
+      this.fileMaxIdx.set(newPath, oldMax);
+    }
   }
 
   async deletePagesFrom(
@@ -391,10 +422,13 @@ export class OpfsBackend implements StorageBackend {
     if (!fileDir) return;
 
     const toRemove: string[] = [];
+    let newMax = -1;
     for await (const name of (fileDir as IterableDirectoryHandle).keys()) {
       const idx = parseInt(name, 10);
       if (idx >= fromPageIndex) {
         toRemove.push(name);
+      } else if (idx > newMax) {
+        newMax = idx;
       }
     }
 
@@ -409,6 +443,8 @@ export class OpfsBackend implements StorageBackend {
         `OPFS deletePagesFrom: ${failures.length}/${toRemove.length} page removals failed: ${failures[0].reason}`,
       );
     }
+
+    this.fileMaxIdx.set(path, newMax);
   }
 
   async readMeta(path: string): Promise<FileMeta | null> {
@@ -580,5 +616,6 @@ export class OpfsBackend implements StorageBackend {
     this.pagesDir = null;
     this.metaDir = null;
     this.initPromise = null;
+    this.fileMaxIdx.clear();
   }
 }
