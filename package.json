@@ -41,5 +41,22 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AnIrishDuck/tomefs.git"
+  },
+  "homepage": "https://github.com/AnIrishDuck/tomefs#readme",
+  "keywords": [
+    "emscripten",
+    "filesystem",
+    "pglite",
+    "page-cache",
+    "indexeddb",
+    "opfs",
+    "wasm"
+  ]
 }
