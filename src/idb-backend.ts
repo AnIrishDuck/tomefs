@@ -416,7 +416,7 @@ export class IdbBackend implements StorageBackend {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(META_STORE, "readwrite");
       const store = tx.objectStore(META_STORE);
-      store.put({ ...meta }, path);
+      store.put(meta, path);
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -435,7 +435,7 @@ export class IdbBackend implements StorageBackend {
       const store = tx.objectStore(META_STORE);
 
       for (const { path, meta } of entries) {
-        store.put({ ...meta }, path);
+        store.put(meta, path);
       }
 
       tx.oncomplete = () => resolve();
@@ -511,7 +511,7 @@ export class IdbBackend implements StorageBackend {
       }
 
       for (const { path, meta } of metas) {
-        metaStore.put({ ...meta }, path);
+        metaStore.put(meta, path);
       }
 
       tx.oncomplete = () => resolve();
