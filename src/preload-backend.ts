@@ -517,9 +517,57 @@ export class PreloadBackend implements SyncStorageBackend {
   async flush(): Promise<void> {
     this.assertInitialized();
 
-    // Partition dirty pages: pages at paths pending deletion must be
-    // written AFTER the delete (to handle delete-then-recreate at the
-    // same path). All other dirty pages are written first for crash safety.
+    // Fast path: no deletes, truncations, or metadata removals pending.
+    // This is the common steady-state case (normal writes without rename
+    // or unlink). Skip the O(dirty) early/late partitioning and write all
+    // dirty pages + metadata in a single syncAll call.
+    if (
+      this.deletedFiles.size === 0 &&
+      this.deletedMeta.size === 0 &&
+      this.truncations.size === 0
+    ) {
+      if (this.dirtyPages.size === 0 && this.dirtyMeta.size === 0) return;
+
+      const flushedPageKeys = new Set(this.dirtyPages);
+      const flushedMetaPaths = new Set(this.dirtyMeta);
+
+      const pageBatch: Array<{
+        path: string;
+        pageIndex: number;
+        data: Uint8Array;
+      }> = [];
+      for (const key of flushedPageKeys) {
+        const data = this.pages.get(key);
+        if (data) {
+          const nullIdx = key.indexOf("\0");
+          const path = key.substring(0, nullIdx);
+          const pageIndex = parseInt(key.substring(nullIdx + 1), 10);
+          pageBatch.push({ path, pageIndex, data });
+        }
+      }
+
+      const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
+      for (const path of flushedMetaPaths) {
+        const m = this.meta.get(path);
+        if (m) metaBatch.push({ path, meta: m });
+      }
+
+      if (pageBatch.length > 0 || metaBatch.length > 0) {
+        await this.remote.syncAll(pageBatch, metaBatch);
+      }
+
+      for (const key of flushedPageKeys) {
+        this.dirtyPages.delete(key);
+      }
+      for (const path of flushedMetaPaths) {
+        this.dirtyMeta.delete(path);
+      }
+      return;
+    }
+
+    // Complex path: deletes or truncations are pending. Partition dirty
+    // pages into early (pre-delete) and late (post-delete) batches to
+    // handle delete-then-recreate at the same path.
     // Snapshot the dirty keys we intend to flush. We must NOT clear
     // dirtyPages/dirtyMeta until all operations succeed — otherwise a
     // mid-flush failure loses dirty tracking and the data is never retried.
