@@ -214,8 +214,60 @@ export class PreloadBackend implements SyncStorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
   ): void {
     this.assertInitialized();
+    if (pages.length === 0) return;
+    if (pages.length === 1) {
+      const { path, pageIndex, data } = pages[0];
+      const key = pageKeyStr(path, pageIndex);
+      this.pages.set(key, new Uint8Array(data));
+      this.trackPage(path, key, pageIndex);
+      this.dirtyPages.add(key);
+      return;
+    }
+
+    // Batch by file path to amortize secondary index lookups.
+    // syncAll passes dirty pages from the cache — commonly multiple pages
+    // from the same file. Grouping avoids repeated Map.get calls for
+    // filePageKeys/filePageIndices/fileMaxIdx per page.
+    let prevPath = "";
+    let keys: Set<string> | undefined;
+    let indices: Map<number, string> | undefined;
+    let maxIdx = -1;
+
     for (const { path, pageIndex, data } of pages) {
-      this.writePage(path, pageIndex, data);
+      const key = pageKeyStr(path, pageIndex);
+      this.pages.set(key, new Uint8Array(data));
+      this.dirtyPages.add(key);
+
+      if (path !== prevPath) {
+        // Flush maxIdx for previous file
+        if (prevPath !== "" && maxIdx >= 0) {
+          const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+          if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
+        }
+
+        prevPath = path;
+        keys = this.filePageKeys.get(path);
+        if (!keys) {
+          keys = new Set();
+          this.filePageKeys.set(path, keys);
+        }
+        indices = this.filePageIndices.get(path);
+        if (!indices) {
+          indices = new Map();
+          this.filePageIndices.set(path, indices);
+        }
+        maxIdx = this.fileMaxIdx.get(path) ?? -1;
+      }
+
+      keys!.add(key);
+      indices!.set(pageIndex, key);
+      if (pageIndex > maxIdx) maxIdx = pageIndex;
+    }
+
+    // Flush maxIdx for the last file
+    if (prevPath !== "" && maxIdx >= 0) {
+      const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+      if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
     }
   }
 
