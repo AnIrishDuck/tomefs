@@ -16,7 +16,7 @@
  *   FS.mount(tomefs, {}, '/data');
  */
 
-import { PAGE_SIZE } from "./types.js";
+import { PAGE_SIZE, PAGE_SHIFT, PAGE_MASK } from "./types.js";
 import type { FileMeta } from "./types.js";
 import { SyncPageCache } from "./sync-page-cache.js";
 import { SyncMemoryBackend } from "./sync-memory-backend.js";
@@ -191,8 +191,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (toRead === 0) return 0;
 
     // Single-page fast path with per-node page table (avoids pageCache overhead)
-    const firstPage = (position / PAGE_SIZE) | 0;
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
     if (pageOffset + toRead <= PAGE_SIZE) {
       // node._pages is always initialized (never undefined), so direct
       // array access avoids optional-chain overhead on every read.
@@ -211,7 +211,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Multi-page fast path: check per-node page table for all pages.
     // If every page is cached and not evicted, copy directly without
     // key construction, Map lookups, or LRU reordering overhead.
-    const lastPage = ((position + toRead - 1) / PAGE_SIZE) | 0;
+    const lastPage = (position + toRead - 1) >>> PAGE_SHIFT;
     const pages = node._pages;
     if (pages) {
       let allCached = true;
@@ -226,8 +226,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         let bytesRead = 0;
         let pos = position;
         while (bytesRead < toRead) {
-          const pi = (pos / PAGE_SIZE) | 0;
-          const po = pos - pi * PAGE_SIZE;
+          const pi = pos >>> PAGE_SHIFT;
+          const po = pos & PAGE_MASK;
           const n = Math.min(PAGE_SIZE - po, toRead - bytesRead);
           buffer.set(pages[pi].data.subarray(po, po + n), offset + bytesRead);
           bytesRead += n;
@@ -278,13 +278,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     if (length === 0) return 0;
 
     // Single-page fast path with per-node page table
-    const firstPage = (position / PAGE_SIZE) | 0;
-    const pageOffset = position - firstPage * PAGE_SIZE;
+    const firstPage = position >>> PAGE_SHIFT;
+    const pageOffset = position & PAGE_MASK;
     if (pageOffset + length <= PAGE_SIZE) {
       let page = node._pages[firstPage];
       if (!page || page.evicted) {
         const firstNewPage = node.usedBytes > 0
-          ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
+          ? ((node.usedBytes + PAGE_MASK) >>> PAGE_SHIFT) : 0;
         const needsRead = firstPage < firstNewPage
           && !(pageOffset === 0 && length >= PAGE_SIZE);
         page = needsRead
@@ -307,7 +307,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // Multi-page warm path: check per-node page table for all pages.
     // If every page is cached and not evicted, write directly without
     // key construction, Map lookups, or LRU reordering overhead.
-    const lastPage = ((position + length - 1) / PAGE_SIZE) | 0;
+    const lastPage = (position + length - 1) >>> PAGE_SHIFT;
     const pages = node._pages;
     if (pages) {
       let allCached = true;
@@ -322,8 +322,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         let bytesWritten = 0;
         let pos = position;
         while (bytesWritten < length) {
-          const pi = (pos / PAGE_SIZE) | 0;
-          const po = pos - pi * PAGE_SIZE;
+          const pi = pos >>> PAGE_SHIFT;
+          const po = pos & PAGE_MASK;
           const n = Math.min(PAGE_SIZE - po, length - bytesWritten);
           const page = pages[pi];
           page.data.set(
@@ -389,7 +389,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // last surviving page (replacing the cached CachedPage reference).
       node._pages = [];
       // Zero the tail of the last surviving page, then invalidate beyond
-      const neededPages = Math.ceil(newSize / PAGE_SIZE);
+      const neededPages = (newSize + PAGE_MASK) >>> PAGE_SHIFT;
       pageCache.zeroTailAfterTruncate(path, newSize);
       pageCache.invalidatePagesFrom(path, neededPages);
       backend.deletePagesFrom(path, neededPages);
@@ -399,7 +399,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // a prior extend), restoreTree would see maxPageIndex < lastExpected
       // and incorrectly shrink the file. Materialize a sentinel so the
       // page exists in the backend after syncfs.
-      if (neededPages > 0 && newSize % PAGE_SIZE === 0) {
+      if (neededPages > 0 && (newSize & PAGE_MASK) === 0) {
         const lastIdx = neededPages - 1;
         if (!pageCache.has(path, lastIdx)) {
           pageCache.markPageDirty(path, lastIdx);
@@ -419,8 +419,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // operations and avoids cache thrashing when the allocation exceeds
       // cache capacity (e.g., Postgres pre-allocating a 256 MB WAL segment
       // with a 32 MB page cache).
-      const firstNewPage = node.usedBytes > 0 ? Math.ceil(node.usedBytes / PAGE_SIZE) : 0;
-      const lastPageIdx = Math.ceil(newSize / PAGE_SIZE) - 1;
+      const firstNewPage = node.usedBytes > 0 ? ((node.usedBytes + PAGE_MASK) >>> PAGE_SHIFT) : 0;
+      const lastPageIdx = ((newSize + PAGE_MASK) >>> PAGE_SHIFT) - 1;
       if (lastPageIdx >= firstNewPage) {
         pageCache.markPageDirtyNoRead(path, lastPageIdx);
       }
@@ -1240,7 +1240,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
 
       for (let i = 0; i < fileEntries.length; i++) {
         const { meta, parent, name } = fileEntries[i];
-        const pagesFromMeta = meta.size > 0 ? Math.ceil(meta.size / PAGE_SIZE) : 0;
+        const pagesFromMeta = meta.size > 0 ? ((meta.size + PAGE_MASK) >>> PAGE_SHIFT) : 0;
         const highIdx = allMaxIndices[i];
         const lastPageIndex = pagesFromMeta - 1;
 
