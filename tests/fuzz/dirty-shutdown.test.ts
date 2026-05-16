@@ -188,6 +188,10 @@ type Op =
   | { type: "allocate"; path: string; offset: number; length: number }
   | { type: "chmod"; path: string; mode: number }
   | { type: "mmapWrite"; path: string; offset: number; data: Uint8Array }
+  | { type: "renameSymlink"; oldPath: string; newPath: string }
+  | { type: "ftruncateFd"; fdId: number; size: number }
+  | { type: "dupFd"; srcFdId: number; newFdId: number }
+  | { type: "openTrunc"; path: string }
   | { type: "openFd"; path: string; fdId: number }
   | { type: "writeFd"; fdId: number; data: Uint8Array; offset: number }
   | { type: "closeFd"; fdId: number };
@@ -226,6 +230,10 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["allocate", allFiles.length > 0 ? 8 : 0],
     ["chmod", allFiles.length > 0 ? 6 : 0],
     ["mmapWrite", allFiles.length > 0 ? 6 : 0],
+    ["renameSymlink", allSymlinks.length > 0 ? 6 : 0],
+    ["ftruncateFd", model.openFds.size > 0 ? 6 : 0],
+    ["dupFd", model.openFds.size > 0 && model.openFds.size < 8 ? 5 : 0],
+    ["openTrunc", allFiles.length > 0 ? 6 : 0],
     ["openFd", allFiles.length > 0 && model.openFds.size < 4 ? 8 : 0],
     ["writeFd", model.openFds.size > 0 ? 10 : 0],
     ["closeFd", model.openFds.size > 0 ? 6 : 0],
@@ -350,6 +358,35 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "mmapWrite", path, offset, data };
     }
 
+    case "renameSymlink": {
+      const oldPath = rng.pick(allSymlinks);
+      const dir = rng.pick(allContainerDirs);
+      const name = rng.pick(LINK_NAMES);
+      const newPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+      return { type: "renameSymlink", oldPath, newPath };
+    }
+
+    case "ftruncateFd": {
+      const fdIds = [...model.openFds.keys()];
+      const fdId = rng.pick(fdIds);
+      const fd = model.openFds.get(fdId)!;
+      const currentSize = model.files.get(fd.path)?.data.length ?? 0;
+      const sizeChoices = [0, Math.max(0, currentSize - PAGE_SIZE), currentSize, currentSize + PAGE_SIZE];
+      return { type: "ftruncateFd", fdId, size: rng.pick(sizeChoices) };
+    }
+
+    case "dupFd": {
+      const fdIds = [...model.openFds.keys()];
+      const srcFdId = rng.pick(fdIds);
+      const newFdId = model.nextFdId;
+      return { type: "dupFd", srcFdId, newFdId };
+    }
+
+    case "openTrunc": {
+      const path = rng.pick(allFiles);
+      return { type: "openTrunc", path };
+    }
+
     case "openFd": {
       const path = rng.pick(allFiles);
       const fdId = model.nextFdId;
@@ -449,6 +486,27 @@ function execOp(FS: EmscriptenFS, op: Op, activeFds: Map<number, any>): boolean 
         const buf = mmapResult.ptr;
         buf.set(op.data);
         s.stream_ops.msync(s, buf, op.offset, op.data.length, 0);
+        FS.close(s);
+        return true;
+      }
+      case "renameSymlink":
+        FS.rename(rw(op.oldPath), rw(op.newPath));
+        return true;
+      case "ftruncateFd": {
+        const s = activeFds.get(op.fdId);
+        if (!s) return false;
+        FS.ftruncate(s.fd, op.size);
+        return true;
+      }
+      case "dupFd": {
+        const src = activeFds.get(op.srcFdId);
+        if (!src) return false;
+        const duped = FS.dupStream(src);
+        activeFds.set(op.newFdId, duped);
+        return true;
+      }
+      case "openTrunc": {
+        const s = FS.open(rw(op.path), O.WRONLY | O.TRUNC);
         FS.close(s);
         return true;
       }
@@ -604,6 +662,43 @@ function updateModel(model: FSModel, op: Op): void {
       file.data.set(op.data, op.offset);
       break;
     }
+    case "renameSymlink": {
+      const target = model.symlinks.get(op.oldPath);
+      if (!target) break;
+      if (op.oldPath === op.newPath) break;
+      model.symlinks.delete(op.oldPath);
+      model.files.delete(op.newPath);
+      model.symlinks.delete(op.newPath);
+      model.symlinks.set(op.newPath, target);
+      break;
+    }
+    case "ftruncateFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (!fd) break;
+      const file = model.files.get(fd.path);
+      if (!file) break;
+      if (op.size < file.data.length) {
+        file.data = new Uint8Array(file.data.slice(0, op.size));
+      } else if (op.size > file.data.length) {
+        const newData = new Uint8Array(op.size);
+        newData.set(file.data);
+        file.data = newData;
+      }
+      break;
+    }
+    case "dupFd": {
+      const srcFd = model.openFds.get(op.srcFdId);
+      if (!srcFd) break;
+      model.openFds.set(op.newFdId, { path: srcFd.path });
+      model.nextFdId = op.newFdId + 1;
+      break;
+    }
+    case "openTrunc": {
+      const file = model.files.get(op.path);
+      if (!file) break;
+      file.data = new Uint8Array(0);
+      break;
+    }
     case "openFd": {
       model.openFds.set(op.fdId, { path: op.path });
       model.nextFdId = op.fdId + 1;
@@ -662,6 +757,14 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] chmod(${op.path}, ${op.mode.toString(8)})`;
     case "mmapWrite":
       return `[${index}] mmapWrite(${op.path}, @${op.offset}, ${op.data.length}B)`;
+    case "renameSymlink":
+      return `[${index}] renameSymlink(${op.oldPath} -> ${op.newPath})`;
+    case "ftruncateFd":
+      return `[${index}] ftruncateFd(fdId=${op.fdId}, ${op.size})`;
+    case "dupFd":
+      return `[${index}] dupFd(fdId=${op.srcFdId} -> fdId=${op.newFdId})`;
+    case "openTrunc":
+      return `[${index}] openTrunc(${op.path})`;
     case "openFd":
       return `[${index}] openFd(${op.path}, fdId=${op.fdId})`;
     case "writeFd":
@@ -1066,6 +1169,34 @@ describe("fuzz: dirty shutdown recovery", () => {
 
     it("seed 75002: 3 clean + 50 dirty ops, small cache @fast", async () => {
       await runDirtyShutdown(75002, 3, 50, 16);
+    }, 30_000);
+  });
+
+  describe("symlink rename + fd truncate during dirty phase", () => {
+    it("seed 77001: 25 clean + 35 dirty ops, tiny cache @fast", async () => {
+      await runDirtyShutdown(77001, 25, 35, 4);
+    }, 30_000);
+
+    it("seed 77002: 20 clean + 40 dirty ops, small cache", async () => {
+      await runDirtyShutdown(77002, 20, 40, 16);
+    }, 30_000);
+
+    it("seed 77003: 30 clean + 30 dirty ops, tiny cache", async () => {
+      await runDirtyShutdown(77003, 30, 30, 4);
+    }, 30_000);
+
+    it("seed 77004: 15 clean + 50 dirty ops, small cache", async () => {
+      await runDirtyShutdown(77004, 15, 50, 16);
+    }, 30_000);
+  });
+
+  describe("dup fd + open-trunc during dirty phase", () => {
+    it("seed 78001: 20 clean + 30 dirty ops, tiny cache @fast", async () => {
+      await runDirtyShutdown(78001, 20, 30, 4);
+    }, 30_000);
+
+    it("seed 78002: 25 clean + 40 dirty ops, small cache", async () => {
+      await runDirtyShutdown(78002, 25, 40, 16);
     }, 30_000);
   });
 
