@@ -177,6 +177,9 @@ type Op =
   | { type: "fstatFd"; fdId: number }
   | { type: "fchmodFd"; fdId: number; mode: number }
   | { type: "openTrunc"; path: string }
+  | { type: "lstatOp"; path: string }
+  | { type: "lstatSymlink"; path: string }
+  | { type: "statThroughSymlink"; path: string }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -231,6 +234,9 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["fstatFd", model.openFds.size > 0 ? 6 : 0],
     ["fchmodFd", model.openFds.size > 0 ? 5 : 0],
     ["openTrunc", allFiles.length > 0 ? 6 : 0],
+    ["lstatOp", allFiles.length > 0 ? 5 : 0],
+    ["lstatSymlink", allSymlinks.length > 0 ? 5 : 0],
+    ["statThroughSymlink", validSymlinks.length > 0 ? 5 : 0],
     ["syncfs", 3],
   ];
 
@@ -555,6 +561,18 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "openTrunc", path };
     }
 
+    case "lstatOp": {
+      return { type: "lstatOp", path: rng.pick(allFiles) };
+    }
+
+    case "lstatSymlink": {
+      return { type: "lstatSymlink", path: rng.pick(allSymlinks) };
+    }
+
+    case "statThroughSymlink": {
+      return { type: "statThroughSymlink", path: rng.pick(validSymlinks) };
+    }
+
     case "syncfs":
     default:
       return { type: "syncfs" };
@@ -788,6 +806,27 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
       }
 
       case "statOp": {
+        const st = FS.stat(op.path);
+        return { error: null, size: st.size, data: new TextEncoder().encode(
+          `${st.size}:${st.mode}`,
+        )};
+      }
+
+      case "lstatOp": {
+        const st = FS.lstat(op.path);
+        return { error: null, size: st.size, data: new TextEncoder().encode(
+          `${st.size}:${st.mode}`,
+        )};
+      }
+
+      case "lstatSymlink": {
+        const st = FS.lstat(op.path);
+        return { error: null, size: st.size, data: new TextEncoder().encode(
+          `${st.size}:${st.mode}`,
+        )};
+      }
+
+      case "statThroughSymlink": {
         const st = FS.stat(op.path);
         return { error: null, size: st.size, data: new TextEncoder().encode(
           `${st.size}:${st.mode}`,
@@ -1039,7 +1078,7 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
     case "openTrunc":
       model.files.set(op.path, 0);
       break;
-    // readAt, readFd, readFdAt, readlink, readThroughSymlink, seekFd, mmapRead, fstatFd don't modify file state
+    // readAt, readFd, readFdAt, readlink, readThroughSymlink, seekFd, mmapRead, fstatFd, lstatOp, lstatSymlink, statThroughSymlink don't modify file state
     // mmapWrite modifies file contents via msync but doesn't change size
     // fchmodFd modifies mode bits but not file size or contents
   }
@@ -1108,6 +1147,12 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] readdir(${op.path})`;
     case "statOp":
       return `[${index}] stat(${op.path})`;
+    case "lstatOp":
+      return `[${index}] lstat(${op.path})`;
+    case "lstatSymlink":
+      return `[${index}] lstatSymlink(${op.path})`;
+    case "statThroughSymlink":
+      return `[${index}] statThroughSymlink(${op.path})`;
     case "mmapRead":
       return `[${index}] mmapRead(fdId=${op.fdId}, len=${op.length}, pos=${op.position})`;
     case "mmapWrite":
@@ -1680,6 +1725,28 @@ describe("fuzz: randomized differential testing", () => {
 
     it("seed 54321 small cache", async () => {
       await runFuzzSequence(54321, 150, 16);
+    }, 30_000);
+  });
+
+  describe("lstat and stat-through-symlink operations", () => {
+    // Seeds chosen to exercise lstat (stat without following symlinks)
+    // and stat-through-symlink (stat following the link). These target
+    // the metadata code path for symlink nodes: lstat must return the
+    // symlink's own attributes (S_IFLNK mode, size = target length),
+    // while stat through a symlink must return the target file's
+    // attributes. Under cache pressure, the target file's metadata
+    // must survive eviction and reload correctly.
+
+    it("seed 60001 tiny cache @fast", async () => {
+      await runFuzzSequence(60001, 120, 4);
+    }, 30_000);
+
+    it("seed 60002 tiny cache", async () => {
+      await runFuzzSequence(60002, 120, 4);
+    }, 30_000);
+
+    it("seed 60003 small cache", async () => {
+      await runFuzzSequence(60003, 150, 16);
     }, 30_000);
   });
 
