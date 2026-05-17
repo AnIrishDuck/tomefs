@@ -304,32 +304,32 @@ describe("adversarial: rename round-trip (A→B→A) + persistence @fast", () =>
     const fd = FS.open(`${MOUNT}/f`, O.RDWR | O.CREAT, 0o666);
     FS.write(fd, fillPattern(PAGE_SIZE * 2, 0x77), 0, PAGE_SIZE * 2, 0);
     FS.close(fd);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.rename(`${MOUNT}/f`, `${MOUNT}/g`);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     // Write while named g
     const fd2 = FS.open(`${MOUNT}/g`, O.WRONLY);
     FS.write(fd2, fillPattern(PAGE_SIZE, 0x88), 0, PAGE_SIZE, PAGE_SIZE * 2);
     FS.close(fd2);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.rename(`${MOUNT}/g`, `${MOUNT}/f`);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncfs(FS, tomefs);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     // Second round-trip
     FS.rename(`${MOUNT}/f`, `${MOUNT}/h`);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.rename(`${MOUNT}/h`, `${MOUNT}/f`);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncfs(FS, tomefs);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
   });
 
   it("A→B→A with syncfs between each rename persists correctly", async () => {

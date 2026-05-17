@@ -1515,13 +1515,13 @@ async function runFuzzSequence(
     // Periodically do a full comparison (every 10 ops)
     if (i > 0 && i % 10 === 0) {
       compareAllFiles(memFS, tomeFS, model, `after op ${i}`);
-      tomefs.pageCache.assertInvariants();
+      tomefs.assertInvariants();
     }
   }
 
   // Final full comparison
   compareAllFiles(memFS, tomeFS, model, "final");
-  tomefs.pageCache.assertInvariants();
+  tomefs.assertInvariants();
 }
 
 // ---------------------------------------------------------------

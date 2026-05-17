@@ -436,32 +436,32 @@ describe("adversarial: WAL segment recycling + persistence", () => {
     const { FS, tomefs } = await mountTome(backend, 4);
 
     writeSequential(FS, `${MOUNT}/wal`, 3, 0x10);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncfs(FS, tomefs);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.truncate(`${MOUNT}/wal`, 0);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     writeSequential(FS, `${MOUNT}/wal`, 2, 0x30);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncfs(FS, tomefs);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     // Second recycle with competing file
     writeSequential(FS, `${MOUNT}/other`, 2, 0x50);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.truncate(`${MOUNT}/wal`, 0);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     writeSequential(FS, `${MOUNT}/wal`, 3, 0x70);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncfs(FS, tomefs);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
   });
 
   it("rename-based recycling: rename wal_old → wal_new, write new data @fast", async () => {
