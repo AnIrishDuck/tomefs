@@ -4,6 +4,8 @@ export { IdbBackend } from "./idb-backend.js";
 export type { IdbBackendOptions } from "./idb-backend.js";
 export { OpfsBackend } from "./opfs-backend.js";
 export type { OpfsBackendOptions } from "./opfs-backend.js";
+export { OpfsSahBackend } from "./opfs-sah-backend.js";
+export type { OpfsSahBackendOptions } from "./opfs-sah-backend.js";
 export type { StorageBackend } from "./storage-backend.js";
 export { SyncPageCache } from "./sync-page-cache.js";
 export { SyncMemoryBackend } from "./sync-memory-backend.js";
