@@ -503,29 +503,29 @@ describe("adversarial: truncate-extend oscillation + persistence @fast", () => {
     const { FS, tomefs } = await mountTome(backend, 4);
 
     writeFile(FS, "/tome/f", filledData(3, 0x99));
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.truncate("/tome/f", PAGE_SIZE + 100);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.truncate("/tome/f", PAGE_SIZE * 3);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncfs(FS, tomefs);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     // Second cycle with competing file
     writeFile(FS, "/tome/g", filledData(2, 0x88));
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.truncate("/tome/f", PAGE_SIZE / 2);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.truncate("/tome/f", PAGE_SIZE * 4);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncfs(FS, tomefs);
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     FS.unmount("/tome");
   });

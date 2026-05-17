@@ -1065,7 +1065,7 @@ async function runPersistenceFuzz(
 
     if (op.type === "checkpoint") {
       // Validate page cache index consistency before persist
-      harness.tomefs.pageCache.assertInvariants();
+      harness.tomefs.assertInvariants();
       // Persist with fds still open (like Postgres during fsync/checkpoint)
       harness.rawFS.syncfs(false, (err: Error | null) => {
         if (err) throw err;
@@ -1073,7 +1073,7 @@ async function runPersistenceFuzz(
       // Close all fds before remount — fds don't survive module teardown
       closeAllFds(harness, model);
       harness = await remount(harness);
-      harness.tomefs.pageCache.assertInvariants();
+      harness.tomefs.assertInvariants();
       checkpoints++;
 
       // Verify all files survived the remount
@@ -1087,12 +1087,12 @@ async function runPersistenceFuzz(
 
   // Close open fds, persist, remount, verify
   closeAllFds(harness, model);
-  harness.tomefs.pageCache.assertInvariants();
+  harness.tomefs.assertInvariants();
   harness.rawFS.syncfs(false, (err: Error | null) => {
     if (err) throw err;
   });
   harness = await remount(harness);
-  harness.tomefs.pageCache.assertInvariants();
+  harness.tomefs.assertInvariants();
   verifyModel(harness.FS, model, "final checkpoint");
 }
 
