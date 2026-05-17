@@ -19,6 +19,18 @@ export interface IdbBackendOptions {
   dbVersion?: number;
   /** Pre-opened IDBDatabase instance (overrides dbName/dbVersion). */
   db?: IDBDatabase;
+  /**
+   * Transaction durability hint for readwrite transactions.
+   *
+   * - `'default'` — browser decides (typically relaxed)
+   * - `'relaxed'` — may acknowledge before data hits persistent storage
+   * - `'strict'` — waits until data is confirmed on persistent storage
+   *
+   * For database filesystems, `'strict'` ensures that data persisted via
+   * syncAll is truly crash-safe. The tradeoff is higher write latency.
+   * Default: undefined (browser default behavior).
+   */
+  durability?: IDBTransactionDurability;
 }
 
 /**
@@ -35,12 +47,14 @@ export class IdbBackend implements StorageBackend {
   private db: IDBDatabase | null;
   private readonly dbName: string;
   private readonly dbVersion: number;
+  private readonly durability: IDBTransactionDurability | undefined;
   private initPromise: Promise<IDBDatabase> | null = null;
 
   constructor(options?: IdbBackendOptions) {
     this.db = options?.db ?? null;
     this.dbName = options?.dbName ?? DEFAULT_DB_NAME;
     this.dbVersion = options?.dbVersion ?? DEFAULT_DB_VERSION;
+    this.durability = options?.durability;
   }
 
   /**
@@ -81,6 +95,16 @@ export class IdbBackend implements StorageBackend {
   /** Build the compound key for a page: [path, pageIndex]. */
   private pageKey(path: string, pageIndex: number): [string, number] {
     return [path, pageIndex];
+  }
+
+  /** Create a readwrite transaction with the configured durability hint. */
+  private rwTransaction(
+    db: IDBDatabase,
+    storeNames: string | string[],
+  ): IDBTransaction {
+    return this.durability
+      ? db.transaction(storeNames, "readwrite", { durability: this.durability })
+      : db.transaction(storeNames, "readwrite");
   }
 
   async readPage(
@@ -142,7 +166,7 @@ export class IdbBackend implements StorageBackend {
   ): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const tx = this.rwTransaction(db, PAGES_STORE);
       const store = tx.objectStore(PAGES_STORE);
       store.put(new Uint8Array(data), this.pageKey(path, pageIndex));
 
@@ -159,7 +183,7 @@ export class IdbBackend implements StorageBackend {
 
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const tx = this.rwTransaction(db, PAGES_STORE);
       const store = tx.objectStore(PAGES_STORE);
 
       for (const { path, pageIndex, data } of pages) {
@@ -180,7 +204,7 @@ export class IdbBackend implements StorageBackend {
     // In IDB key ordering, strings sort after numbers, so [path, ""]
     // sorts after [path, <any number>], bounding just this file's pages.
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const tx = this.rwTransaction(db, PAGES_STORE);
       const store = tx.objectStore(PAGES_STORE);
       const range = IDBKeyRange.bound([path, 0], [path, ""], false, true);
       store.delete(range);
@@ -200,7 +224,7 @@ export class IdbBackend implements StorageBackend {
 
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const tx = this.rwTransaction(db, PAGES_STORE);
       const store = tx.objectStore(PAGES_STORE);
 
       for (const path of paths) {
@@ -224,7 +248,7 @@ export class IdbBackend implements StorageBackend {
     // Lower bound [path, fromPageIndex] captures the first page to delete;
     // upper bound [path, ""] captures all higher-numbered pages for this path.
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const tx = this.rwTransaction(db, PAGES_STORE);
       const store = tx.objectStore(PAGES_STORE);
       const range = IDBKeyRange.bound(
         [path, fromPageIndex],
@@ -340,7 +364,7 @@ export class IdbBackend implements StorageBackend {
     // Clearing the destination first prevents orphan pages when the destination
     // has more pages than the source (mirrors OpfsBackend behavior).
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(PAGES_STORE, "readwrite");
+      const tx = this.rwTransaction(db, PAGES_STORE);
       const store = tx.objectStore(PAGES_STORE);
 
       // Delete any pre-existing pages at the destination path.
@@ -414,7 +438,7 @@ export class IdbBackend implements StorageBackend {
   async writeMeta(path: string, meta: FileMeta): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(META_STORE, "readwrite");
+      const tx = this.rwTransaction(db, META_STORE);
       const store = tx.objectStore(META_STORE);
       store.put({ ...meta }, path);
 
@@ -431,7 +455,7 @@ export class IdbBackend implements StorageBackend {
 
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(META_STORE, "readwrite");
+      const tx = this.rwTransaction(db, META_STORE);
       const store = tx.objectStore(META_STORE);
 
       for (const { path, meta } of entries) {
@@ -447,7 +471,7 @@ export class IdbBackend implements StorageBackend {
   async deleteMeta(path: string): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(META_STORE, "readwrite");
+      const tx = this.rwTransaction(db, META_STORE);
       const store = tx.objectStore(META_STORE);
       store.delete(path);
 
@@ -462,7 +486,7 @@ export class IdbBackend implements StorageBackend {
 
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(META_STORE, "readwrite");
+      const tx = this.rwTransaction(db, META_STORE);
       const store = tx.objectStore(META_STORE);
 
       for (const path of paths) {
@@ -502,7 +526,7 @@ export class IdbBackend implements StorageBackend {
       // Single transaction spanning both stores — pages and metadata
       // are committed atomically. A crash can never leave pages updated
       // without their corresponding metadata (or vice versa).
-      const tx = db.transaction([PAGES_STORE, META_STORE], "readwrite");
+      const tx = this.rwTransaction(db, [PAGES_STORE, META_STORE]);
       const pageStore = tx.objectStore(PAGES_STORE);
       const metaStore = tx.objectStore(META_STORE);
 
@@ -525,7 +549,7 @@ export class IdbBackend implements StorageBackend {
 
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction([PAGES_STORE, META_STORE], "readwrite");
+      const tx = this.rwTransaction(db, [PAGES_STORE, META_STORE]);
       const pageStore = tx.objectStore(PAGES_STORE);
       const metaStore = tx.objectStore(META_STORE);
 
