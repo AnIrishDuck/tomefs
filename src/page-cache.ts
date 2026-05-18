@@ -364,6 +364,37 @@ export class PageCache {
       }
     }
 
+    // Two-page write specialization: eliminates loop overhead for the
+    // common case of writes straddling a single page boundary.
+    if (lastPage === firstPage + 1) {
+      const n1 = PAGE_SIZE - pageOffset;
+      const needsRead1 =
+        firstPage < firstNewPage &&
+        !(pageOffset === 0 && n1 >= PAGE_SIZE);
+      const page1 = await this.getPageInternal(path, firstPage, needsRead1);
+      page1.data.set(buffer.subarray(offset, offset + n1), pageOffset);
+      if (!page1.dirty) {
+        page1.dirty = true;
+        this.trackDirty(path, page1.key);
+      }
+
+      const n2 = length - n1;
+      const needsRead2 = lastPage < firstNewPage && !(n2 >= PAGE_SIZE);
+      const page2 = await this.getPageInternal(path, lastPage, needsRead2);
+      page2.data.set(buffer.subarray(offset + n1, offset + length));
+      if (!page2.dirty) {
+        page2.dirty = true;
+        this.trackDirty(path, page2.key);
+      }
+
+      if (existingMissing.length > 1) {
+        this._hits -= existingMissing.length;
+      }
+
+      const newFileSize = Math.max(currentFileSize, position + length);
+      return { bytesWritten: length, newFileSize };
+    }
+
     // Write data into pages (pre-loaded existing pages are cache hits;
     // new pages beyond file extent skip the backend read)
     let bytesWritten = 0;
@@ -384,13 +415,22 @@ export class PageCache {
         pageIndex < firstNewPage &&
         !(pageOffset === 0 && bytesInPage === PAGE_SIZE);
       const page = await this.getPageInternal(path, pageIndex, needsRead);
-      page.data.set(
-        buffer.subarray(
-          offset + bytesWritten,
-          offset + bytesWritten + bytesInPage,
-        ),
-        pageOffset,
-      );
+      if (pageOffset === 0 && bytesInPage === PAGE_SIZE) {
+        page.data.set(
+          buffer.subarray(
+            offset + bytesWritten,
+            offset + bytesWritten + PAGE_SIZE,
+          ),
+        );
+      } else {
+        page.data.set(
+          buffer.subarray(
+            offset + bytesWritten,
+            offset + bytesWritten + bytesInPage,
+          ),
+          pageOffset,
+        );
+      }
       if (!page.dirty) {
         page.dirty = true;
         this.trackDirty(path, page.key);
