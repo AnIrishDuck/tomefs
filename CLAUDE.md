@@ -26,6 +26,7 @@ src/sync-page-cache.ts — Bounded LRU page cache with dirty tracking
 src/page-cache.ts      — Async page cache variant
 src/idb-backend.ts     — IndexedDB storage backend
 src/opfs-backend.ts    — OPFS storage backend
+src/opfs-sah-backend.ts — OPFS backend using FileSystemSyncAccessHandle
 src/preload-backend.ts — Graceful degradation without SharedArrayBuffer
 src/sab-client.ts      — SAB+Atomics sync bridge (worker side)
 src/sab-worker.ts      — SAB+Atomics sync bridge (storage worker side)

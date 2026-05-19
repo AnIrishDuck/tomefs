@@ -51,7 +51,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 - **Dirty tracking**: Only modified pages are written back to storage
 - **Batch flush**: All dirty pages for a file (or globally) can be flushed in a single operation
 - **Page-aligned I/O**: 8 KB pages match Postgres internals, eliminating partial-page overhead
-- **Pluggable backends**: `StorageBackend` interface allows swapping storage (memory for testing, IDB or OPFS for production)
+- **Pluggable backends**: `StorageBackend` interface allows swapping storage (memory for testing, IDB or OPFS for production). OPFS supports a fast `SyncAccessHandle` variant for reduced per-operation latency
 
 ## Status
 
