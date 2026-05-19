@@ -90,7 +90,8 @@ type Op =
   | { type: "writeMetas"; entries: Array<{ path: string; meta: FileMeta }> }
   | { type: "deleteMeta"; path: string }
   | { type: "deleteMetas"; paths: string[] }
-  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> };
+  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> }
+  | { type: "deleteAll"; paths: string[] };
 
 // ---------------------------------------------------------------
 // Operation generation
@@ -243,6 +244,17 @@ const OP_TABLE: WeightedOp[] = [
       return { type: "syncAll", pages, metas };
     },
   },
+  {
+    weight: 5,
+    generate: (rng) => {
+      const count = 1 + rng.int(3);
+      const paths = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        paths.add(rng.pick(FILE_PATHS));
+      }
+      return { type: "deleteAll", paths: [...paths] };
+    },
+  },
 ];
 
 const TOTAL_WEIGHT = OP_TABLE.reduce((sum, op) => sum + op.weight, 0);
@@ -301,6 +313,9 @@ async function executeOp(backend: StorageBackend, op: Op): Promise<void> {
         op.pages.map((p) => ({ ...p, data: new Uint8Array(p.data) })),
         op.metas.map((e) => ({ path: e.path, meta: { ...e.meta } })),
       );
+      break;
+    case "deleteAll":
+      await backend.deleteAll(op.paths);
       break;
   }
 }
@@ -418,6 +433,8 @@ function formatOp(op: Op): string {
       return `deleteMetas([${op.paths.join(", ")}])`;
     case "syncAll":
       return `syncAll(pages=[${op.pages.map((p) => `${p.path}:${p.pageIndex}`).join(", ")}], metas=[${op.metas.map((m) => m.path).join(", ")}])`;
+    case "deleteAll":
+      return `deleteAll([${op.paths.join(", ")}])`;
   }
 }
 
@@ -696,5 +713,208 @@ describe("OpfsBackend differential fuzz", () => {
         await runSyncAllFuzz(seed);
       }, 20_000);
     }
+  });
+
+  // deleteAll-heavy — stress the combined delete-pages + delete-metadata path.
+  // deleteAll is used by tomefs syncfs for orphan cleanup; OPFS implements it
+  // as sequential deleteFiles + deleteMetas (no atomicity). This exercises
+  // interactions between deleteAll and concurrent writes/renames that could
+  // leave inconsistent state.
+  describe("deleteAll-heavy sequences", () => {
+    async function runDeleteAllFuzz(seed: number): Promise<void> {
+      const rng = new Rng(seed);
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+      const mem: StorageBackend = new MemoryBackend();
+
+      const ops: Op[] = [];
+      for (let i = 0; i < 60; i++) {
+        const roll = rng.int(100);
+        let op: Op;
+        if (roll < 20) {
+          op = {
+            type: "writePage",
+            path: rng.pick(FILE_PATHS),
+            pageIndex: rng.int(MAX_PAGE_INDEX),
+            data: randomPageData(rng),
+          };
+        } else if (roll < 30) {
+          const count = 1 + rng.int(4);
+          const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
+          for (let j = 0; j < count; j++) {
+            pages.push({
+              path: rng.pick(FILE_PATHS),
+              pageIndex: rng.int(MAX_PAGE_INDEX),
+              data: randomPageData(rng),
+            });
+          }
+          op = { type: "writePages", pages };
+        } else if (roll < 45) {
+          op = {
+            type: "writeMeta",
+            path: rng.pick(FILE_PATHS),
+            meta: randomMeta(rng),
+          };
+        } else if (roll < 55) {
+          const pageCount = 1 + rng.int(3);
+          const metaCount = 1 + rng.int(3);
+          const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
+          for (let j = 0; j < pageCount; j++) {
+            pages.push({
+              path: rng.pick(FILE_PATHS),
+              pageIndex: rng.int(MAX_PAGE_INDEX),
+              data: randomPageData(rng),
+            });
+          }
+          const metas: Array<{ path: string; meta: FileMeta }> = [];
+          for (let j = 0; j < metaCount; j++) {
+            metas.push({
+              path: rng.pick(FILE_PATHS),
+              meta: randomMeta(rng),
+            });
+          }
+          op = { type: "syncAll", pages, metas };
+        } else if (roll < 80) {
+          const count = 1 + rng.int(3);
+          const paths = new Set<string>();
+          for (let j = 0; j < count; j++) {
+            paths.add(rng.pick(FILE_PATHS));
+          }
+          op = { type: "deleteAll", paths: [...paths] };
+        } else if (roll < 90) {
+          op = {
+            type: "renameFile",
+            oldPath: rng.pick(FILE_PATHS),
+            newPath: rng.pick(FILE_PATHS),
+          };
+        } else {
+          op = { type: "deleteFile", path: rng.pick(FILE_PATHS) };
+        }
+        ops.push(op);
+      }
+
+      for (let i = 0; i < ops.length; i++) {
+        await executeOp(opfs, ops[i]);
+        await executeOp(mem, ops[i]);
+
+        if ((i + 1) % 5 === 0 || i === ops.length - 1) {
+          await verifyEquivalence(
+            opfs,
+            mem,
+            `deleteAll-heavy seed=${seed} after op ${i + 1}`,
+          );
+        }
+      }
+
+      await opfs.destroy();
+    }
+
+    const seeds = [500, 501, 502, 503, 504];
+    for (const seed of seeds) {
+      it(`seed ${seed}, 60 ops`, async () => {
+        await runDeleteAllFuzz(seed);
+      }, 20_000);
+    }
+  });
+
+  // cleanupOrphanedPages — verify that orphaned page directories (pages
+  // without corresponding metadata) are correctly identified and removed.
+  // This exercises the OPFS-specific recovery mechanism used during mount
+  // when a crash left pages behind without metadata.
+  describe("cleanupOrphanedPages verification", () => {
+    it("removes page dirs with no metadata after deleteAll partial simulation @fast", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      // Write pages and metadata for several files
+      for (const path of ["/x", "/y", "/z"]) {
+        await opfs.writePage(path, 0, randomPageData(new Rng(42)));
+        await opfs.writeMeta(path, { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 });
+      }
+
+      // Manually delete metadata only (simulating crash mid-deleteAll)
+      await opfs.deleteMeta("/x");
+      await opfs.deleteMeta("/z");
+
+      // Pages for /x and /z are now orphaned — no metadata
+      const orphans = await opfs.cleanupOrphanedPages();
+      expect(orphans).toBe(2);
+
+      // /y should still be intact
+      const files = await opfs.listFiles();
+      expect(files).toEqual(["/y"]);
+      const page = await opfs.readPage("/y", 0);
+      expect(page).not.toBeNull();
+
+      // Orphaned pages should be gone
+      expect(await opfs.readPage("/x", 0)).toBeNull();
+      expect(await opfs.readPage("/z", 0)).toBeNull();
+
+      await opfs.destroy();
+    });
+
+    it("no-ops when all pages have metadata", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      for (const path of ["/a", "/b"]) {
+        await opfs.writePage(path, 0, randomPageData(new Rng(99)));
+        await opfs.writeMeta(path, { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 });
+      }
+
+      const orphans = await opfs.cleanupOrphanedPages();
+      expect(orphans).toBe(0);
+
+      // All data intact
+      expect((await opfs.listFiles()).sort()).toEqual(["/a", "/b"]);
+
+      await opfs.destroy();
+    });
+
+    it("handles cleanup after fuzz sequence with deleteAll", async () => {
+      const rng = new Rng(777);
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      // Build up state
+      for (let i = 0; i < 20; i++) {
+        const path = rng.pick(FILE_PATHS);
+        await opfs.writePage(path, rng.int(MAX_PAGE_INDEX), randomPageData(rng));
+        await opfs.writeMeta(path, randomMeta(rng));
+      }
+
+      // deleteAll some paths
+      await opfs.deleteAll(["/a", "/c", "/e"]);
+
+      // After deleteAll, no orphans should exist
+      const orphans = await opfs.cleanupOrphanedPages();
+      expect(orphans).toBe(0);
+
+      // Now simulate partial failure: write pages without metadata
+      await opfs.writePage("/orphan1", 0, randomPageData(rng));
+      await opfs.writePage("/orphan2", 0, randomPageData(rng));
+
+      const orphans2 = await opfs.cleanupOrphanedPages();
+      expect(orphans2).toBe(2);
+
+      // Verify orphans are gone and legitimate files intact
+      expect(await opfs.readPage("/orphan1", 0)).toBeNull();
+      expect(await opfs.readPage("/orphan2", 0)).toBeNull();
+
+      await opfs.destroy();
+    });
+
+    it("idempotent — second cleanup returns 0", async () => {
+      const root = createFakeOpfsRoot();
+      const opfs = new OpfsBackend({ root: root as any });
+
+      await opfs.writePage("/stale", 0, randomPageData(new Rng(1)));
+      // No metadata → orphan
+
+      expect(await opfs.cleanupOrphanedPages()).toBe(1);
+      expect(await opfs.cleanupOrphanedPages()).toBe(0);
+
+      await opfs.destroy();
+    });
   });
 });
