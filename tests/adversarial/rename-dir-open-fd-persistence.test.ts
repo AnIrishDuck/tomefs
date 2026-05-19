@@ -583,11 +583,11 @@ describe("adversarial: directory rename with open descendant FDs + persistence",
     }
 
     // Verify page cache internal consistency
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     for (const fd of fds) FS.close(fd);
 
-    tomefs.pageCache.assertInvariants();
+    tomefs.assertInvariants();
 
     syncAndUnmount(FS, tomefs);
     const { FS: FS2, tomefs: tomefs2 } = await mountTome(backend, 8);
@@ -602,7 +602,7 @@ describe("adversarial: directory rename with open descendant FDs + persistence",
       expect(buf[PAGE_SIZE - 1]).toBe(0x10 + i);
     }
 
-    tomefs2.pageCache.assertInvariants();
+    tomefs2.assertInvariants();
   });
 
   // ------------------------------------------------------------------

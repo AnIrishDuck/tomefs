@@ -1273,7 +1273,7 @@ async function runPersistenceRoundtrip(
       closeAllFds(instance.rawFS, model, streams);
 
       // Validate page cache index consistency before persist
-      instance.tomefs.pageCache.assertInvariants();
+      instance.tomefs.assertInvariants();
 
       // Persist current state
       syncfs(instance.rawFS);
@@ -1285,7 +1285,7 @@ async function runPersistenceRoundtrip(
       streams = new Map();
 
       // Validate page cache index consistency after restore
-      instance.tomefs.pageCache.assertInvariants();
+      instance.tomefs.assertInvariants();
 
       // Verify backend structural integrity before remount
       const context = `remount after op ${i} (seed ${seed})`;
@@ -1306,7 +1306,7 @@ async function runPersistenceRoundtrip(
   closeAllFds(instance.rawFS, model, streams);
 
   // Validate page cache before final persist
-  instance.tomefs.pageCache.assertInvariants();
+  instance.tomefs.assertInvariants();
 
   // Final roundtrip: persist and verify one last time
   syncfs(instance.rawFS);
@@ -1320,7 +1320,7 @@ async function runPersistenceRoundtrip(
     );
   }
   instance = await createTomeFSInstance(backend, maxPages);
-  instance.tomefs.pageCache.assertInvariants();
+  instance.tomefs.assertInvariants();
   try {
     verifyAfterRemount(instance.rawFS, model, context);
   } catch (e) {
