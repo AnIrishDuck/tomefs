@@ -819,4 +819,92 @@ describe("IdbBackend", () => {
       }
     });
   });
+
+  // -------------------------------------------------------------------
+  // Durability option
+  // -------------------------------------------------------------------
+
+  describe("durability option", () => {
+    it("works with durability: strict", async () => {
+      const strictBackend = new IdbBackend({
+        dbName: `tomefs-strict-${dbCounter++}`,
+        durability: "strict",
+      });
+      try {
+        const data = filledPage(0xcc);
+        await strictBackend.writePage("/test", 0, data);
+        const result = await strictBackend.readPage("/test", 0);
+        expect(result).toEqual(data);
+      } finally {
+        await strictBackend.destroy();
+      }
+    });
+
+    it("works with durability: relaxed", async () => {
+      const relaxedBackend = new IdbBackend({
+        dbName: `tomefs-relaxed-${dbCounter++}`,
+        durability: "relaxed",
+      });
+      try {
+        const data = filledPage(0xdd);
+        await relaxedBackend.writePage("/test", 0, data);
+        const result = await relaxedBackend.readPage("/test", 0);
+        expect(result).toEqual(data);
+      } finally {
+        await relaxedBackend.destroy();
+      }
+    });
+
+    it("syncAll respects durability option", async () => {
+      const strictBackend = new IdbBackend({
+        dbName: `tomefs-sync-strict-${dbCounter++}`,
+        durability: "strict",
+      });
+      try {
+        await strictBackend.syncAll(
+          [{ path: "/f", pageIndex: 0, data: filledPage(0xab) }],
+          [{ path: "/f", meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 2 } }],
+        );
+        const page = await strictBackend.readPage("/f", 0);
+        expect(page).toEqual(filledPage(0xab));
+        const meta = await strictBackend.readMeta("/f");
+        expect(meta?.size).toBe(PAGE_SIZE);
+      } finally {
+        await strictBackend.destroy();
+      }
+    });
+
+    it("deleteAll respects durability option", async () => {
+      const strictBackend = new IdbBackend({
+        dbName: `tomefs-del-strict-${dbCounter++}`,
+        durability: "strict",
+      });
+      try {
+        await strictBackend.writePage("/a", 0, filledPage(0x11));
+        await strictBackend.writeMeta("/a", { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 2 });
+        await strictBackend.deleteAll(["/a"]);
+        expect(await strictBackend.readPage("/a", 0)).toBeNull();
+        expect(await strictBackend.readMeta("/a")).toBeNull();
+      } finally {
+        await strictBackend.destroy();
+      }
+    });
+
+    it("writePages batch respects durability option", async () => {
+      const strictBackend = new IdbBackend({
+        dbName: `tomefs-batch-strict-${dbCounter++}`,
+        durability: "strict",
+      });
+      try {
+        await strictBackend.writePages([
+          { path: "/x", pageIndex: 0, data: filledPage(0x01) },
+          { path: "/x", pageIndex: 1, data: filledPage(0x02) },
+        ]);
+        expect(await strictBackend.readPage("/x", 0)).toEqual(filledPage(0x01));
+        expect(await strictBackend.readPage("/x", 1)).toEqual(filledPage(0x02));
+      } finally {
+        await strictBackend.destroy();
+      }
+    });
+  });
 });
