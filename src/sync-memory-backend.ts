@@ -70,8 +70,56 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   writePages(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
   ): void {
+    if (pages.length === 0) return;
+    if (pages.length === 1) {
+      this.writePage(pages[0].path, pages[0].pageIndex, pages[0].data);
+      return;
+    }
+
+    // Batch by file path to amortize secondary index lookups.
+    // syncAll passes dirty pages from the cache — commonly 3-10 pages across
+    // 2-3 files (WAL + heap + index). Grouping avoids repeated Map.get calls
+    // for filePageKeys/filePageIndices/fileMaxIdx per page.
+    let prevPath = "";
+    let keys: Set<string> | undefined;
+    let indices: Map<number, string> | undefined;
+    let maxIdx = -1;
+
     for (const { path, pageIndex, data } of pages) {
-      this.writePage(path, pageIndex, data);
+      const key = pageKeyStr(path, pageIndex);
+      this.pages.set(key, new Uint8Array(data));
+
+      if (path !== prevPath) {
+        // Flush maxIdx for previous file
+        if (prevPath !== "" && maxIdx >= 0) {
+          const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+          if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
+        }
+
+        // Switch to new file's indexes
+        prevPath = path;
+        keys = this.filePageKeys.get(path);
+        if (!keys) {
+          keys = new Set();
+          this.filePageKeys.set(path, keys);
+        }
+        indices = this.filePageIndices.get(path);
+        if (!indices) {
+          indices = new Map();
+          this.filePageIndices.set(path, indices);
+        }
+        maxIdx = this.fileMaxIdx.get(path) ?? -1;
+      }
+
+      keys!.add(key);
+      indices!.set(pageIndex, key);
+      if (pageIndex > maxIdx) maxIdx = pageIndex;
+    }
+
+    // Flush maxIdx for the last file
+    if (prevPath !== "" && maxIdx >= 0) {
+      const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+      if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
     }
   }
 
