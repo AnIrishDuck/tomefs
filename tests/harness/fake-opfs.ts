@@ -87,6 +87,70 @@ class FakeWritableFileStream {
   }
 }
 
+/** Fake FileSystemSyncAccessHandle for testing createSyncAccessHandle(). */
+class FakeSyncAccessHandle {
+  private fileHandle: FakeFileHandle;
+  private closed = false;
+
+  constructor(fileHandle: FakeFileHandle) {
+    this.fileHandle = fileHandle;
+  }
+
+  read(buffer: ArrayBufferView, options?: { at?: number }): number {
+    if (this.closed) throw new DOMException("Handle is closed", "InvalidStateError");
+    const at = options?.at ?? 0;
+    const src = this.fileHandle.data;
+    const dst = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const available = Math.max(0, src.byteLength - at);
+    const bytesToRead = Math.min(dst.byteLength, available);
+    if (bytesToRead > 0) {
+      dst.set(src.subarray(at, at + bytesToRead));
+    }
+    if (bytesToRead < dst.byteLength) {
+      dst.fill(0, bytesToRead);
+    }
+    return bytesToRead;
+  }
+
+  write(buffer: ArrayBufferView, options?: { at?: number }): number {
+    if (this.closed) throw new DOMException("Handle is closed", "InvalidStateError");
+    const at = options?.at ?? 0;
+    const src = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const needed = at + src.byteLength;
+    if (needed > this.fileHandle.data.byteLength) {
+      const grown = new Uint8Array(needed);
+      grown.set(this.fileHandle.data);
+      this.fileHandle.data = grown;
+    }
+    this.fileHandle.data.set(src, at);
+    return src.byteLength;
+  }
+
+  truncate(size: number): void {
+    if (this.closed) throw new DOMException("Handle is closed", "InvalidStateError");
+    if (size < this.fileHandle.data.byteLength) {
+      this.fileHandle.data = this.fileHandle.data.slice(0, size);
+    } else if (size > this.fileHandle.data.byteLength) {
+      const grown = new Uint8Array(size);
+      grown.set(this.fileHandle.data);
+      this.fileHandle.data = grown;
+    }
+  }
+
+  getSize(): number {
+    if (this.closed) throw new DOMException("Handle is closed", "InvalidStateError");
+    return this.fileHandle.data.byteLength;
+  }
+
+  flush(): void {
+    if (this.closed) throw new DOMException("Handle is closed", "InvalidStateError");
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
 /** Fake FileSystemFileHandle backed by in-memory data. */
 class FakeFileHandle {
   readonly kind = "file" as const;
@@ -107,6 +171,10 @@ class FakeFileHandle {
     return new FakeWritableFileStream((committed) => {
       this.data = new Uint8Array(committed);
     });
+  }
+
+  async createSyncAccessHandle(): Promise<FakeSyncAccessHandle> {
+    return new FakeSyncAccessHandle(this);
   }
 }
 
