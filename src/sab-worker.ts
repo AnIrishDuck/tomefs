@@ -217,7 +217,7 @@ export class SabWorker {
               `WRITE_PAGES: dataLen ${pm.dataLen} at offset ${offset} exceeds binary length ${binary.length}`,
             );
           }
-          const data = binary.slice(offset, offset + pm.dataLen);
+          const data = binary.subarray(offset, offset + pm.dataLen);
           offset += pm.dataLen;
           return { path: pm.path, pageIndex: pm.pageIndex, data };
         });
@@ -402,7 +402,7 @@ export class SabWorker {
               `SYNC_ALL: dataLen ${pm.dataLen} at offset ${offset} exceeds binary length ${binary.length}`,
             );
           }
-          const data = binary.slice(offset, offset + pm.dataLen);
+          const data = binary.subarray(offset, offset + pm.dataLen);
           offset += pm.dataLen;
           return { path: pm.path, pageIndex: pm.pageIndex, data };
         });
