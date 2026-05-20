@@ -45,6 +45,10 @@ export class PreloadBackend implements SyncStorageBackend {
    *  Avoids string parsing (indexOf + parseInt) in maxPageIndex and deletePagesFrom. */
   private filePageIndices = new Map<string, Map<number, string>>();
 
+  /** Cached max page index per file for O(1) maxPageIndex lookups.
+   *  Updated on write/delete; -1 means no pages exist. */
+  private fileMaxIdx = new Map<string, number>();
+
   /** Pages that have been written locally but not yet flushed. */
   private dirtyPages = new Set<string>();
   /** Metadata entries that have been written locally but not yet flushed. */
@@ -92,6 +96,7 @@ export class PreloadBackend implements SyncStorageBackend {
     this.meta.clear();
     this.filePageKeys.clear();
     this.filePageIndices.clear();
+    this.fileMaxIdx.clear();
     this.dirtyPages.clear();
     this.dirtyMeta.clear();
     this.deletedFiles.clear();
@@ -166,6 +171,11 @@ export class PreloadBackend implements SyncStorageBackend {
       this.filePageIndices.set(path, indices);
     }
     indices.set(pageIndex, key);
+
+    const cur = this.fileMaxIdx.get(path) ?? -1;
+    if (pageIndex > cur) {
+      this.fileMaxIdx.set(path, pageIndex);
+    }
   }
 
   private assertInitialized(): void {
@@ -204,8 +214,60 @@ export class PreloadBackend implements SyncStorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
   ): void {
     this.assertInitialized();
+    if (pages.length === 0) return;
+    if (pages.length === 1) {
+      const { path, pageIndex, data } = pages[0];
+      const key = pageKeyStr(path, pageIndex);
+      this.pages.set(key, new Uint8Array(data));
+      this.trackPage(path, key, pageIndex);
+      this.dirtyPages.add(key);
+      return;
+    }
+
+    // Batch by file path to amortize secondary index lookups.
+    // syncAll passes dirty pages from the cache — commonly multiple pages
+    // from the same file. Grouping avoids repeated Map.get calls for
+    // filePageKeys/filePageIndices/fileMaxIdx per page.
+    let prevPath = "";
+    let keys: Set<string> | undefined;
+    let indices: Map<number, string> | undefined;
+    let maxIdx = -1;
+
     for (const { path, pageIndex, data } of pages) {
-      this.writePage(path, pageIndex, data);
+      const key = pageKeyStr(path, pageIndex);
+      this.pages.set(key, new Uint8Array(data));
+      this.dirtyPages.add(key);
+
+      if (path !== prevPath) {
+        // Flush maxIdx for previous file
+        if (prevPath !== "" && maxIdx >= 0) {
+          const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+          if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
+        }
+
+        prevPath = path;
+        keys = this.filePageKeys.get(path);
+        if (!keys) {
+          keys = new Set();
+          this.filePageKeys.set(path, keys);
+        }
+        indices = this.filePageIndices.get(path);
+        if (!indices) {
+          indices = new Map();
+          this.filePageIndices.set(path, indices);
+        }
+        maxIdx = this.fileMaxIdx.get(path) ?? -1;
+      }
+
+      keys!.add(key);
+      indices!.set(pageIndex, key);
+      if (pageIndex > maxIdx) maxIdx = pageIndex;
+    }
+
+    // Flush maxIdx for the last file
+    if (prevPath !== "" && maxIdx >= 0) {
+      const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+      if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
     }
   }
 
@@ -220,6 +282,7 @@ export class PreloadBackend implements SyncStorageBackend {
       this.filePageKeys.delete(path);
     }
     this.filePageIndices.delete(path);
+    this.fileMaxIdx.delete(path);
     this.deletedFiles.add(path);
     // Clear any pending truncation for this file
     this.truncations.delete(path);
@@ -238,13 +301,7 @@ export class PreloadBackend implements SyncStorageBackend {
 
   maxPageIndex(path: string): number {
     this.assertInitialized();
-    const indices = this.filePageIndices.get(path);
-    if (!indices || indices.size === 0) return -1;
-    let max = -1;
-    for (const idx of indices.keys()) {
-      if (idx > max) max = idx;
-    }
-    return max;
+    return this.fileMaxIdx.get(path) ?? -1;
   }
 
   maxPageIndexBatch(paths: string[]): number[] {
@@ -287,6 +344,7 @@ export class PreloadBackend implements SyncStorageBackend {
       return;
     }
 
+    const oldMax = this.fileMaxIdx.get(oldPath) ?? -1;
     const toAdd: Array<[number, string, Uint8Array]> = [];
     for (const [pageIndex, key] of oldIndices) {
       const data = this.pages.get(key)!;
@@ -299,11 +357,15 @@ export class PreloadBackend implements SyncStorageBackend {
     }
     this.filePageKeys.delete(oldPath);
     this.filePageIndices.delete(oldPath);
+    this.fileMaxIdx.delete(oldPath);
 
     for (const [pageIndex, key, data] of toAdd) {
       this.pages.set(key, data);
       this.trackPage(newPath, key, pageIndex);
       this.dirtyPages.add(key);
+    }
+    if (oldMax >= 0) {
+      this.fileMaxIdx.set(newPath, oldMax);
     }
     // Track as: delete old file + dirty-write all new pages
     this.deletedFiles.add(oldPath);
@@ -326,6 +388,16 @@ export class PreloadBackend implements SyncStorageBackend {
       if (indices.size === 0) {
         this.filePageIndices.delete(path);
         this.filePageKeys.delete(path);
+        this.fileMaxIdx.delete(path);
+      } else {
+        const prevMax = this.fileMaxIdx.get(path) ?? -1;
+        if (prevMax >= fromPageIndex) {
+          let newMax = -1;
+          for (const idx of indices.keys()) {
+            if (idx > newMax) newMax = idx;
+          }
+          this.fileMaxIdx.set(path, newMax);
+        }
       }
     }
     // Track the lowest truncation point
@@ -445,9 +517,57 @@ export class PreloadBackend implements SyncStorageBackend {
   async flush(): Promise<void> {
     this.assertInitialized();
 
-    // Partition dirty pages: pages at paths pending deletion must be
-    // written AFTER the delete (to handle delete-then-recreate at the
-    // same path). All other dirty pages are written first for crash safety.
+    // Fast path: no deletes, truncations, or metadata removals pending.
+    // This is the common steady-state case (normal writes without rename
+    // or unlink). Skip the O(dirty) early/late partitioning and write all
+    // dirty pages + metadata in a single syncAll call.
+    if (
+      this.deletedFiles.size === 0 &&
+      this.deletedMeta.size === 0 &&
+      this.truncations.size === 0
+    ) {
+      if (this.dirtyPages.size === 0 && this.dirtyMeta.size === 0) return;
+
+      const flushedPageKeys = new Set(this.dirtyPages);
+      const flushedMetaPaths = new Set(this.dirtyMeta);
+
+      const pageBatch: Array<{
+        path: string;
+        pageIndex: number;
+        data: Uint8Array;
+      }> = [];
+      for (const key of flushedPageKeys) {
+        const data = this.pages.get(key);
+        if (data) {
+          const nullIdx = key.indexOf("\0");
+          const path = key.substring(0, nullIdx);
+          const pageIndex = parseInt(key.substring(nullIdx + 1), 10);
+          pageBatch.push({ path, pageIndex, data });
+        }
+      }
+
+      const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
+      for (const path of flushedMetaPaths) {
+        const m = this.meta.get(path);
+        if (m) metaBatch.push({ path, meta: m });
+      }
+
+      if (pageBatch.length > 0 || metaBatch.length > 0) {
+        await this.remote.syncAll(pageBatch, metaBatch);
+      }
+
+      for (const key of flushedPageKeys) {
+        this.dirtyPages.delete(key);
+      }
+      for (const path of flushedMetaPaths) {
+        this.dirtyMeta.delete(path);
+      }
+      return;
+    }
+
+    // Complex path: deletes or truncations are pending. Partition dirty
+    // pages into early (pre-delete) and late (post-delete) batches to
+    // handle delete-then-recreate at the same path.
     // Snapshot the dirty keys we intend to flush. We must NOT clear
     // dirtyPages/dirtyMeta until all operations succeed — otherwise a
     // mid-flush failure loses dirty tracking and the data is never retried.

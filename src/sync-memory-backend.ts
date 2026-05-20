@@ -20,6 +20,10 @@ export class SyncMemoryBackend implements SyncStorageBackend {
    *  Avoids string parsing (indexOf + parseInt) in maxPageIndex and deletePagesFrom. */
   private filePageIndices = new Map<string, Map<number, string>>();
 
+  /** Cached max page index per file for O(1) maxPageIndex lookups.
+   *  Updated on write/delete; -1 means no pages exist. */
+  private fileMaxIdx = new Map<string, number>();
+
   /** Add a page key to the secondary indexes. */
   private trackPage(path: string, key: string, pageIndex: number): void {
     let keys = this.filePageKeys.get(path);
@@ -35,6 +39,11 @@ export class SyncMemoryBackend implements SyncStorageBackend {
       this.filePageIndices.set(path, indices);
     }
     indices.set(pageIndex, key);
+
+    const cur = this.fileMaxIdx.get(path) ?? -1;
+    if (pageIndex > cur) {
+      this.fileMaxIdx.set(path, pageIndex);
+    }
   }
 
   readPage(path: string, pageIndex: number): Uint8Array | null {
@@ -61,8 +70,56 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   writePages(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
   ): void {
+    if (pages.length === 0) return;
+    if (pages.length === 1) {
+      this.writePage(pages[0].path, pages[0].pageIndex, pages[0].data);
+      return;
+    }
+
+    // Batch by file path to amortize secondary index lookups.
+    // syncAll passes dirty pages from the cache — commonly 3-10 pages across
+    // 2-3 files (WAL + heap + index). Grouping avoids repeated Map.get calls
+    // for filePageKeys/filePageIndices/fileMaxIdx per page.
+    let prevPath = "";
+    let keys: Set<string> | undefined;
+    let indices: Map<number, string> | undefined;
+    let maxIdx = -1;
+
     for (const { path, pageIndex, data } of pages) {
-      this.writePage(path, pageIndex, data);
+      const key = pageKeyStr(path, pageIndex);
+      this.pages.set(key, new Uint8Array(data));
+
+      if (path !== prevPath) {
+        // Flush maxIdx for previous file
+        if (prevPath !== "" && maxIdx >= 0) {
+          const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+          if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
+        }
+
+        // Switch to new file's indexes
+        prevPath = path;
+        keys = this.filePageKeys.get(path);
+        if (!keys) {
+          keys = new Set();
+          this.filePageKeys.set(path, keys);
+        }
+        indices = this.filePageIndices.get(path);
+        if (!indices) {
+          indices = new Map();
+          this.filePageIndices.set(path, indices);
+        }
+        maxIdx = this.fileMaxIdx.get(path) ?? -1;
+      }
+
+      keys!.add(key);
+      indices!.set(pageIndex, key);
+      if (pageIndex > maxIdx) maxIdx = pageIndex;
+    }
+
+    // Flush maxIdx for the last file
+    if (prevPath !== "" && maxIdx >= 0) {
+      const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
+      if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
     }
   }
 
@@ -75,6 +132,7 @@ export class SyncMemoryBackend implements SyncStorageBackend {
       this.filePageKeys.delete(path);
     }
     this.filePageIndices.delete(path);
+    this.fileMaxIdx.delete(path);
   }
 
   deleteFiles(paths: string[]): void {
@@ -97,6 +155,16 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     if (indices.size === 0) {
       this.filePageIndices.delete(path);
       this.filePageKeys.delete(path);
+      this.fileMaxIdx.delete(path);
+    } else {
+      const prevMax = this.fileMaxIdx.get(path) ?? -1;
+      if (prevMax >= fromPageIndex) {
+        let newMax = -1;
+        for (const idx of indices.keys()) {
+          if (idx > newMax) newMax = idx;
+        }
+        this.fileMaxIdx.set(path, newMax);
+      }
     }
   }
 
@@ -109,13 +177,7 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   }
 
   maxPageIndex(path: string): number {
-    const indices = this.filePageIndices.get(path);
-    if (!indices || indices.size === 0) return -1;
-    let max = -1;
-    for (const idx of indices.keys()) {
-      if (idx > max) max = idx;
-    }
-    return max;
+    return this.fileMaxIdx.get(path) ?? -1;
   }
 
   maxPageIndexBatch(paths: string[]): number[] {
@@ -130,6 +192,7 @@ export class SyncMemoryBackend implements SyncStorageBackend {
 
     const oldIndices = this.filePageIndices.get(oldPath);
     if (!oldIndices) return;
+    const oldMax = this.fileMaxIdx.get(oldPath) ?? -1;
     const toAdd: Array<[number, string, Uint8Array]> = [];
     for (const [pageIndex, key] of oldIndices) {
       const data = this.pages.get(key)!;
@@ -139,9 +202,13 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     }
     this.filePageKeys.delete(oldPath);
     this.filePageIndices.delete(oldPath);
+    this.fileMaxIdx.delete(oldPath);
     for (const [pageIndex, key, data] of toAdd) {
       this.pages.set(key, data);
       this.trackPage(newPath, key, pageIndex);
+    }
+    if (oldMax >= 0) {
+      this.fileMaxIdx.set(newPath, oldMax);
     }
   }
 
