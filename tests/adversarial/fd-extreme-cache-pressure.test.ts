@@ -34,7 +34,6 @@ const O = {
 } as const;
 
 const SEEK_SET = 0;
-const SEEK_CUR = 1;
 const SEEK_END = 2;
 
 const MOUNT = "/tome";
@@ -80,10 +79,9 @@ function syncfs(FS: any): void {
 describe("adversarial: FD operations under 2-page cache pressure", () => {
   let FS: any;
   let backend: SyncMemoryBackend;
-  let tomefs: any;
 
   beforeEach(async () => {
-    ({ FS, backend, tomefs } = await createTestFS(2));
+    ({ FS, backend } = await createTestFS(2));
   });
 
   // ---------------------------------------------------------------

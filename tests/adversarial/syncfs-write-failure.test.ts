@@ -200,7 +200,7 @@ describe("syncfs write failure recovery", () => {
 
     const readBuf = new Uint8Array(256);
     const rfd = FS2.open(`${MOUNT}/file`, O.RDONLY);
-    const bytesRead = FS2.read(rfd, readBuf, 0, readBuf.length);
+    FS2.read(rfd, readBuf, 0, readBuf.length);
     FS2.close(rfd);
     expect(decode(readBuf, data2.length)).toBe("second write");
   });
@@ -269,7 +269,7 @@ describe("syncfs write failure recovery", () => {
 
     const readBuf = new Uint8Array(256);
     const rfd = FS2.open(`${MOUNT}/treetest`, O.RDONLY);
-    const bytesRead = FS2.read(rfd, readBuf, 0, readBuf.length);
+    FS2.read(rfd, readBuf, 0, readBuf.length);
     FS2.close(rfd);
     expect(decode(readBuf, data2.length)).toBe("updated tree walk data");
   });
@@ -278,7 +278,7 @@ describe("syncfs write failure recovery", () => {
     // This is the critical scenario: if dirty flags were cleared on failure,
     // eviction would silently discard the data.
     const backend = new FailOnSyncBackend();
-    const { FS, tomefs } = await createHarness(backend, 4); // tiny cache
+    const { FS } = await createHarness(backend, 4); // tiny cache
 
     // Fill cache with dirty pages from one file (4 pages = 32 KB)
     const fileData = new Uint8Array(PAGE_SIZE * 4);

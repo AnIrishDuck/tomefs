@@ -17,7 +17,6 @@ import {
   S_IFDIR,
   S_IFLNK,
   S_IRWXUGO,
-  S_IRWXU,
   S_IRUSR,
   S_IWUSR,
   S_IXUSR,

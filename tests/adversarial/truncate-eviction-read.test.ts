@@ -17,7 +17,6 @@
 import {
   createFS,
   O,
-  SEEK_SET,
   type FSHarness,
 } from "../harness/emscripten-fs.js";
 

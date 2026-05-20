@@ -6,7 +6,6 @@
  */
 import {
   createFS,
-  encode,
   expectErrno,
   O,
   type FSHarness,

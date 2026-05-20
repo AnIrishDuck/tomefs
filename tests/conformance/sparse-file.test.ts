@@ -19,11 +19,8 @@
  */
 import {
   createFS,
-  encode,
-  decode,
   O,
   SEEK_SET,
-  SEEK_END,
   type FSHarness,
 } from "../harness/emscripten-fs.js";
 

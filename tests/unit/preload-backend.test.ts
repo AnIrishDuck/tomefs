@@ -214,7 +214,6 @@ describe("PreloadBackend", () => {
       const backend = new PreloadBackend(counting);
 
       await backend.init();
-      const firstCallCount = counting.calls["listFiles"] ?? 0;
 
       counting.resetCounts();
       await backend.init();

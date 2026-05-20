@@ -13,7 +13,6 @@ import {
   encode,
   decode,
   O,
-  SEEK_SET,
   type FSHarness,
 } from "../harness/emscripten-fs.js";
 

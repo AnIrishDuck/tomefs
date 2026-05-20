@@ -11,7 +11,7 @@
 import { createTomeFSPGlite } from "../../src/pglite-fs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import type { SyncStorageBackend } from "../../src/sync-storage-backend.js";
-import { FakeServer, type SyncStatus, type Blob } from "./fake-tributary.js";
+import { FakeServer, type SyncStatus } from "./fake-tributary.js";
 
 /** Cache size configurations matching existing test conventions. */
 export const CACHE_CONFIGS = {

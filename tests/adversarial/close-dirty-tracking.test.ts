@@ -14,10 +14,8 @@
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import {
-  createFS,
   encode,
   O,
-  type FSHarness,
 } from "../harness/emscripten-fs.js";
 
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";

@@ -106,7 +106,7 @@ describe("tomefs + PreloadBackend (no SAB)", () => {
       // Write through tomefs
       const backend1 = new PreloadBackend(remote);
       await backend1.init();
-      const { FS: FS1, tomefs: tf1 } = await mountTomeFS(backend1);
+      const { FS: FS1 } = await mountTomeFS(backend1);
 
       writeFile(FS1, "/data/persist.txt", "durable");
       FS1.mkdir("/data/subdir");

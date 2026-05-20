@@ -1038,7 +1038,7 @@ function syncfs(rawFS: any): void {
  */
 function verifyBackendIntegrity(
   backend: SyncMemoryBackend,
-  model: FSModel,
+  _model: FSModel,
   context: string,
 ): void {
   const backendFiles = backend.listFiles();

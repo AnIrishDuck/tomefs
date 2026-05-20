@@ -28,7 +28,6 @@ import { dirname, join } from "path";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
-import { PAGE_SIZE } from "../../src/types.js";
 import type { SyncStorageBackend } from "../../src/sync-storage-backend.js";
 import type { FileMeta } from "../../src/types.js";
 
@@ -499,7 +498,7 @@ describe("crash recovery: rename after syncfs", () => {
     expect(inner.readMeta(CLEAN_MARKER_PATH)).toBeNull();
 
     // Remount: should trigger full tree walk on first syncfs
-    const { FS: FS2, tomefs: tomefs2 } = await mountTome(inner);
+    const { FS: FS2 } = await mountTome(inner);
 
     // Verify the file is accessible (rename completed in backend)
     const buf = new Uint8Array(data.length);

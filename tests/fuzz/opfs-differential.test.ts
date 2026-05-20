@@ -19,7 +19,7 @@
  * Ethos §9: "Write tests designed to break tomefs specifically"
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { OpfsBackend } from "../../src/opfs-backend.js";
 import { MemoryBackend } from "../../src/memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";

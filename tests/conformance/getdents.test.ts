@@ -12,7 +12,6 @@
 import {
   createFS,
   encode,
-  expectErrno,
   O,
   S_IFMT,
   S_IFREG,

@@ -16,7 +16,6 @@ import {
   S_IFREG,
   S_IFDIR,
   S_IFLNK,
-  S_IRWXUGO,
   type FSHarness,
 } from "../harness/emscripten-fs.js";
 

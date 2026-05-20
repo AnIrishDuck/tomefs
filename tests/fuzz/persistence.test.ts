@@ -415,36 +415,6 @@ function generateOp(rng: Rng, model: Model): Op {
   }
 }
 
-function formatOp(op: Op, index: number): string {
-  switch (op.type) {
-    case "createFile": return `[${index}] create(${op.path}, ${op.data.length}B)`;
-    case "writeAt": return `[${index}] write(${op.path}, @${op.offset}, ${op.data.length}B)`;
-    case "truncate": return `[${index}] truncate(${op.path}, ${op.size})`;
-    case "renameFile": return `[${index}] rename(${op.oldPath} -> ${op.newPath})`;
-    case "renameDir": return `[${index}] renameDir(${op.oldPath} -> ${op.newPath})`;
-    case "unlink": return `[${index}] unlink(${op.path})`;
-    case "mkdir": return `[${index}] mkdir(${op.path})`;
-    case "rmdir": return `[${index}] rmdir(${op.path})`;
-    case "symlink": return `[${index}] symlink(${op.target} -> ${op.path})`;
-    case "unlinkSymlink": return `[${index}] unlinkSymlink(${op.path})`;
-    case "renameSymlink": return `[${index}] renameSymlink(${op.oldPath} -> ${op.newPath})`;
-    case "chmodFile": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
-    case "chmodDir": return `[${index}] chmod(${op.path}, 0o${op.mode.toString(8)})`;
-    case "openFd": return `[${index}] openFd(${op.path}, fd#${op.fdId})`;
-    case "writeFd": return `[${index}] writeFd(fd#${op.fdId}, ${op.data.length}B)`;
-    case "closeFd": return `[${index}] closeFd(fd#${op.fdId})`;
-    case "dupFd": return `[${index}] dupFd(fd#${op.srcFdId} -> fd#${op.newFdId})`;
-    case "seekFd": return `[${index}] seekFd(fd#${op.fdId}, ${op.offset}, whence=${op.whence})`;
-    case "ftruncateFd": return `[${index}] ftruncateFd(fd#${op.fdId}, ${op.size})`;
-    case "appendWrite": return `[${index}] appendWrite(${op.path}, ${op.data.length}B)`;
-    case "allocate": return `[${index}] allocate(${op.path}, @${op.offset}, ${op.length})`;
-    case "utime": return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
-    case "mmapWriteAt": return `[${index}] mmapWriteAt(${op.path}, @${op.position}, ${op.data.length}B)`;
-
-    case "checkpoint": return `[${index}] CHECKPOINT`;
-  }
-}
-
 // ---------------------------------------------------------------
 // Model update
 // ---------------------------------------------------------------
@@ -1037,7 +1007,7 @@ function verifyModel(FS: EmscriptenFS, model: Model, context: string): void {
 
 /** Close all open fds on a harness and clear them from the model. */
 function closeAllFds(harness: PersistenceHarness, model: Model): void {
-  for (const [fdId, stream] of harness.liveStreams) {
+  for (const [_fdId, stream] of harness.liveStreams) {
     try { harness.FS.close(stream); } catch { /* already closed or invalid */ }
   }
   harness.liveStreams.clear();

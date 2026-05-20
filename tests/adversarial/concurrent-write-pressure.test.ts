@@ -39,16 +39,6 @@ const O = {
 const MOUNT = "/tome";
 const MAX_PAGES = 4; // 32 KB cache — extreme pressure
 
-function encode(s: string): Uint8Array {
-  return new TextEncoder().encode(s);
-}
-
-function decode(buf: Uint8Array, length?: number): string {
-  return new TextDecoder().decode(
-    length !== undefined ? buf.subarray(0, length) : buf,
-  );
-}
-
 /** Fill a buffer with a deterministic pattern based on a seed byte. */
 function fillPattern(size: number, seed: number): Uint8Array {
   const buf = new Uint8Array(size);

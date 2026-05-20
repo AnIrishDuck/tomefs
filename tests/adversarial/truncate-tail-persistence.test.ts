@@ -31,15 +31,6 @@ const O = {
   TRUNC: 512,
 } as const;
 
-function encode(s: string): Uint8Array {
-  return new TextEncoder().encode(s);
-}
-
-function decode(buf: Uint8Array, length?: number): string {
-  return new TextDecoder().decode(
-    length !== undefined ? buf.subarray(0, length) : buf,
-  );
-}
 
 /**
  * Mount tomefs with a specific cache size. Small caches force eviction

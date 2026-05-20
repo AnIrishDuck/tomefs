@@ -58,7 +58,7 @@ describe("PageCache", () => {
       data[0] = 1;
       await backend.writePage("/test", 0, data);
 
-      const page1 = await cache.getPage("/test", 0);
+      await cache.getPage("/test", 0);
       // Modify backend — cache should not re-read
       const data2 = new Uint8Array(PAGE_SIZE);
       data2[0] = 99;

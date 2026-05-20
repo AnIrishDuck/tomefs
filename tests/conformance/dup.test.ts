@@ -12,11 +12,9 @@ import {
   createFS,
   encode,
   decode,
-  expectErrno,
   O,
   SEEK_SET,
   SEEK_CUR,
-  SEEK_END,
   type FSHarness,
 } from "../harness/emscripten-fs.js";
 

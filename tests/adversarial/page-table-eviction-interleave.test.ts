@@ -20,7 +20,7 @@
  */
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
@@ -35,8 +35,6 @@ const O = {
   TRUNC: 512,
   APPEND: 1024,
 } as const;
-
-const SEEK_SET = 0;
 
 const MOUNT = "/tome";
 

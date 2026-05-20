@@ -5,7 +5,7 @@
  * to verify the cache preserves data integrity under backend failures.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { SyncPageCache } from "../../src/sync-page-cache.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PageCache } from "../../src/page-cache.js";
