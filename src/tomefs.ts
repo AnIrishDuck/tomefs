@@ -201,10 +201,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         page = pageCache.getPage(node.storagePath, firstPage);
         node._pages[firstPage] = page;
       }
-      buffer.set(
-        page.data.subarray(pageOffset, pageOffset + toRead),
-        offset,
-      );
+      if (pageOffset === 0 && toRead === PAGE_SIZE) {
+        buffer.set(page.data, offset);
+      } else {
+        buffer.set(
+          page.data.subarray(pageOffset, pageOffset + toRead),
+          offset,
+        );
+      }
       return toRead;
     }
 
@@ -223,13 +227,25 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         }
       }
       if (allCached) {
+        // Two-page specialization: eliminates loop overhead for the common
+        // case of reads straddling a single page boundary.
+        if (lastPage === firstPage + 1) {
+          const n1 = PAGE_SIZE - pageOffset;
+          buffer.set(pages[firstPage].data.subarray(pageOffset), offset);
+          buffer.set(pages[lastPage].data.subarray(0, toRead - n1), offset + n1);
+          return toRead;
+        }
         let bytesRead = 0;
         let pos = position;
         while (bytesRead < toRead) {
           const pi = pos >>> PAGE_SHIFT;
           const po = pos & PAGE_MASK;
           const n = Math.min(PAGE_SIZE - po, toRead - bytesRead);
-          buffer.set(pages[pi].data.subarray(po, po + n), offset + bytesRead);
+          if (po === 0 && n === PAGE_SIZE) {
+            buffer.set(pages[pi].data, offset + bytesRead);
+          } else {
+            buffer.set(pages[pi].data.subarray(po, po + n), offset + bytesRead);
+          }
           bytesRead += n;
           pos += n;
         }
@@ -319,6 +335,31 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         }
       }
       if (allCached) {
+        // Two-page specialization: eliminates loop overhead for the common
+        // case of writes straddling a single page boundary.
+        if (lastPage === firstPage + 1) {
+          const n1 = PAGE_SIZE - pageOffset;
+          const page1 = pages[firstPage];
+          page1.data.set(
+            buffer.subarray(offset, offset + n1),
+            pageOffset,
+          );
+          if (!page1.dirty) {
+            page1.dirty = true;
+            pageCache.addDirtyKey(page1.key, node.storagePath);
+          }
+          const page2 = pages[lastPage];
+          page2.data.set(
+            buffer.subarray(offset + n1, offset + length),
+            0,
+          );
+          if (!page2.dirty) {
+            page2.dirty = true;
+            pageCache.addDirtyKey(page2.key, node.storagePath);
+          }
+          node.usedBytes = Math.max(node.usedBytes, position + length);
+          return length;
+        }
         let bytesWritten = 0;
         let pos = position;
         while (bytesWritten < length) {
