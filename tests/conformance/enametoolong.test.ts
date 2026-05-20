@@ -13,7 +13,7 @@ import {
 } from "../harness/emscripten-fs.js";
 
 const describeIfTomefs =
-  process.env.TOMEFS_BACKEND === "tomefs" ? describe : describe.skip;
+  process.env.TOMEFS_BACKEND ? describe : describe.skip;
 
 describeIfTomefs("ENAMETOOLONG enforcement (tomefs only)", () => {
   let h: FSHarness;

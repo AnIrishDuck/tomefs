@@ -60,7 +60,7 @@ describe("readdir (test_readdir.c)", () => {
   // Root and /dev listing tests only apply to MEMFS — under tomefs, "/" is
   // rewritten to the mount point which doesn't contain system directories.
   const itIfMemfs =
-    process.env.TOMEFS_BACKEND === "tomefs" ? it.skip : it;
+    process.env.TOMEFS_BACKEND ? it.skip : it;
 
   itIfMemfs("readdir on root contains expected directories", () => {
     const { FS } = h;
