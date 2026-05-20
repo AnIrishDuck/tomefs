@@ -1545,6 +1545,92 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       }
     },
 
+    assertInvariants() {
+      const errors: string[] = [];
+
+      const seenStoragePaths = new Map<string, any>();
+
+      for (const node of allFileNodes) {
+        if (!FS.isFile(node.mode)) {
+          errors.push(
+            `allFileNodes contains non-file node (mode=${node.mode.toString(8)}, path=${node.storagePath})`,
+          );
+        }
+
+        if (typeof node.storagePath !== "string" || node.storagePath === "") {
+          errors.push(`file node has invalid storagePath: ${JSON.stringify(node.storagePath)}`);
+          continue;
+        }
+
+        if (typeof node.usedBytes !== "number" || node.usedBytes < 0) {
+          errors.push(
+            `file node ${node.storagePath} has invalid usedBytes: ${node.usedBytes}`,
+          );
+        }
+
+        if (typeof node.openCount !== "number" || node.openCount < 0) {
+          errors.push(
+            `file node ${node.storagePath} has invalid openCount: ${node.openCount}`,
+          );
+        }
+
+        if (node.unlinked && node.openCount === 0) {
+          errors.push(
+            `allFileNodes contains unlinked node with openCount=0: ${node.storagePath} (should have been removed)`,
+          );
+        }
+
+        if (!node.unlinked) {
+          if (!node.parent) {
+            errors.push(
+              `non-unlinked file node ${node.storagePath} has no parent`,
+            );
+          } else if (!node.parent.contents || node.parent.contents[node.name] !== node) {
+            errors.push(
+              `non-unlinked file node ${node.storagePath} not found in parent.contents[${node.name}]`,
+            );
+          }
+        }
+
+        const prev = seenStoragePaths.get(node.storagePath);
+        if (prev) {
+          errors.push(
+            `duplicate storagePath ${node.storagePath} shared by two file nodes`,
+          );
+        } else {
+          seenStoragePaths.set(node.storagePath, node);
+        }
+
+        if (!Array.isArray(node._pages)) {
+          errors.push(
+            `file node ${node.storagePath} has non-array _pages: ${typeof node._pages}`,
+          );
+        }
+      }
+
+      for (const node of dirtyMetaNodes) {
+        if (!node._metaDirty) {
+          errors.push(
+            `dirtyMetaNodes contains node with _metaDirty=false (mode=${node.mode.toString(8)})`,
+          );
+        }
+
+        if (FS.isFile(node.mode) && !allFileNodes.has(node) && !(node.unlinked && node.openCount === 0)) {
+          errors.push(
+            `dirtyMetaNodes contains file node not in allFileNodes: ${node.storagePath}`,
+          );
+        }
+      }
+
+      pageCache.assertInvariants();
+
+      if (errors.length > 0) {
+        throw new Error(
+          `tomefs invariant violations (${errors.length}):\n  - ${errors.join("\n  - ")}`,
+        );
+      }
+    },
+
     createNode(parent: any, name: string, mode: number, dev: number) {
       if (FS.isBlkdev(mode) || FS.isFIFO(mode)) {
         throw new FS.ErrnoError(63); // EPERM
