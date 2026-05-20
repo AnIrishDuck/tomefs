@@ -91,7 +91,8 @@ type Op =
   | { type: "writeMetas"; entries: Array<{ path: string; meta: FileMeta }> }
   | { type: "deleteMeta"; path: string }
   | { type: "deleteMetas"; paths: string[] }
-  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> };
+  | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> }
+  | { type: "deleteAll"; paths: string[] };
 
 const FILE_PATHS = ["/a", "/b", "/c", "/d", "/sub/x", "/sub/y"];
 const MAX_PAGE_INDEX = 5;
@@ -129,6 +130,7 @@ function generateOps(rng: Rng, count: number): Op[] {
       ["deleteMeta", knownPaths.size > 0 ? 5 : 0],
       ["deleteMetas", knownPaths.size > 1 ? 3 : 0],
       ["syncAll", knownPaths.size > 0 ? 6 : 2],
+      ["deleteAll", knownPaths.size > 1 ? 4 : 0],
     ];
 
     const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -240,6 +242,13 @@ function generateOps(rng: Rng, count: number): Op[] {
         ops.push({ type: "syncAll", pages, metas });
         break;
       }
+
+      case "deleteAll": {
+        const count = 1 + rng.int(Math.min(3, knownPaths.size));
+        const paths = [...knownPaths].slice(0, count);
+        ops.push({ type: "deleteAll", paths });
+        break;
+      }
     }
   }
 
@@ -284,6 +293,9 @@ async function executeOp(backend: StorageBackend, op: Op): Promise<void> {
       break;
     case "syncAll":
       await backend.syncAll(op.pages, op.metas);
+      break;
+    case "deleteAll":
+      await backend.deleteAll(op.paths);
       break;
   }
 }
@@ -387,6 +399,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] deleteMetas(${op.paths.join(", ")})`;
     case "syncAll":
       return `[${index}] syncAll(${op.pages.length} pages, ${op.metas.length} metas)`;
+    case "deleteAll":
+      return `[${index}] deleteAll(${op.paths.join(", ")})`;
   }
 }
 
@@ -471,6 +485,15 @@ describe("IDB backend differential fuzz", () => {
     for (const seed of [6000, 6001, 6002, 6003, 6004]) {
       it(`seed ${seed}: 60 ops`, async () => {
         await runSyncAllHeavySeed(seed, 60);
+      });
+    }
+  });
+
+  // deleteAll-heavy: exercises atomic multi-store delete (pages + metadata)
+  describe("deleteAll-heavy sequences", () => {
+    for (const seed of [7000, 7001, 7002, 7003, 7004]) {
+      it(`seed ${seed}: 60 ops`, async () => {
+        await runDeleteAllHeavySeed(seed, 60);
       });
     }
   });
@@ -667,6 +690,132 @@ async function runSyncAllHeavySeed(seed: number, opCount: number): Promise<void>
 
       if ((i + 1) % 5 === 0 || i === ops.length - 1) {
         await compareState(idb, mem, `syncall-heavy seed=${seed} after op ${i}`);
+      }
+    }
+  } finally {
+    idb.close();
+    await idb.destroy();
+  }
+}
+
+async function runDeleteAllHeavySeed(seed: number, opCount: number): Promise<void> {
+  const rng = new Rng(seed);
+  const ops: Op[] = [];
+  const knownPaths = new Set<string>();
+
+  for (let i = 0; i < opCount; i++) {
+    const weights: [string, number][] = [
+      ["writePage", 10],
+      ["writePages", 5],
+      ["writeMeta", 8],
+      ["writeMetas", 4],
+      ["syncAll", 6],
+      ["deleteAll", knownPaths.size > 0 ? 15 : 0],
+      ["deleteFile", knownPaths.size > 0 ? 3 : 0],
+      ["renameFile", knownPaths.size > 0 ? 4 : 0],
+    ];
+
+    const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
+    let r = rng.int(totalWeight);
+    let opType = weights[0][0];
+    for (const [t, w] of weights) {
+      r -= w;
+      if (r < 0) {
+        opType = t;
+        break;
+      }
+    }
+
+    switch (opType) {
+      case "writePage": {
+        const path = rng.pick(FILE_PATHS);
+        knownPaths.add(path);
+        ops.push({
+          type: "writePage",
+          path,
+          pageIndex: rng.int(MAX_PAGE_INDEX),
+          data: rng.bytes(PAGE_SIZE),
+        });
+        break;
+      }
+      case "writePages": {
+        const pageCount = 1 + rng.int(4);
+        const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
+        for (let p = 0; p < pageCount; p++) {
+          const path = rng.pick(FILE_PATHS);
+          knownPaths.add(path);
+          pages.push({ path, pageIndex: rng.int(MAX_PAGE_INDEX), data: rng.bytes(PAGE_SIZE) });
+        }
+        ops.push({ type: "writePages", pages });
+        break;
+      }
+      case "writeMeta": {
+        const path = rng.pick(FILE_PATHS);
+        knownPaths.add(path);
+        ops.push({ type: "writeMeta", path, meta: randomMeta(rng) });
+        break;
+      }
+      case "writeMetas": {
+        const entryCount = 1 + rng.int(4);
+        const entries: Array<{ path: string; meta: FileMeta }> = [];
+        for (let e = 0; e < entryCount; e++) {
+          const path = rng.pick(FILE_PATHS);
+          knownPaths.add(path);
+          entries.push({ path, meta: randomMeta(rng) });
+        }
+        ops.push({ type: "writeMetas", entries });
+        break;
+      }
+      case "syncAll": {
+        const pageCount = 1 + rng.int(4);
+        const metaCount = 1 + rng.int(3);
+        const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
+        for (let p = 0; p < pageCount; p++) {
+          const path = rng.pick(FILE_PATHS);
+          knownPaths.add(path);
+          pages.push({ path, pageIndex: rng.int(MAX_PAGE_INDEX), data: rng.bytes(PAGE_SIZE) });
+        }
+        const metas: Array<{ path: string; meta: FileMeta }> = [];
+        for (let m = 0; m < metaCount; m++) {
+          const path = rng.pick(FILE_PATHS);
+          knownPaths.add(path);
+          metas.push({ path, meta: randomMeta(rng) });
+        }
+        ops.push({ type: "syncAll", pages, metas });
+        break;
+      }
+      case "deleteAll": {
+        const count = 1 + rng.int(Math.min(3, knownPaths.size));
+        const paths = [...knownPaths].slice(0, count);
+        ops.push({ type: "deleteAll", paths });
+        break;
+      }
+      case "deleteFile": {
+        const path = rng.pick([...knownPaths]);
+        ops.push({ type: "deleteFile", path });
+        break;
+      }
+      case "renameFile": {
+        const oldPath = rng.pick([...knownPaths]);
+        const newPath = rng.pick(FILE_PATHS);
+        knownPaths.add(newPath);
+        ops.push({ type: "renameFile", oldPath, newPath });
+        break;
+      }
+    }
+  }
+
+  let dbCounter = 0;
+  const idb = new IdbBackend({ dbName: `fuzz_deleteall_${seed}_${dbCounter++}` });
+  const mem = new MemoryBackend();
+
+  try {
+    for (let i = 0; i < ops.length; i++) {
+      await executeOp(idb, ops[i]);
+      await executeOp(mem, ops[i]);
+
+      if ((i + 1) % 5 === 0 || i === ops.length - 1) {
+        await compareState(idb, mem, `deleteAll-heavy seed=${seed} after op ${i}`);
       }
     }
   } finally {
