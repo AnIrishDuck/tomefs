@@ -107,6 +107,10 @@ function randomMeta(rng: Rng): FileMeta {
   };
 }
 
+function randomPage(rng: Rng): Uint8Array {
+  return rng.bytes(PAGE_SIZE);
+}
+
 // ---------------------------------------------------------------
 // Operation generator
 // ---------------------------------------------------------------
@@ -496,6 +500,148 @@ describe("IDB backend differential fuzz", () => {
         await runDeleteAllHeavySeed(seed, 60);
       });
     }
+  });
+
+  // cleanupOrphanedPages — verify that orphaned pages (pages in the pages
+  // store without corresponding metadata in the meta store) are correctly
+  // identified and removed. This exercises the IDB-specific crash recovery
+  // mechanism for scenarios where page eviction wrote pages to the backend
+  // but the process crashed before the next syncfs wrote metadata.
+  describe("cleanupOrphanedPages verification", () => {
+    it("removes pages with no metadata after partial deleteAll simulation @fast", async () => {
+      let dbCounter = 0;
+      const idb = new IdbBackend({ dbName: `fuzz_cleanup_partial_${dbCounter++}` });
+
+      try {
+        for (const path of ["/x", "/y", "/z"]) {
+          await idb.writePage(path, 0, randomPage(new Rng(42)));
+          await idb.writeMeta(path, { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 });
+        }
+
+        // Simulate crash mid-deleteAll: metadata deleted but pages remain
+        await idb.deleteMeta("/x");
+        await idb.deleteMeta("/z");
+
+        const orphans = await idb.cleanupOrphanedPages();
+        expect(orphans).toBe(2);
+
+        // /y should still be intact
+        const files = await idb.listFiles();
+        expect(files).toEqual(["/y"]);
+        expect(await idb.readPage("/y", 0)).not.toBeNull();
+
+        // Orphaned pages should be gone
+        expect(await idb.readPage("/x", 0)).toBeNull();
+        expect(await idb.readPage("/z", 0)).toBeNull();
+      } finally {
+        idb.close();
+        await idb.destroy();
+      }
+    });
+
+    it("no-ops when all pages have metadata @fast", async () => {
+      let dbCounter = 0;
+      const idb = new IdbBackend({ dbName: `fuzz_cleanup_noop_${dbCounter++}` });
+
+      try {
+        for (const path of ["/a", "/b"]) {
+          await idb.writePage(path, 0, randomPage(new Rng(99)));
+          await idb.writeMeta(path, { size: PAGE_SIZE, mode: 0o100644, ctime: 1000, mtime: 2000 });
+        }
+
+        const orphans = await idb.cleanupOrphanedPages();
+        expect(orphans).toBe(0);
+        expect((await idb.listFiles()).sort()).toEqual(["/a", "/b"]);
+      } finally {
+        idb.close();
+        await idb.destroy();
+      }
+    });
+
+    it("handles cleanup after fuzz sequence with deleteAll", async () => {
+      const rng = new Rng(777);
+      let dbCounter = 0;
+      const idb = new IdbBackend({ dbName: `fuzz_cleanup_post_${dbCounter++}` });
+
+      try {
+        // Build up state
+        for (let i = 0; i < 20; i++) {
+          const path = rng.pick(FILE_PATHS);
+          await idb.writePage(path, rng.int(MAX_PAGE_INDEX), randomPage(rng));
+          await idb.writeMeta(path, randomMeta(rng));
+        }
+
+        // deleteAll some paths
+        await idb.deleteAll(["/a", "/c", "/sub/x"]);
+
+        // After deleteAll, no orphans should exist
+        const orphans = await idb.cleanupOrphanedPages();
+        expect(orphans).toBe(0);
+
+        // Simulate partial failure: write pages without metadata
+        await idb.writePage("/orphan1", 0, randomPage(rng));
+        await idb.writePage("/orphan2", 0, randomPage(rng));
+
+        const orphans2 = await idb.cleanupOrphanedPages();
+        expect(orphans2).toBe(2);
+
+        expect(await idb.readPage("/orphan1", 0)).toBeNull();
+        expect(await idb.readPage("/orphan2", 0)).toBeNull();
+      } finally {
+        idb.close();
+        await idb.destroy();
+      }
+    });
+
+    it("idempotent — second cleanup returns 0 @fast", async () => {
+      let dbCounter = 0;
+      const idb = new IdbBackend({ dbName: `fuzz_cleanup_idem_${dbCounter++}` });
+
+      try {
+        await idb.writePage("/stale", 0, randomPage(new Rng(1)));
+
+        expect(await idb.cleanupOrphanedPages()).toBe(1);
+        expect(await idb.cleanupOrphanedPages()).toBe(0);
+      } finally {
+        idb.close();
+        await idb.destroy();
+      }
+    });
+
+    it("cleans up multi-page orphans across many paths", async () => {
+      let dbCounter = 0;
+      const idb = new IdbBackend({ dbName: `fuzz_cleanup_multi_${dbCounter++}` });
+      const rng = new Rng(12345);
+
+      try {
+        // Write pages for 4 files, metadata for only 2
+        for (const path of ["/keep1", "/keep2"]) {
+          for (let pi = 0; pi < 3; pi++) {
+            await idb.writePage(path, pi, randomPage(rng));
+          }
+          await idb.writeMeta(path, randomMeta(rng));
+        }
+        for (const path of ["/orphan1", "/orphan2"]) {
+          for (let pi = 0; pi < 4; pi++) {
+            await idb.writePage(path, pi, randomPage(rng));
+          }
+        }
+
+        const orphans = await idb.cleanupOrphanedPages();
+        expect(orphans).toBe(2);
+
+        // Kept files intact
+        expect(await idb.countPages("/keep1")).toBe(3);
+        expect(await idb.countPages("/keep2")).toBe(3);
+
+        // Orphans gone
+        expect(await idb.countPages("/orphan1")).toBe(0);
+        expect(await idb.countPages("/orphan2")).toBe(0);
+      } finally {
+        idb.close();
+        await idb.destroy();
+      }
+    });
   });
 });
 

@@ -565,6 +565,85 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  /**
+   * Remove pages whose path has no corresponding metadata entry.
+   *
+   * Scans the pages store for all unique paths, checks each against the
+   * meta store, and deletes all page entries for orphaned paths. Returns
+   * the number of orphaned paths cleaned up.
+   *
+   * Orphaned pages can accumulate when a crash occurs between a page
+   * eviction (which writes pages via writePages) and the next syncfs
+   * (which writes metadata via syncAll). The pages exist in the pages
+   * store but have no metadata entry — invisible to listFiles() and
+   * unreachable via the normal restore path.
+   */
+  async cleanupOrphanedPages(): Promise<number> {
+    const db = await this.getDb();
+
+    // Phase 1: collect all unique paths from the pages store and all
+    // paths from the meta store in a single readonly transaction.
+    const { pagePaths, metaPaths } = await new Promise<{
+      pagePaths: Set<string>;
+      metaPaths: Set<string>;
+    }>((resolve, reject) => {
+      const tx = db.transaction([PAGES_STORE, META_STORE], "readonly");
+      const pageStore = tx.objectStore(PAGES_STORE);
+      const metaStore = tx.objectStore(META_STORE);
+
+      const pagePaths = new Set<string>();
+      const metaPaths = new Set<string>();
+
+      const cursorReq = pageStore.openKeyCursor();
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (cursor) {
+          const [path] = cursor.key as [string, number];
+          pagePaths.add(path);
+          cursor.continue();
+        }
+      };
+
+      const metaReq = metaStore.getAllKeys();
+      metaReq.onsuccess = () => {
+        for (const key of metaReq.result) {
+          metaPaths.add(key as string);
+        }
+      };
+
+      tx.oncomplete = () => resolve({ pagePaths, metaPaths });
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
+    });
+
+    // Phase 2: identify orphaned paths (pages exist, no metadata).
+    const orphanPaths: string[] = [];
+    for (const path of pagePaths) {
+      if (!metaPaths.has(path)) {
+        orphanPaths.push(path);
+      }
+    }
+
+    if (orphanPaths.length === 0) return 0;
+
+    // Phase 3: delete all pages for orphaned paths in a single transaction.
+    await new Promise<void>((resolve, reject) => {
+      const tx = this.rwTransaction(db, PAGES_STORE);
+      const store = tx.objectStore(PAGES_STORE);
+
+      for (const path of orphanPaths) {
+        const range = IDBKeyRange.bound([path, 0], [path, ""], false, true);
+        store.delete(range);
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
+    });
+
+    return orphanPaths.length;
+  }
+
   /** Close the database connection. */
   close(): void {
     if (this.db) {
