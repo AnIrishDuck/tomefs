@@ -1180,6 +1180,7 @@ interface DualFS {
   memFS: EmscriptenFS;
   tomeFS: EmscriptenFS;
   tomefs: any;
+  backend: SyncMemoryBackend;
   syncTomeFS: () => void;
 }
 
@@ -1209,7 +1210,7 @@ async function createDualFS(maxPages: number): Promise<DualFS> {
     });
   };
 
-  return { memFS, tomeFS, tomefs, syncTomeFS };
+  return { memFS, tomeFS, tomefs, backend, syncTomeFS };
 }
 
 function createTomePathRewriter(realFS: any): EmscriptenFS {
@@ -1392,7 +1393,7 @@ async function runFuzzSequence(
 ): Promise<void> {
   const rng = new Rng(seed);
   const model = newModel();
-  const { memFS, tomeFS, tomefs, syncTomeFS } = await createDualFS(maxPages);
+  const { memFS, tomeFS, tomefs, backend, syncTomeFS } = await createDualFS(maxPages);
 
   // Track actual stream objects for open fds per FS
   const memFdStreams: FdStreamMap = new Map();
@@ -1516,6 +1517,7 @@ async function runFuzzSequence(
     if (i > 0 && i % 10 === 0) {
       compareAllFiles(memFS, tomeFS, model, `after op ${i}`);
       tomefs.assertInvariants();
+      backend.assertInvariants();
     }
   }
 
