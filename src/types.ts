@@ -75,3 +75,21 @@ export interface SabStats {
   /** Calls where the worker returned an error. */
   errors: number;
 }
+
+/** Snapshot of filesystem-level performance counters. */
+export interface TomeFSStats {
+  /** Total syncfs calls (incremental + full tree). */
+  syncfsCount: number;
+  /** Syncfs calls that used the fast incremental path (no orphan cleanup). */
+  incrementalSyncs: number;
+  /** Syncfs calls that required the full tree walk + orphan cleanup. */
+  fullTreeSyncs: number;
+  /** Syncfs calls that skipped work entirely (nothing dirty). */
+  noopSyncs: number;
+  /** Total orphan paths deleted during cleanup. */
+  orphansDeleted: number;
+  /** Current number of tracked file nodes (allFileNodes size). */
+  trackedFiles: number;
+  /** Current number of nodes with unsaved metadata changes. */
+  dirtyMetaCount: number;
+}
