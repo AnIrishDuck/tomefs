@@ -10,7 +10,7 @@
  */
 
 import { PAGE_SIZE } from "./types.js";
-import type { FileMeta } from "./types.js";
+import type { FileMeta, SabStats } from "./types.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
 import {
   STATUS_IDLE,
@@ -25,6 +25,7 @@ import {
   DEFAULT_BUFFER_SIZE,
   encodeMessage,
   decodeMessage,
+  opcodeName,
 } from "./sab-protocol.js";
 
 /**
@@ -55,6 +56,10 @@ export class SabClient implements SyncStorageBackend {
    * corrupting the message.
    */
   private recovering = false;
+
+  private _calls = 0;
+  private _timeouts = 0;
+  private _errors = 0;
 
   /**
    * Maximum pages per batch call. Computed from buffer size to prevent
@@ -115,6 +120,20 @@ export class SabClient implements SyncStorageBackend {
   /** Create a SharedArrayBuffer for use with this client and a SabWorker. */
   static createBuffer(size: number = DEFAULT_BUFFER_SIZE): SharedArrayBuffer {
     return new SharedArrayBuffer(size);
+  }
+
+  getStats(): SabStats {
+    return {
+      calls: this._calls,
+      timeouts: this._timeouts,
+      errors: this._errors,
+    };
+  }
+
+  resetStats(): void {
+    this._calls = 0;
+    this._timeouts = 0;
+    this._errors = 0;
   }
 
   readPage(path: string, pageIndex: number): Uint8Array | null {
@@ -604,6 +623,8 @@ export class SabClient implements SyncStorageBackend {
       this.recoverFromTimeout();
     }
 
+    this._calls++;
+
     // Encode request into the data region
     const dataLen = encodeMessage(
       this.dataView,
@@ -635,8 +656,9 @@ export class SabClient implements SyncStorageBackend {
         // from IDLE → RESPONSE, which recoverFromTimeout() can detect.
         Atomics.store(this.controlView, SLOT_STATUS, STATUS_IDLE);
         this.recovering = true;
+        this._timeouts++;
         throw new Error(
-          `SAB bridge timeout: storage worker did not respond within ${this.timeout}ms`,
+          `SAB bridge timeout (${opcodeName(opcode)}): storage worker did not respond within ${this.timeout}ms`,
         );
       }
       status = Atomics.load(this.controlView, SLOT_STATUS);
@@ -658,7 +680,8 @@ export class SabClient implements SyncStorageBackend {
       // Reset to idle for next call
       Atomics.store(this.controlView, SLOT_STATUS, STATUS_IDLE);
 
-      throw new Error(`SAB bridge error: ${errMsg}`);
+      this._errors++;
+      throw new Error(`SAB bridge error (${opcodeName(opcode)}): ${errMsg}`);
     }
 
     // Read response
