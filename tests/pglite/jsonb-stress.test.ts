@@ -588,7 +588,7 @@ describeScenario(
     }
 
     for (let round = 0; round < 3; round++) {
-      const smallResult = await pg.query(
+      await pg.query(
         `SELECT id, data FROM mixed_docs
          WHERE doc_type = 'small' AND data @> $1
          ORDER BY id LIMIT 3`,
