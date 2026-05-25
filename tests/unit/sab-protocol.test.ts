@@ -12,6 +12,8 @@ import {
   CONTROL_BYTES,
   JSON_REGION_OFFSET,
   DEFAULT_BUFFER_SIZE,
+  OpCode,
+  opcodeName,
 } from "../../src/sab-protocol.js";
 
 /** Create buffer views matching the SAB protocol layout. */
@@ -350,6 +352,22 @@ describe("sab-protocol", () => {
 
       expect(decoded.json).toEqual({ second: true });
       expect(decoded.binary).toEqual(new Uint8Array([0xcc]));
+    });
+  });
+
+  describe("opcodeName", () => {
+    it("@fast returns name for known opcodes", () => {
+      expect(opcodeName(OpCode.READ_PAGE)).toBe("READ_PAGE");
+      expect(opcodeName(OpCode.WRITE_PAGES)).toBe("WRITE_PAGES");
+      expect(opcodeName(OpCode.SYNC_ALL)).toBe("SYNC_ALL");
+      expect(opcodeName(OpCode.DELETE_ALL)).toBe("DELETE_ALL");
+      expect(opcodeName(OpCode.LIST_FILES_RANGE)).toBe("LIST_FILES_RANGE");
+    });
+
+    it("@fast returns UNKNOWN for invalid opcodes", () => {
+      expect(opcodeName(999)).toBe("UNKNOWN(999)");
+      expect(opcodeName(0)).toBe("UNKNOWN(0)");
+      expect(opcodeName(-1)).toBe("UNKNOWN(-1)");
     });
   });
 

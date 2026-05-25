@@ -1634,3 +1634,146 @@ describe("SAB bridge: worker-side dataLen validation", () => {
     expect(page![0]).toBe(0x42);
   });
 });
+
+describe("SAB bridge: stats track errors and timeouts", () => {
+  let failingBackend: FailingBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    failingBackend = new FailingBackend();
+    sab = SabClient.createBuffer();
+    sabWorker = new SabWorker(sab, failingBackend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 0 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("@fast error counter increments on backend failure", async () => {
+    failingBackend.failOn = "readPage";
+
+    await expect(
+      callClient(clientWorker, "readPage", ["/test", 0]),
+    ).rejects.toThrow();
+
+    const stats = (await callClient(clientWorker, "getStats", [])) as {
+      calls: number;
+      errors: number;
+    };
+    expect(stats.calls).toBe(1);
+    expect(stats.errors).toBe(1);
+  });
+
+  it("error message includes opcode name", async () => {
+    failingBackend.failOn = "readPage";
+    failingBackend.failMessage = "disk full";
+
+    await expect(
+      callClient(clientWorker, "readPage", ["/test", 0]),
+    ).rejects.toThrow(/READ_PAGE/);
+  });
+
+  it("error counter tracks multiple errors across operations", async () => {
+    failingBackend.failOn = "readPage";
+    for (let i = 0; i < 3; i++) {
+      await expect(
+        callClient(clientWorker, "readPage", ["/t", i]),
+      ).rejects.toThrow();
+    }
+
+    failingBackend.failOn = null;
+    await callClient(clientWorker, "readPage", ["/t", 0]);
+
+    const stats = (await callClient(clientWorker, "getStats", [])) as {
+      calls: number;
+      errors: number;
+    };
+    expect(stats.calls).toBe(4);
+    expect(stats.errors).toBe(3);
+  });
+
+  it("resetStats clears error counter", async () => {
+    failingBackend.failOn = "writeMeta";
+    const meta = { size: 0, mode: 0o644, ctime: 0, mtime: 0 };
+    await expect(
+      callClient(clientWorker, "writeMeta", ["/t", meta]),
+    ).rejects.toThrow();
+
+    await callClient(clientWorker, "resetStats", []);
+
+    const stats = (await callClient(clientWorker, "getStats", [])) as {
+      calls: number;
+      errors: number;
+    };
+    expect(stats.calls).toBe(0);
+    expect(stats.errors).toBe(0);
+  });
+});
+
+describe("SAB bridge: stats track timeouts", () => {
+  let slowBackend: SlowBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    slowBackend = new SlowBackend();
+    sab = SabClient.createBuffer();
+    sabWorker = new SabWorker(sab, slowBackend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 200 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("timeout counter increments on slow operation", async () => {
+    slowBackend.readDelay = 2000;
+
+    await expect(
+      callClient(clientWorker, "readPage", ["/slow", 0]),
+    ).rejects.toThrow(/SAB bridge timeout/);
+
+    // Recovery: wait for worker to finish before getStats
+    slowBackend.readDelay = 0;
+    await callClient(clientWorker, "readPage", ["/fast", 0]);
+
+    const stats = (await callClient(clientWorker, "getStats", [])) as {
+      calls: number;
+      timeouts: number;
+    };
+    expect(stats.calls).toBe(2);
+    expect(stats.timeouts).toBe(1);
+  }, 10000);
+
+  it("timeout error message includes opcode name", async () => {
+    slowBackend.readDelay = 2000;
+
+    await expect(
+      callClient(clientWorker, "readPage", ["/slow", 0]),
+    ).rejects.toThrow(/READ_PAGE/);
+  }, 10000);
+});

@@ -65,3 +65,13 @@ export interface CacheStats {
   /** Total dirty pages flushed to the backend. */
   flushes: number;
 }
+
+/** Snapshot of SAB bridge performance counters. */
+export interface SabStats {
+  /** Total calls sent through the bridge. */
+  calls: number;
+  /** Calls that timed out waiting for the worker. */
+  timeouts: number;
+  /** Calls where the worker returned an error. */
+  errors: number;
+}
