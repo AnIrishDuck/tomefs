@@ -318,7 +318,11 @@ function createPathRewritingFS(realFS: any): EmscriptenFS {
 /**
  * Create a fresh Emscripten module instance with the configured filesystem.
  *
- * By default uses MEMFS. Set TOMEFS_BACKEND=tomefs to test against tomefs.
+ * By default uses MEMFS. Set TOMEFS_BACKEND to test against other backends:
+ *   - "tomefs"  — tomefs with SyncMemoryBackend (direct sync path)
+ *   - "preload" — tomefs with PreloadBackend wrapping MemoryBackend
+ *                 (graceful degradation path for environments without SAB)
+ *
  * Each call returns an isolated FS — tests don't share state.
  */
 export async function createFS(): Promise<FSHarness> {
@@ -331,12 +335,26 @@ export async function createFS(): Promise<FSHarness> {
   const E = Module.ERRNO_CODES as ErrNoCodes;
 
   const backendName = process.env.TOMEFS_BACKEND;
-  if (backendName === "tomefs") {
+  if (backendName === "tomefs" || backendName === "preload") {
     const { createTomeFS } = await import("../../src/tomefs.js");
     const maxPages = process.env.TOMEFS_MAX_PAGES
       ? parseInt(process.env.TOMEFS_MAX_PAGES, 10)
       : undefined;
-    const tomefs = createTomeFS(rawFS, maxPages ? { maxPages } : undefined);
+
+    let backend;
+    if (backendName === "preload") {
+      const { MemoryBackend } = await import("../../src/memory-backend.js");
+      const { PreloadBackend } = await import("../../src/preload-backend.js");
+      const remote = new MemoryBackend();
+      const preload = new PreloadBackend(remote);
+      await preload.init();
+      backend = preload;
+    }
+
+    const tomefs = createTomeFS(rawFS, {
+      ...(backend ? { backend } : {}),
+      ...(maxPages ? { maxPages } : {}),
+    });
 
     rawFS.mkdir(TOME_MOUNT);
     rawFS.mount(tomefs, {}, TOME_MOUNT);
