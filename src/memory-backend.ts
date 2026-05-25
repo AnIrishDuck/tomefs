@@ -109,4 +109,8 @@ export class MemoryBackend implements StorageBackend {
   async deleteAll(paths: string[]): Promise<void> {
     this.inner.deleteAll(paths);
   }
+
+  assertInvariants(): void {
+    this.inner.assertInvariants();
+  }
 }
