@@ -101,7 +101,7 @@ describe("mkdir (wasmfs_mkdir.c)", () => {
   // Note: ENAMETOOLONG is only enforced in WasmFS and tomefs, not the legacy JS FS.
   // The upstream C test guards this with #ifdef WASMFS. We skip it for MEMFS
   // but run it when TOMEFS_BACKEND=tomefs.
-  (process.env.TOMEFS_BACKEND === "tomefs" ? it : it.skip)(
+  (process.env.TOMEFS_BACKEND ? it : it.skip)(
     "mkdir with name longer than 255 chars throws ENAMETOOLONG",
     () => {
       const { FS, E } = h;
