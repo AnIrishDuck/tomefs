@@ -47,6 +47,14 @@ export const OpCode = {
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];
 
+const OPCODE_NAMES: Record<number, string> = Object.fromEntries(
+  Object.entries(OpCode).map(([name, code]) => [code, name]),
+);
+
+export function opcodeName(opcode: number): string {
+  return OPCODE_NAMES[opcode] ?? `UNKNOWN(${opcode})`;
+}
+
 /** Byte offsets in the SharedArrayBuffer. */
 export const CONTROL_BYTES = 12; // 3 x Int32
 export const JSON_REGION_OFFSET = CONTROL_BYTES;
