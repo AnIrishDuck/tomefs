@@ -21,6 +21,7 @@ import { MemoryBackend } from "../../src/memory-backend.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { IdbBackend } from "../../src/idb-backend.js";
 import { OpfsBackend } from "../../src/opfs-backend.js";
+import { OpfsSahBackend } from "../../src/opfs-sah-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import type { StorageBackend } from "../../src/storage-backend.js";
 import type { SyncStorageBackend } from "../../src/sync-storage-backend.js";
@@ -73,6 +74,8 @@ interface BackendFactory {
   name: string;
   create: () => StorageBackend;
   destroy?: () => Promise<void>;
+  /** True for backends where gap pages are zero-filled, not null (e.g., OpfsSahBackend). */
+  denseStorage?: boolean;
 }
 
 let idbCounter = 0;
@@ -100,6 +103,16 @@ const factories: BackendFactory[] = [
       const root = createFakeOpfsRoot();
       const b = new OpfsBackend({ root: root as any });
       factories[3].destroy = () => b.destroy();
+      return b;
+    },
+  },
+  {
+    name: "OpfsSahBackend",
+    denseStorage: true,
+    create: () => {
+      const root = createFakeOpfsRoot();
+      const b = new OpfsSahBackend({ root: root as any });
+      factories[4].destroy = () => b.destroy();
       return b;
     },
   },
@@ -182,7 +195,9 @@ for (const factory of factories) {
         expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
         expect(await backend.readPage("/f", 5)).toEqual(filledPage(0x05));
         expect(await backend.readPage("/f", 10)).toEqual(filledPage(0x0a));
-        expect(await backend.countPages("/f")).toBe(3);
+        if (!factory.denseStorage) {
+          expect(await backend.countPages("/f")).toBe(3);
+        }
         expect(await backend.maxPageIndex("/f")).toBe(10);
       });
 
@@ -240,11 +255,18 @@ for (const factory of factories) {
         await backend.renameFile("/f", "/g");
 
         expect(await backend.readPage("/g", 0)).toEqual(filledPage(0x01));
-        expect(await backend.readPage("/g", 1)).toBeNull();
-        expect(await backend.readPage("/g", 2)).toBeNull();
+        if (factory.denseStorage) {
+          expect(await backend.readPage("/g", 1)).toEqual(new Uint8Array(PAGE_SIZE));
+          expect(await backend.readPage("/g", 2)).toEqual(new Uint8Array(PAGE_SIZE));
+        } else {
+          expect(await backend.readPage("/g", 1)).toBeNull();
+          expect(await backend.readPage("/g", 2)).toBeNull();
+        }
         expect(await backend.readPage("/g", 3)).toEqual(filledPage(0x03));
         expect(await backend.readPage("/g", 7)).toEqual(filledPage(0x07));
-        expect(await backend.countPages("/g")).toBe(3);
+        if (!factory.denseStorage) {
+          expect(await backend.countPages("/g")).toBe(3);
+        }
         expect(await backend.maxPageIndex("/g")).toBe(7);
       });
     });
@@ -266,8 +288,12 @@ for (const factory of factories) {
         expect(await backend.readPage("/f", 3)).toEqual(filledPage(0x03));
         expect(await backend.readPage("/f", 7)).toBeNull();
         expect(await backend.readPage("/f", 10)).toBeNull();
-        expect(await backend.countPages("/f")).toBe(2);
-        expect(await backend.maxPageIndex("/f")).toBe(3);
+        if (factory.denseStorage) {
+          expect(await backend.maxPageIndex("/f")).toBe(4);
+        } else {
+          expect(await backend.countPages("/f")).toBe(2);
+          expect(await backend.maxPageIndex("/f")).toBe(3);
+        }
       });
 
       it("threshold between two sparse pages deletes only the later one", async () => {
@@ -278,7 +304,9 @@ for (const factory of factories) {
 
         expect(await backend.readPage("/f", 2)).toEqual(filledPage(0x02));
         expect(await backend.readPage("/f", 8)).toBeNull();
-        expect(await backend.countPages("/f")).toBe(1);
+        if (!factory.denseStorage) {
+          expect(await backend.countPages("/f")).toBe(1);
+        }
       });
 
       it("threshold at exact sparse page index deletes that page", async () => {
@@ -289,7 +317,9 @@ for (const factory of factories) {
 
         expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
         expect(await backend.readPage("/f", 5)).toBeNull();
-        expect(await backend.countPages("/f")).toBe(1);
+        if (!factory.denseStorage) {
+          expect(await backend.countPages("/f")).toBe(1);
+        }
       });
     });
 
@@ -354,7 +384,11 @@ for (const factory of factories) {
 
         const results = await backend.readPages("/f", [0, 1, 2]);
         expect(results[0]).toEqual(filledPage(0xaa));
-        expect(results[1]).toBeNull();
+        if (factory.denseStorage) {
+          expect(results[1]).toEqual(new Uint8Array(PAGE_SIZE));
+        } else {
+          expect(results[1]).toBeNull();
+        }
         expect(results[2]).toEqual(filledPage(0xcc));
       });
 
@@ -753,7 +787,11 @@ for (const factory of factories) {
         await backend.writePage("/f", 0, filledPage(0x01));
         await backend.writePage("/f", 5, filledPage(0x05));
 
-        expect(await backend.countPages("/f")).toBe(2);
+        if (factory.denseStorage) {
+          expect(await backend.countPages("/f")).toBe(6);
+        } else {
+          expect(await backend.countPages("/f")).toBe(2);
+        }
       });
 
       it("reflects deletePagesFrom", async () => {
@@ -849,7 +887,11 @@ for (const factory of factories) {
         await backend.writePage("/sparse", 5, filledPage(0x02));
 
         const counts = await backend.countPagesBatch(["/sparse"]);
-        expect(counts).toEqual([2]);
+        if (factory.denseStorage) {
+          expect(counts).toEqual([6]);
+        } else {
+          expect(counts).toEqual([2]);
+        }
       });
     });
 
@@ -1100,7 +1142,11 @@ for (const factory of factories) {
           [{ path: "/f", meta }],
         );
 
-        expect(await backend.countPages("/f")).toBe(3);
+        if (factory.denseStorage) {
+          expect(await backend.countPages("/f")).toBe(8);
+        } else {
+          expect(await backend.countPages("/f")).toBe(3);
+        }
         expect(await backend.maxPageIndex("/f")).toBe(7);
       });
 
