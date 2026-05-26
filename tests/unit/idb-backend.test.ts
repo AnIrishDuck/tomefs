@@ -907,4 +907,129 @@ describe("IdbBackend", () => {
       }
     });
   });
+
+  // -------------------------------------------------------------------
+  // cleanupOrphanedPages
+  // -------------------------------------------------------------------
+
+  describe("cleanupOrphanedPages", () => {
+    it("removes pages with no corresponding metadata @fast", async () => {
+      await backend.writePage("/file1", 0, filledPage(0xaa));
+      await backend.writeMeta("/file1", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+      await backend.writePage("/file2", 0, filledPage(0xbb));
+      await backend.writePage("/file2", 1, filledPage(0xcc));
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(1);
+      expect(await backend.readPage("/file1", 0)).toEqual(filledPage(0xaa));
+      expect(await backend.readPage("/file2", 0)).toBeNull();
+      expect(await backend.readPage("/file2", 1)).toBeNull();
+    });
+
+    it("returns 0 when there are no orphans @fast", async () => {
+      await backend.writePage("/f", 0, filledPage(0x01));
+      await backend.writeMeta("/f", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+
+      const removed = await backend.cleanupOrphanedPages();
+      expect(removed).toBe(0);
+      expect(await backend.readPage("/f", 0)).toEqual(filledPage(0x01));
+    });
+
+    it("returns 0 on empty backend @fast", async () => {
+      const removed = await backend.cleanupOrphanedPages();
+      expect(removed).toBe(0);
+    });
+
+    it("removes multiple orphaned paths", async () => {
+      await backend.writePage("/keep", 0, filledPage(0x01));
+      await backend.writeMeta("/keep", {
+        size: PAGE_SIZE,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+      await backend.writePage("/orphan1", 0, filledPage(0x02));
+      await backend.writePage("/orphan2", 0, filledPage(0x03));
+      await backend.writePage("/orphan2", 1, filledPage(0x04));
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(2);
+      expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/orphan1", 0)).toBeNull();
+      expect(await backend.readPage("/orphan2", 0)).toBeNull();
+    });
+
+    it("does not remove metadata-only entries (no pages)", async () => {
+      await backend.writeMeta("/empty", {
+        size: 0,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(0);
+      expect(await backend.readMeta("/empty")).toEqual({
+        size: 0,
+        mode: 0o100644,
+        ctime: 1000,
+        mtime: 2000,
+      });
+    });
+
+    it("idempotent: second call returns 0", async () => {
+      await backend.writePage("/orphan", 0, filledPage(0xff));
+
+      expect(await backend.cleanupOrphanedPages()).toBe(1);
+      expect(await backend.cleanupOrphanedPages()).toBe(0);
+    });
+
+    it("handles mixed: some files have metadata, some do not", async () => {
+      await backend.writePage("/a", 0, filledPage(0x01));
+      await backend.writeMeta("/a", { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 2 });
+      await backend.writePage("/b", 0, filledPage(0x02));
+      await backend.writePage("/c", 0, filledPage(0x03));
+      await backend.writeMeta("/c", { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 2 });
+      await backend.writePage("/d", 0, filledPage(0x04));
+      await backend.writePage("/d", 1, filledPage(0x05));
+      await backend.writePage("/d", 2, filledPage(0x06));
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(2);
+      expect(await backend.readPage("/a", 0)).toEqual(filledPage(0x01));
+      expect(await backend.readPage("/b", 0)).toBeNull();
+      expect(await backend.readPage("/c", 0)).toEqual(filledPage(0x03));
+      expect(await backend.readPage("/d", 0)).toBeNull();
+      expect(await backend.countPages("/d")).toBe(0);
+    });
+
+    it("orphan cleanup after deleteFile + crash (metadata deleted, pages remain)", async () => {
+      await backend.writePage("/victim", 0, filledPage(0x11));
+      await backend.writePage("/victim", 1, filledPage(0x22));
+      await backend.writeMeta("/victim", { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 1, mtime: 2 });
+
+      // Simulate: deleteMeta succeeded but deleteFile (pages) did not
+      await backend.deleteMeta("/victim");
+
+      expect(await backend.readPage("/victim", 0)).toEqual(filledPage(0x11));
+      const removed = await backend.cleanupOrphanedPages();
+      expect(removed).toBe(1);
+      expect(await backend.readPage("/victim", 0)).toBeNull();
+      expect(await backend.readPage("/victim", 1)).toBeNull();
+    });
+  });
 });
