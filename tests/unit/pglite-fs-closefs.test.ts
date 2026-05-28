@@ -119,6 +119,109 @@ describe("pglite-fs closeFs error handling @fast", () => {
     expect(baseCloseFsCalled).toBe(true);
   });
 
+  it("closeFs prioritizes sync error when both sync and base closeFs fail @fast", async () => {
+    let baseCloseFsCalled = false;
+    class FakeMemoryFS {
+      init() {
+        return Promise.resolve({
+          emscriptenOpts: { preRun: [] },
+        });
+      }
+      closeFs() {
+        baseCloseFsCalled = true;
+        return Promise.reject(new Error("base closeFs cleanup failed"));
+      }
+      syncToFs() {
+        return Promise.resolve();
+      }
+    }
+
+    const backend = new SyncMemoryBackend();
+    const adapter = createTomeFSPGlite({
+      MemoryFS: FakeMemoryFS as any,
+      backend,
+      maxPages: 64,
+    });
+
+    const initResult = await adapter.init({}, {});
+
+    const fakeModule = {
+      FS: {
+        filesystems: {},
+        mkdir: () => {},
+        mount: () => {},
+        syncfs: (_populate: boolean, callback: (err: Error | null) => void) => {
+          callback(new Error("sync data loss"));
+        },
+      },
+    };
+
+    for (const hook of initResult.emscriptenOpts.preRun) {
+      hook(fakeModule);
+    }
+
+    let caught: Error | null = null;
+    try {
+      await adapter.closeFs();
+    } catch (e) {
+      caught = e as Error;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toBe("sync data loss");
+    expect(baseCloseFsCalled).toBe(true);
+  });
+
+  it("closeFs propagates base closeFs error when sync succeeds @fast", async () => {
+    class FakeMemoryFS {
+      init() {
+        return Promise.resolve({
+          emscriptenOpts: { preRun: [] },
+        });
+      }
+      closeFs() {
+        return Promise.reject(new Error("base closeFs failed"));
+      }
+      syncToFs() {
+        return Promise.resolve();
+      }
+    }
+
+    const backend = new SyncMemoryBackend();
+    const adapter = createTomeFSPGlite({
+      MemoryFS: FakeMemoryFS as any,
+      backend,
+      maxPages: 64,
+    });
+
+    const initResult = await adapter.init({}, {});
+
+    const fakeModule = {
+      FS: {
+        filesystems: {},
+        mkdir: () => {},
+        mount: () => {},
+        syncfs: (_populate: boolean, callback: (err: Error | null) => void) => {
+          callback(null);
+        },
+      },
+    };
+
+    for (const hook of initResult.emscriptenOpts.preRun) {
+      hook(fakeModule);
+    }
+
+    let caught: Error | null = null;
+    try {
+      await adapter.closeFs();
+    } catch (e) {
+      caught = e as Error;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toBe("base closeFs failed");
+  });
+
   it("closeFs without module init skips syncfs and calls base @fast", async () => {
     let baseCloseFsCalled = false;
     class FakeMemoryFS {
