@@ -53,6 +53,9 @@ jobs:
       - name: Smoke tests (tomefs)
         run: TOMEFS_BACKEND=tomefs npm run test:fast
 
+      - name: Smoke tests (preload backend)
+        run: TOMEFS_BACKEND=preload npm run test:fast
+
   full-tests:
     name: Full test suite (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -75,6 +78,29 @@ jobs:
 
       - name: Full test suite (tomefs)
         run: TOMEFS_BACKEND=tomefs npm test
+
+  preload-backend-tests:
+    name: PreloadBackend conformance (graceful degradation)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Conformance tests (preload backend)
+        run: TOMEFS_BACKEND=preload npx vitest run tests/conformance/
+
+      - name: Workload tests (preload backend)
+        run: TOMEFS_BACKEND=preload npx vitest run tests/workload/ tests/scribe-data/
+
+      - name: Adversarial tests (preload backend)
+        run: TOMEFS_BACKEND=preload npx vitest run tests/adversarial/
 
   small-cache-tests:
     name: Small-cache stress (4-page cache)
