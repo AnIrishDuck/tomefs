@@ -257,4 +257,109 @@ export class SyncMemoryBackend implements SyncStorageBackend {
     this.deleteFiles(paths);
     this.deleteMetas(paths);
   }
+
+  assertInvariants(): void {
+    const errors: string[] = [];
+
+    // 1. Every key in pages must appear in exactly one filePageKeys set
+    const allTrackedKeys = new Set<string>();
+    for (const [path, keys] of this.filePageKeys) {
+      if (keys.size === 0) {
+        errors.push(`filePageKeys[${path}] is empty (should be deleted)`);
+      }
+      for (const key of keys) {
+        if (allTrackedKeys.has(key)) {
+          errors.push(`filePageKeys: key ${key} appears under multiple paths`);
+        }
+        allTrackedKeys.add(key);
+        if (!this.pages.has(key)) {
+          errors.push(`filePageKeys[${path}] contains ${key} not in pages`);
+        }
+        const nullIdx = key.indexOf("\0");
+        const keyPath = key.substring(0, nullIdx);
+        if (keyPath !== path) {
+          errors.push(
+            `filePageKeys[${path}] contains key with path=${keyPath}`,
+          );
+        }
+      }
+    }
+    for (const key of this.pages.keys()) {
+      if (!allTrackedKeys.has(key)) {
+        errors.push(`pages contains ${key} not tracked in filePageKeys`);
+      }
+    }
+
+    // 2. filePageIndices consistent with filePageKeys
+    for (const [path, indices] of this.filePageIndices) {
+      if (indices.size === 0) {
+        errors.push(`filePageIndices[${path}] is empty (should be deleted)`);
+      }
+      const keys = this.filePageKeys.get(path);
+      if (!keys) {
+        errors.push(
+          `filePageIndices has path ${path} not in filePageKeys`,
+        );
+        continue;
+      }
+      if (indices.size !== keys.size) {
+        errors.push(
+          `filePageIndices[${path}] size ${indices.size} !== filePageKeys[${path}] size ${keys.size}`,
+        );
+      }
+      for (const [pageIndex, key] of indices) {
+        if (!keys.has(key)) {
+          errors.push(
+            `filePageIndices[${path}][${pageIndex}] = ${key} not in filePageKeys[${path}]`,
+          );
+        }
+        const expected = pageKeyStr(path, pageIndex);
+        if (key !== expected) {
+          errors.push(
+            `filePageIndices[${path}][${pageIndex}] = ${key} but expected ${expected}`,
+          );
+        }
+      }
+    }
+    for (const path of this.filePageKeys.keys()) {
+      if (!this.filePageIndices.has(path)) {
+        errors.push(
+          `filePageKeys has path ${path} not in filePageIndices`,
+        );
+      }
+    }
+
+    // 3. fileMaxIdx correct for each file
+    for (const [path, cachedMax] of this.fileMaxIdx) {
+      const indices = this.filePageIndices.get(path);
+      if (!indices || indices.size === 0) {
+        errors.push(
+          `fileMaxIdx[${path}] = ${cachedMax} but no pages exist`,
+        );
+        continue;
+      }
+      let actualMax = -1;
+      for (const idx of indices.keys()) {
+        if (idx > actualMax) actualMax = idx;
+      }
+      if (cachedMax !== actualMax) {
+        errors.push(
+          `fileMaxIdx[${path}] = ${cachedMax} but actual max is ${actualMax}`,
+        );
+      }
+    }
+    for (const path of this.filePageIndices.keys()) {
+      if (!this.fileMaxIdx.has(path)) {
+        errors.push(
+          `filePageIndices has path ${path} not in fileMaxIdx`,
+        );
+      }
+    }
+
+    if (errors.length > 0) {
+      throw new Error(
+        `SyncMemoryBackend invariant violations (${errors.length}):\n  - ${errors.join("\n  - ")}`,
+      );
+    }
+  }
 }
