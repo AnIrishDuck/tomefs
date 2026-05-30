@@ -686,6 +686,85 @@ describe("SAB+Atomics Bridge", () => {
       expect(await callClient(clientWorker, "readPage", ["/test", 0])).toBeNull();
     });
   });
+
+  describe("stats", () => {
+    it("@fast getStats returns zero counters initially", async () => {
+      const stats = await callClient(clientWorker, "getStats", []);
+      expect(stats).toEqual({ calls: 0, timeouts: 0, errors: 0 });
+    });
+
+    it("@fast getStats tracks call count", async () => {
+      await callClient(clientWorker, "readPage", ["/a", 0]);
+      await callClient(clientWorker, "readPage", ["/b", 0]);
+      const data = new Uint8Array(PAGE_SIZE);
+      await callClient(clientWorker, "writePage", ["/a", 0, data]);
+
+      const stats = (await callClient(clientWorker, "getStats", [])) as {
+        calls: number;
+        timeouts: number;
+        errors: number;
+      };
+      expect(stats.calls).toBe(3);
+      expect(stats.timeouts).toBe(0);
+      expect(stats.errors).toBe(0);
+    });
+
+    it("@fast resetStats zeroes all counters", async () => {
+      await callClient(clientWorker, "readPage", ["/a", 0]);
+      await callClient(clientWorker, "writeMeta", [
+        "/a",
+        { size: 0, mode: 0o100644, ctime: 1000, mtime: 1000 },
+      ]);
+
+      let stats = (await callClient(clientWorker, "getStats", [])) as {
+        calls: number;
+      };
+      expect(stats.calls).toBe(2);
+
+      await callClient(clientWorker, "resetStats", []);
+
+      stats = (await callClient(clientWorker, "getStats", [])) as {
+        calls: number;
+      };
+      expect(stats.calls).toBe(0);
+    });
+
+    it("getStats counts batch operations as single calls", async () => {
+      const page0 = new Uint8Array(PAGE_SIZE);
+      const page1 = new Uint8Array(PAGE_SIZE);
+      await callClient(clientWorker, "writePages", [
+        [
+          { path: "/a", pageIndex: 0, data: page0 },
+          { path: "/a", pageIndex: 1, data: page1 },
+        ],
+      ]);
+      await callClient(clientWorker, "readPages", ["/a", [0, 1]]);
+
+      const stats = (await callClient(clientWorker, "getStats", [])) as {
+        calls: number;
+      };
+      expect(stats.calls).toBe(2);
+    });
+
+    it("getStats increments across diverse operations", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      const meta = { size: 100, mode: 0o100644, ctime: 1000, mtime: 1000 };
+
+      await callClient(clientWorker, "writePage", ["/f", 0, data]);
+      await callClient(clientWorker, "readPage", ["/f", 0]);
+      await callClient(clientWorker, "writeMeta", ["/f", meta]);
+      await callClient(clientWorker, "readMeta", ["/f"]);
+      await callClient(clientWorker, "listFiles", []);
+      await callClient(clientWorker, "countPages", ["/f"]);
+      await callClient(clientWorker, "maxPageIndex", ["/f"]);
+      await callClient(clientWorker, "deleteFile", ["/f"]);
+
+      const stats = (await callClient(clientWorker, "getStats", [])) as {
+        calls: number;
+      };
+      expect(stats.calls).toBe(8);
+    });
+  });
 });
 
 /** Convert a structured-clone result back to Uint8Array. */
