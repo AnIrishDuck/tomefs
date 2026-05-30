@@ -12,7 +12,7 @@ export { SyncMemoryBackend } from "./sync-memory-backend.js";
 export type { SyncStorageBackend } from "./sync-storage-backend.js";
 export { createTomeFS } from "./tomefs.js";
 export type { TomeFSOptions } from "./tomefs.js";
-export type { CachedPage, CacheStats, FileMeta, PageKey, SabStats } from "./types.js";
+export type { CachedPage, CacheStats, FileMeta, PageKey, SabStats, TomeFSStats } from "./types.js";
 export { PAGE_SIZE, DEFAULT_MAX_PAGES, pageKeyStr } from "./types.js";
 export { opcodeName } from "./sab-protocol.js";
 export { PreloadBackend } from "./preload-backend.js";
