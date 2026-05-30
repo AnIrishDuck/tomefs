@@ -12,18 +12,15 @@ import {
   createTomeFSHarness,
   createMemFSHarness,
   encode,
-  decode,
   generatePageData,
   writeFileData,
   verifyFileData,
   O,
   SEEK_SET,
-  SEEK_END,
   PAGE_SIZE,
   CACHE_CONFIGS,
   type CacheSize,
   type WorkloadHarness,
-  type EmscriptenFS,
 } from "./harness.js";
 
 // ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@
  * Ethos §5: "we never use mocks — we use fakes"
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import "fake-indexeddb/auto";
 import { IdbBackend } from "../../src/idb-backend.js";
 import { MemoryBackend } from "../../src/memory-backend.js";

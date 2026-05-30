@@ -25,7 +25,7 @@
 
 import { describe, it, expect } from "vitest";
 import { PreloadBackend } from "../../src/preload-backend.js";
-import { PAGE_SIZE, pageKeyStr } from "../../src/types.js";
+import { PAGE_SIZE } from "../../src/types.js";
 import type { StorageBackend } from "../../src/storage-backend.js";
 import type { FileMeta } from "../../src/types.js";
 import { MemoryBackend } from "../../src/memory-backend.js";

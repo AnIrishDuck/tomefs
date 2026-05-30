@@ -140,7 +140,7 @@ describe("adversarial: batched metadata during directory rename", () => {
   // ------------------------------------------------------------------
 
   it("never-synced files get metadata at new paths after directory rename @fast", async () => {
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create files but NEVER call syncfs — no metadata in backend yet
     FS.mkdir(`${MOUNT}/fresh`);
@@ -207,7 +207,7 @@ describe("adversarial: batched metadata during directory rename", () => {
   // ------------------------------------------------------------------
 
   it("file sizes in batch-written metadata match node state @fast", async () => {
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     FS.mkdir(`${MOUNT}/sizes`);
     // Files of various sizes
@@ -235,7 +235,7 @@ describe("adversarial: batched metadata during directory rename", () => {
   // ------------------------------------------------------------------
 
   it("timestamps in batch-written metadata reflect node state", async () => {
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     FS.mkdir(`${MOUNT}/ts`);
     writeFile(FS, `${MOUNT}/ts/f.txt`, "data");
@@ -256,7 +256,7 @@ describe("adversarial: batched metadata during directory rename", () => {
   // ------------------------------------------------------------------
 
   it("file mode in batch-written metadata matches node state @fast", async () => {
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     FS.mkdir(`${MOUNT}/modes`);
     const s = FS.open(`${MOUNT}/modes/f.txt`, O.RDWR | O.CREAT, 0o644);

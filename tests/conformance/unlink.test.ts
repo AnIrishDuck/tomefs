@@ -158,7 +158,7 @@ describe("unlink (unlink.c)", () => {
   });
 
   it("rmdir root throws EBUSY", () => {
-    const { FS, E } = h;
+    const { FS } = h;
     // Emscripten JS FS returns EBUSY for rmdir("/")
     // Note: also accepts EISDIR per platform differences
     try {

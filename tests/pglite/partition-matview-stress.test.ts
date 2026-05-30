@@ -131,7 +131,7 @@ describeScenario(
     await pg.query(`CREATE TABLE metrics_mar PARTITION OF metrics
       FOR VALUES FROM ('2025-03-01') TO ('2025-04-01')`);
 
-    for (const [month, table] of [["01", "jan"], ["02", "feb"], ["03", "mar"]] as const) {
+    for (const [month, _table] of [["01", "jan"], ["02", "feb"], ["03", "mar"]] as const) {
       await pg.query(`
         INSERT INTO metrics (ts, sensor_id, value)
         SELECT

@@ -263,7 +263,7 @@ describe("adversarial: clean-shutdown marker invalidation", () => {
     // Session 2: open fd, unlink, then "crash"
     {
       const { FS } = await createHarness(backend);
-      const fd = FS.open(`${MOUNT}/held`, O.RDONLY);
+      FS.open(`${MOUNT}/held`, O.RDONLY);
       FS.unlink(`${MOUNT}/held`);
       // fd still open, /__deleted_N was created
       // Crash — no syncfs, no close

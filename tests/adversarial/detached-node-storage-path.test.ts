@@ -73,7 +73,7 @@ function syncfs(FS: any, tomefs: any) {
 describe("adversarial: detached node storage path consistency", () => {
   it("mount-tree file has mount-relative storagePath @fast", async () => {
     const backend = new SyncMemoryBackend();
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create a file through the normal mount-tree path
     const path = `${MOUNT}/subdir/test.txt`;
@@ -185,7 +185,7 @@ describe("adversarial: detached node storage path consistency", () => {
 
     // Remount and verify data survives
     FS.unmount(MOUNT);
-    const { FS: FS2, tomefs: tomefs2 } = await mountTome(backend);
+    const { FS: FS2 } = await mountTome(backend);
 
     // The file should be restored at the mount-relative path
     const files = backend.listFiles();
@@ -304,7 +304,6 @@ describe("adversarial: detached node storage path consistency", () => {
 
     // Verify storagePath is mount-relative before rename
     expect(detached.storagePath).not.toMatch(new RegExp(`^${MOUNT}/`));
-    const oldPath = detached.storagePath;
 
     // Create destination directory in tomefs and rename
     FS.mkdir(`${MOUNT}/dest`);

@@ -5,7 +5,7 @@
  * between SabClient and SabWorker. These are pure functions operating on
  * SharedArrayBuffer views, so no workers or backends are needed.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   encodeMessage,
   decodeMessage,

@@ -590,8 +590,8 @@ describe("OpfsBackend", () => {
       const pagesDir = (b as any).pagesDir;
       const original = pagesDir.removeEntry.bind(pagesDir);
       pagesDir.removeEntry = async (
-        name: string,
-        options?: { recursive?: boolean },
+        _name: string,
+        _options?: { recursive?: boolean },
       ) => {
         throw new DOMException("Quota exceeded", "QuotaExceededError");
       };
@@ -608,7 +608,7 @@ describe("OpfsBackend", () => {
 
       const metaDir = (b as any).metaDir;
       const original = metaDir.removeEntry.bind(metaDir);
-      metaDir.removeEntry = async (name: string) => {
+      metaDir.removeEntry = async (_name: string) => {
         throw new DOMException("IO error", "InvalidStateError");
       };
 
@@ -668,8 +668,8 @@ describe("OpfsBackend", () => {
       const metaDir = (b as any).metaDir;
       const original = metaDir.getFileHandle.bind(metaDir);
       metaDir.getFileHandle = async (
-        name: string,
-        options?: { create?: boolean },
+        _name: string,
+        _options?: { create?: boolean },
       ) => {
         throw new DOMException("Locked", "InvalidStateError");
       };

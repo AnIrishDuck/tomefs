@@ -282,7 +282,6 @@ describe("adversarial: multi-cycle incremental syncfs", () => {
     // First PAGE_SIZE bytes should be the original pattern
     expect(verifyPattern(buf.subarray(0, PAGE_SIZE), PAGE_SIZE, 0x55)).toBe(true);
     // Next PAGE_SIZE/2 bytes should also match (second page, first half)
-    const expected = fillPattern(PAGE_SIZE, 0x55).subarray(0, PAGE_SIZE / 2);
     // The pattern wraps — bytes at position PAGE_SIZE..PAGE_SIZE+4095 of the
     // original 3-page write correspond to seed offsets PAGE_SIZE..
     // Actually let me verify the raw bytes.

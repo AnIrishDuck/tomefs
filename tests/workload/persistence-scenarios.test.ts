@@ -11,7 +11,7 @@
  */
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
@@ -27,7 +27,6 @@ const O = {
   APPEND: 1024,
 } as const;
 
-const SEEK_SET = 0;
 const SEEK_END = 2;
 
 const MOUNT = "/tome";
@@ -38,18 +37,6 @@ const CACHE_CONFIGS = {
   small: 16,   // 128 KB — moderate eviction
   large: 4096, // 32 MB — working set fits
 } as const;
-
-type CacheSize = keyof typeof CACHE_CONFIGS;
-
-function encode(s: string): Uint8Array {
-  return new TextEncoder().encode(s);
-}
-
-function decode(buf: Uint8Array, length?: number): string {
-  return new TextDecoder().decode(
-    length !== undefined ? buf.subarray(0, length) : buf,
-  );
-}
 
 /** Fill a buffer with a deterministic pattern based on a seed byte. */
 function fillPattern(size: number, seed: number): Uint8Array {
@@ -261,7 +248,6 @@ describeWithPersistence(
   async (backend, maxPages) => {
     const tablePath = `${MOUNT}/base/16384/16385`;
     const totalPages = 8;
-    const fileSize = totalPages * PAGE_SIZE;
 
     // --- Cycle 1: create a table file with 8 pages ---
     const { FS: FS1, tomefs: t1 } = await mountTome(backend, maxPages);

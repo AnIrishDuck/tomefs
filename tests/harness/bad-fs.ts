@@ -12,7 +12,6 @@ import {
   createFS,
   type EmscriptenFS,
   type EmscriptenStream,
-  type EmscriptenStat,
   type FSHarness,
 } from "./emscripten-fs.js";
 
@@ -140,7 +139,7 @@ function noMtimeUpdate(fs: EmscriptenFS): EmscriptenFS {
  * the old target instead of overwriting it.
  * Should be caught by Batch 3 (Rename) tests.
  */
-function renameNoOverwrite(fs: EmscriptenFS, harness: FSHarness): EmscriptenFS {
+function renameNoOverwrite(fs: EmscriptenFS, _harness: FSHarness): EmscriptenFS {
   return new Proxy(fs, {
     get(target, prop) {
       if (prop === "rename") {
@@ -204,7 +203,7 @@ function readdirMissingDot(fs: EmscriptenFS): EmscriptenFS {
  * This simulates a FS that creates symlinks but doesn't resolve them properly.
  * Should be caught by Batch 4 (Links) tests.
  */
-function symlinkNoResolve(fs: EmscriptenFS, harness: FSHarness): EmscriptenFS {
+function symlinkNoResolve(fs: EmscriptenFS, _harness: FSHarness): EmscriptenFS {
   // Track which paths are symlinks we created
   const symlinkTargets = new Map<string, string>();
 

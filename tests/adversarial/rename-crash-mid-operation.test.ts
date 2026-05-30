@@ -23,7 +23,6 @@ import { dirname, join } from "path";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
-import { PAGE_SIZE } from "../../src/types.js";
 import type { SyncStorageBackend } from "../../src/sync-storage-backend.js";
 import type { FileMeta } from "../../src/types.js";
 
@@ -246,7 +245,7 @@ describe("crash during file rename operation", () => {
     expect(inner.maxPageIndex("/file.txt")).toBeGreaterThanOrEqual(0);
 
     // Phase 2: mount again, rename file, crash mid-rename
-    const { FS: FS2, tomefs: tomefs2 } = await mountTome(crashBackend);
+    const { FS: FS2 } = await mountTome(crashBackend);
 
     // For a clean file (no dirty pages), the rename backend ops are:
     //   1. backend.renameFile(old, new) — pages moved
@@ -311,7 +310,7 @@ describe("crash during file rename operation", () => {
     syncAndUnmount(FS, tomefs);
 
     // Phase 2: mount, write more data (making pages dirty), then rename
-    const { FS: FS2, tomefs: tomefs2 } = await mountTome(crashBackend);
+    const { FS: FS2 } = await mountTome(crashBackend);
     const newContent = "updated-content-after-sync";
     const newData = encode(newContent);
     const s2 = FS2.open(`${MOUNT}/dirty.txt`, O.RDWR, 0o666);

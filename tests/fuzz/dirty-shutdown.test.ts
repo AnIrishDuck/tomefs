@@ -33,14 +33,14 @@
  * the seams: metadata updates after flush, dirty flush ordering"
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it } from "vitest";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { createTomeFS } from "../../src/tomefs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import type { EmscriptenFS } from "../harness/emscripten-fs.js";
-import { O, SEEK_SET, SEEK_CUR } from "../harness/emscripten-fs.js";
+import { O } from "../harness/emscripten-fs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -211,9 +211,6 @@ function generateOp(rng: Rng, model: FSModel): Op {
   for (const fd of model.openFds.values()) {
     if (model.files.has(fd.path)) filesWithOpenFds.add(fd.path);
   }
-  // Files without open fds — safe to unlink without creating /__deleted_* markers
-  const filesWithoutOpenFds = allFiles.filter((p) => !filesWithOpenFds.has(p));
-
   const weights: Array<[string, number]> = [
     ["createFile", 20],
     ["mkdir", 10],
@@ -907,7 +904,7 @@ function verifyCheckpointFilesReadable(
     }
   }
 
-  for (const [path, target] of checkpoint.symlinks) {
+  for (const [path, _target] of checkpoint.symlinks) {
     const fullPath = rw(path);
     try {
       const lstat = rawFS.lstat(fullPath);
@@ -961,7 +958,6 @@ function verifyCleanState(
       if (rawFS.isDir(stat.mode)) {
         walk(fullPath);
       } else if (rawFS.isFile(stat.mode)) {
-        const expectedPages = stat.size > 0 ? Math.ceil(stat.size / PAGE_SIZE) : 0;
         // Re-read to verify content length matches stat.size
         if (stat.size > 0) {
           const buf = new Uint8Array(stat.size);

@@ -28,8 +28,6 @@ const O = {
   APPEND: 1024,
 } as const;
 
-const SEEK_SET = 0;
-const SEEK_END = 2;
 const MOUNT = "/tome";
 
 /** Encode a string to Uint8Array. */

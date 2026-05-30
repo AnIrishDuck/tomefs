@@ -384,7 +384,7 @@ describe("adversarial: rename metadata consistency", () => {
   // ---------------------------------------------------------------------------
 
   it("rename of never-synced file writes metadata from node state (crash safety)", async () => {
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create file but don't sync — no metadata in backend
     const s = FS.open(`${MOUNT}/unsynced`, O.RDWR | O.CREAT, 0o666);
@@ -477,7 +477,7 @@ describe("adversarial: rename metadata consistency", () => {
   });
 
   it("symlink rename of never-synced symlink writes metadata for crash safety", async () => {
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create file and symlink but don't sync
     const s = FS.open(`${MOUNT}/file`, O.RDWR | O.CREAT, 0o666);

@@ -9,7 +9,7 @@
  * Run: npx vitest bench
  */
 
-import { bench, describe, beforeEach } from "vitest";
+import { bench, describe } from "vitest";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { createTomeFS } from "../../src/tomefs.js";

@@ -316,7 +316,7 @@ describe("adversarial: symlink target persistence through dirty shutdown", () =>
     // scenario. rename() eagerly writes metadata then triggers orphan
     // cleanup on the next syncfs.
     writeFile(FS, `${MOUNT}/temp.dat`, fillPattern(50, 9));
-    const fd = FS.open(`${MOUNT}/temp.dat`, O.RDONLY);
+    FS.open(`${MOUNT}/temp.dat`, O.RDONLY);
     FS.unlink(`${MOUNT}/temp.dat`);
 
     // Dirty shutdown with an open fd on an unlinked file

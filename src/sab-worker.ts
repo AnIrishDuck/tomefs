@@ -13,7 +13,6 @@
 import type { StorageBackend } from "./storage-backend.js";
 import type { FileMeta } from "./types.js";
 import {
-  STATUS_IDLE,
   STATUS_REQUEST,
   STATUS_RESPONSE,
   STATUS_ERROR,
@@ -26,7 +25,6 @@ import {
 } from "./sab-protocol.js";
 
 export class SabWorker {
-  private readonly sab: SharedArrayBuffer;
   private readonly backend: StorageBackend;
   private readonly controlView: Int32Array;
   private readonly dataView: DataView;
@@ -42,7 +40,6 @@ export class SabWorker {
   private stopPromise: Promise<void> = Promise.resolve();
 
   constructor(sab: SharedArrayBuffer, backend: StorageBackend) {
-    this.sab = sab;
     this.backend = backend;
     this.controlView = new Int32Array(sab, 0, 3);
     this.dataView = new DataView(sab);
