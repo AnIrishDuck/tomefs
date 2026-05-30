@@ -21,7 +21,6 @@ import {
   O,
   SEEK_SET,
   SEEK_CUR,
-  SEEK_END,
   type FSHarness,
 } from "../harness/emscripten-fs.js";
 import { PAGE_SIZE } from "../../src/types.js";

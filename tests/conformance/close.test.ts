@@ -82,7 +82,6 @@ describe("close (close.c)", () => {
   it("fd number is reusable after close", () => {
     const { FS } = h;
     const stream1 = FS.open("/reuse1", O.RDWR | O.CREAT, 0o777);
-    const fd1 = stream1.fd;
     FS.close(stream1);
 
     // The next open may reuse the same fd number

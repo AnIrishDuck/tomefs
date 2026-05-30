@@ -44,8 +44,6 @@ const O = {
   APPEND: 1024,
 } as const;
 
-const SEEK_SET = 0;
-const SEEK_END = 2;
 const MOUNT = "/data";
 const MAX_PAGES = 4; // 32 KB — extreme cache pressure
 

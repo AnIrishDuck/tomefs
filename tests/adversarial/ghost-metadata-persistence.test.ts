@@ -33,7 +33,6 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
-import type { FileMeta } from "../../src/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

@@ -10,7 +10,6 @@ import {
   decode,
   expectErrno,
   O,
-  SEEK_SET,
   S_IFMT,
   S_IFREG,
   S_IRWXUGO,

@@ -9,8 +9,6 @@ import { SabClient } from "../../src/sab-client.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import {
   encodeMessage,
-  CONTROL_BYTES,
-  JSON_REGION_OFFSET,
 } from "../../src/sab-protocol.js";
 
 const sab: SharedArrayBuffer = workerData.sab;

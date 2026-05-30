@@ -42,7 +42,6 @@ export interface SabClientOptions {
 }
 
 export class SabClient implements SyncStorageBackend {
-  private readonly sab: SharedArrayBuffer;
   private readonly controlView: Int32Array;
   private readonly dataView: DataView;
   private readonly uint8View: Uint8Array;
@@ -93,7 +92,6 @@ export class SabClient implements SyncStorageBackend {
   private readonly maxBatchFiles: number;
 
   constructor(sab: SharedArrayBuffer, options?: SabClientOptions) {
-    this.sab = sab;
     this.controlView = new Int32Array(sab, 0, 3);
     this.dataView = new DataView(sab);
     this.uint8View = new Uint8Array(sab);

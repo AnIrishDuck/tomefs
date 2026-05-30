@@ -7,8 +7,6 @@
  */
 import {
   createFS,
-  encode,
-  decode,
   expectErrno,
   O,
   S_IFMT,

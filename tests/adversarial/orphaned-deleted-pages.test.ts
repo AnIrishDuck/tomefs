@@ -36,11 +36,6 @@ function encode(s: string): Uint8Array {
   return new TextEncoder().encode(s);
 }
 
-function decode(buf: Uint8Array, length?: number): string {
-  return new TextDecoder().decode(
-    length !== undefined ? buf.subarray(0, length) : buf,
-  );
-}
 
 function fillPattern(size: number, seed: number): Uint8Array {
   const buf = new Uint8Array(size);

@@ -10,7 +10,6 @@
  */
 import {
   createFS,
-  encode,
   decode,
   expectErrno,
   O,

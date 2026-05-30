@@ -17,13 +17,6 @@ function filledPage(value: number): Uint8Array {
   return page;
 }
 
-function testData(length: number, start = 0): Uint8Array {
-  const buf = new Uint8Array(length);
-  for (let i = 0; i < length; i++) {
-    buf[i] = (start + i) & 0xff;
-  }
-  return buf;
-}
 
 describe("OpfsSahBackend", () => {
   let backend: OpfsSahBackend;

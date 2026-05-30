@@ -19,7 +19,7 @@ import { dirname, join } from "path";
 import { createTomeFS } from "../../src/tomefs.js";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
-import type { EmscriptenFS, EmscriptenStream } from "../harness/emscripten-fs.js";
+import type { EmscriptenFS } from "../harness/emscripten-fs.js";
 import { O, SEEK_SET, SEEK_CUR, SEEK_END } from "../harness/emscripten-fs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));

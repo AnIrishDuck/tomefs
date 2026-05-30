@@ -12,7 +12,6 @@ import { describe, it, expect, beforeEach, afterEach, beforeAll } from "vitest";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { MemoryBackend } from "../../src/memory-backend.js";
 import { SabWorker } from "../../src/sab-worker.js";
 import { SabClient } from "../../src/sab-client.js";

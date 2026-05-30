@@ -40,7 +40,6 @@ const O = {
 } as const;
 
 const MOUNT = "/tome";
-const CLEAN_MARKER_PATH = "/__tomefs_clean";
 
 function encode(s: string): Uint8Array {
   return new TextEncoder().encode(s);

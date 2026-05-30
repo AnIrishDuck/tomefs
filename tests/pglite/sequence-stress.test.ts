@@ -73,7 +73,7 @@ describe("Rapid nextval on multiple sequences", () => {
         results.c.push(Number(rc.rows[0].v));
       }
 
-      for (const [name, vals] of Object.entries(results)) {
+      for (const [_name, vals] of Object.entries(results)) {
         for (let i = 0; i < vals.length; i++) {
           expect(vals[i]).toBe(i + 1);
         }

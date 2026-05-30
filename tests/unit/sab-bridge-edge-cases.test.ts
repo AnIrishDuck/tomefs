@@ -1511,7 +1511,6 @@ describe("SAB bridge: worker-side dataLen validation", () => {
   let sab: SharedArrayBuffer;
 
   // Import protocol constants for manual request crafting
-  const STATUS_IDLE = 0;
   const STATUS_REQUEST = 1;
   const STATUS_RESPONSE = 2;
   const STATUS_ERROR = -1;
@@ -1550,7 +1549,7 @@ describe("SAB bridge: worker-side dataLen validation", () => {
     Atomics.store(controlView, SLOT_DATA_LEN, dataLen);
 
     // Start worker, signal request, and wait for response
-    const workerPromise = sabWorker.start();
+    sabWorker.start();
     Atomics.store(controlView, SLOT_STATUS, STATUS_REQUEST);
     Atomics.notify(controlView, SLOT_STATUS);
 

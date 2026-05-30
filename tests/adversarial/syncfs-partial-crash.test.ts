@@ -482,7 +482,7 @@ describe("partial syncfs: crash during orphan cleanup", () => {
     // Use a high crash count so pages + metadata write succeeds,
     // but orphan cleanup (listFiles + deleteFiles + deleteMetas) crashes.
     const crashBackend = new CrashAfterNOpsSyncBackend(inner, 100);
-    const { FS: FS2, tomefs: t2 } = await mountTome(crashBackend);
+    const { FS: FS2 } = await mountTome(crashBackend);
     FS2.unlink(`${MOUNT}/remove`);
 
     // Inject stale metadata back to simulate orphan (unlink already cleaned
@@ -517,7 +517,7 @@ describe("partial syncfs: crash during orphan cleanup", () => {
     inner.writePage("/remove", 0, new Uint8Array(PAGE_SIZE));
 
     crashBackend2.arm();
-    const err = syncfs(FS3, t3);
+    syncfs(FS3, t3);
     // May or may not crash depending on exact op count
 
     // Phase 3: remount and verify — orphan may or may not be present

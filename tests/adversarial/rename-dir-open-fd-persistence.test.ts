@@ -211,7 +211,7 @@ describe("adversarial: directory rename with open descendant FDs + persistence",
 
     // Verify read through FD returns correct merged content
     const readBuf = new Uint8Array(3 * PAGE_SIZE);
-    const n = FS.read(fd, readBuf, 0, readBuf.length, 0);
+    FS.read(fd, readBuf, 0, readBuf.length, 0);
 
     // First part: original data up to write position
     for (let i = 0; i < PAGE_SIZE - 50; i++) {
