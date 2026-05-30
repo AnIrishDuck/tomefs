@@ -421,6 +421,11 @@ export class SabClient implements SyncStorageBackend {
     }
   }
 
+  cleanupOrphanedPages(): number {
+    const { json } = this.call(OpCode.CLEANUP_ORPHANED_PAGES, {});
+    return (json as { removed: number }).removed;
+  }
+
   syncAll(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,

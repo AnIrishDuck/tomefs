@@ -361,6 +361,7 @@ describe("sab-protocol", () => {
       expect(opcodeName(OpCode.WRITE_PAGES)).toBe("WRITE_PAGES");
       expect(opcodeName(OpCode.SYNC_ALL)).toBe("SYNC_ALL");
       expect(opcodeName(OpCode.DELETE_ALL)).toBe("DELETE_ALL");
+      expect(opcodeName(OpCode.CLEANUP_ORPHANED_PAGES)).toBe("CLEANUP_ORPHANED_PAGES");
       expect(opcodeName(OpCode.LIST_FILES_RANGE)).toBe("LIST_FILES_RANGE");
     });
 

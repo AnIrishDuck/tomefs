@@ -1603,6 +1603,17 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               _orphansDeleted += orphanPaths.length;
             }
 
+            // Clean up page-level orphans: pages that exist in the backend
+            // without a corresponding metadata entry. These accumulate when
+            // a crash occurs between dirty page eviction (which writes pages
+            // via writePage/writePages) and the next syncfs (which writes
+            // metadata via syncAll). The metadata orphan cleanup above
+            // handles stale metadata; this handles the inverse case.
+            if (backend.cleanupOrphanedPages) {
+              const pageOrphans = backend.cleanupOrphanedPages();
+              _orphansDeleted += pageOrphans;
+            }
+
             // Write the clean-shutdown marker AFTER orphan cleanup. This
             // ordering guarantees crash safety: if the process dies before
             // this point, the next mount won't find a marker and will force

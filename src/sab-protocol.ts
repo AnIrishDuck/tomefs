@@ -43,6 +43,7 @@ export const OpCode = {
   MAX_PAGE_INDEX_BATCH: 20,
   SYNC_ALL: 21,
   DELETE_ALL: 22,
+  CLEANUP_ORPHANED_PAGES: 23,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];
