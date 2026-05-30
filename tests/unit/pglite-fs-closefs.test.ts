@@ -149,4 +149,107 @@ describe("pglite-fs closeFs error handling @fast", () => {
 
     expect(baseCloseFsCalled).toBe(true);
   });
+
+  it("closeFs prioritizes sync error over base closeFs error @fast", async () => {
+    let baseCloseFsCalled = false;
+    class FakeMemoryFS {
+      init() {
+        return Promise.resolve({
+          emscriptenOpts: { preRun: [] },
+        });
+      }
+      closeFs() {
+        baseCloseFsCalled = true;
+        return Promise.reject(new Error("base cleanup failed"));
+      }
+      syncToFs() {
+        return Promise.resolve();
+      }
+    }
+
+    const backend = new SyncMemoryBackend();
+    const adapter = createTomeFSPGlite({
+      MemoryFS: FakeMemoryFS as any,
+      backend,
+      maxPages: 64,
+    });
+
+    const initResult = await adapter.init({}, {});
+
+    const fakeModule = {
+      FS: {
+        filesystems: {},
+        mkdir: () => {},
+        mount: () => {},
+        syncfs: (_populate: boolean, callback: (err: Error | null) => void) => {
+          callback(new Error("simulated IDB quota exceeded"));
+        },
+      },
+    };
+
+    for (const hook of initResult.emscriptenOpts.preRun) {
+      hook(fakeModule);
+    }
+
+    let caught: Error | null = null;
+    try {
+      await adapter.closeFs();
+    } catch (e) {
+      caught = e as Error;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toBe("simulated IDB quota exceeded");
+    expect(baseCloseFsCalled).toBe(true);
+  });
+
+  it("closeFs throws base error when only base closeFs fails @fast", async () => {
+    class FakeMemoryFS {
+      init() {
+        return Promise.resolve({
+          emscriptenOpts: { preRun: [] },
+        });
+      }
+      closeFs() {
+        return Promise.reject(new Error("base cleanup failed"));
+      }
+      syncToFs() {
+        return Promise.resolve();
+      }
+    }
+
+    const backend = new SyncMemoryBackend();
+    const adapter = createTomeFSPGlite({
+      MemoryFS: FakeMemoryFS as any,
+      backend,
+      maxPages: 64,
+    });
+
+    const initResult = await adapter.init({}, {});
+
+    const fakeModule = {
+      FS: {
+        filesystems: {},
+        mkdir: () => {},
+        mount: () => {},
+        syncfs: (_populate: boolean, callback: (err: Error | null) => void) => {
+          callback(null);
+        },
+      },
+    };
+
+    for (const hook of initResult.emscriptenOpts.preRun) {
+      hook(fakeModule);
+    }
+
+    let caught: Error | null = null;
+    try {
+      await adapter.closeFs();
+    } catch (e) {
+      caught = e as Error;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toBe("base cleanup failed");
+  });
 });
