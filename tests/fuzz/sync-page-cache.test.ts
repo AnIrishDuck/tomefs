@@ -315,6 +315,7 @@ function runFuzzSession(
       // (cache, mruPage, filePages, dirtyKeys, dirtyFileKeys) that
       // doesn't immediately manifest as incorrect data.
       cache.assertInvariants();
+      backend.assertInvariants();
 
       switch (op) {
         case "write": {
@@ -534,6 +535,7 @@ function runFuzzSession(
         }
       }
       cache.assertInvariants();
+      backend.assertInvariants();
     } catch (e) {
       throw new Error(
         `Seed ${seed}, step ${step}, op ${op} failed: ${(e as Error).message}`,
@@ -543,6 +545,7 @@ function runFuzzSession(
 
   // Final invariant check and verification: flush everything and compare all files
   cache.assertInvariants();
+  backend.assertInvariants();
   cache.flushAll();
   for (const path of activeFiles) {
     verifyBackendFile(backend, model, path);
