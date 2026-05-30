@@ -17,7 +17,7 @@
  */
 
 import { PAGE_SIZE, PAGE_SHIFT, PAGE_MASK } from "./types.js";
-import type { FileMeta } from "./types.js";
+import type { FileMeta, TomeFSStats } from "./types.js";
 import { SyncPageCache } from "./sync-page-cache.js";
 import { SyncMemoryBackend } from "./sync-memory-backend.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
@@ -163,6 +163,15 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       dirtyMetaNodes.add(node);
     }
   }
+
+  // ---------------------------------------------------------------
+  // Filesystem-level performance counters
+  // ---------------------------------------------------------------
+  let _syncfsCount = 0;
+  let _incrementalSyncs = 0;
+  let _fullTreeSyncs = 0;
+  let _noopSyncs = 0;
+  let _orphansDeleted = 0;
 
   // ---------------------------------------------------------------
   // Page-cached file I/O
@@ -1333,6 +1342,26 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     /** Expose the backend for testing. */
     backend,
 
+    getStats(): TomeFSStats {
+      return {
+        syncfsCount: _syncfsCount,
+        incrementalSyncs: _incrementalSyncs,
+        fullTreeSyncs: _fullTreeSyncs,
+        noopSyncs: _noopSyncs,
+        orphansDeleted: _orphansDeleted,
+        trackedFiles: allFileNodes.size,
+        dirtyMetaCount: dirtyMetaNodes.size,
+      };
+    },
+
+    resetStats(): void {
+      _syncfsCount = 0;
+      _incrementalSyncs = 0;
+      _fullTreeSyncs = 0;
+      _noopSyncs = 0;
+      _orphansDeleted = 0;
+    },
+
     mount(_mount: any) {
       mountPrefix = _mount.mountpoint || "";
       const root = TOMEFS.createNode(null, "/", 0o40000 | 0o777, 0);
@@ -1368,6 +1397,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               });
               needsCleanMarker = false;
             }
+            _syncfsCount++;
+            _noopSyncs++;
             callback(null);
             return;
           }
@@ -1447,6 +1478,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             // so the next syncfs retries instead of silently losing data.
             pageCache.commitDirtyPages(dirtyPages);
             needsCleanMarker = false;
+            _syncfsCount++;
+            _incrementalSyncs++;
             for (const node of dirtyMetaNodes) {
               node._metaDirty = false;
             }
@@ -1567,6 +1600,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             }
             if (orphanPaths.length > 0) {
               backend.deleteAll(orphanPaths);
+              _orphansDeleted += orphanPaths.length;
             }
 
             // Write the clean-shutdown marker AFTER orphan cleanup. This
@@ -1578,6 +1612,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
             });
             needsCleanMarker = false;
             needsOrphanCleanup = false;
+            _syncfsCount++;
+            _fullTreeSyncs++;
           }
         }
         callback(null);
