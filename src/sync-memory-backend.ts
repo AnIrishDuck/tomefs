@@ -254,8 +254,8 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   }
 
   deleteAll(paths: string[]): void {
-    this.deleteFiles(paths);
     this.deleteMetas(paths);
+    this.deleteFiles(paths);
   }
 
   assertInvariants(): void {
