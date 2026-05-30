@@ -22,7 +22,7 @@ import {
 const PAGE_SIZE = 8192;
 
 const describeIfTomefs =
-  process.env.TOMEFS_BACKEND === "tomefs" ? describe : describe.skip;
+  process.env.TOMEFS_BACKEND ? describe : describe.skip;
 
 describeIfTomefs("adversarial: allocate() stream_ops", () => {
   let h: FSHarness;

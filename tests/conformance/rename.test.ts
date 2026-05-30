@@ -141,7 +141,7 @@ describe("rename (test_rename.c)", () => {
   // Root rename tests only apply to MEMFS — under tomefs, "/" is rewritten
   // to the mount point, which produces EXDEV (cross-device) instead.
   const itIfMemfs =
-    process.env.TOMEFS_BACKEND === "tomefs" ? it.skip : it;
+    process.env.TOMEFS_BACKEND ? it.skip : it;
 
   itIfMemfs("rename root as source throws EINVAL (JS FS) or EBUSY (WasmFS)", () => {
     const { FS, E } = h;
