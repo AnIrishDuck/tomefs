@@ -25,9 +25,19 @@ Kicked off after Run 1 completed. Covers the same 163 test files but exercises
 the tomefs FS implementation instead of MEMFS. The 22 tests that skip in
 MEMFS mode (gated on `TOMEFS_BACKEND`) become active in this mode.
 
-*(Run 2 in progress — 0 failures observed through ~160 tests. Expected to match
-Run 1 results based on the pattern: the previously-skipped 22 tests all pass
-individually when `TOMEFS_BACKEND=tomefs` is set.)*
+```
+TOMEFS_BACKEND=tomefs npm test
+```
+
+| Metric       | Result                  |
+|-------------|------------------------|
+| Test Files  | 163 passed, 0 skipped  |
+| Tests       | 4074 passed, 4 skipped |
+| Failures    | 0                      |
+| Duration    | 1529s (~25.5 min)      |
+
+All 163 test files ran (none skipped). The 22 MEMFS-skipped tests now execute
+and pass. Only 4 tests skip in this mode (preload-backend-specific).
 
 ### Run 3: Previously-skipped tests only
 
