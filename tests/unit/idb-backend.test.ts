@@ -745,6 +745,60 @@ describe("IdbBackend", () => {
         req.onerror = () => reject(req.error);
       });
     });
+
+    it("IdbBackend readPage rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-readpage-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writePage("/file", 0, filledPage(0x01));
+
+      db.close();
+
+      await expect(b.readPage("/file", 0)).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
+
+    it("IdbBackend countPages rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-countpages-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writePage("/file", 0, filledPage(0x01));
+
+      db.close();
+
+      await expect(b.countPages("/file")).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
+
+    it("IdbBackend maxPageIndex rejects when db connection is closed @fast", async () => {
+      const dbName = `tomefs-close-maxpageidx-${dbCounter++}`;
+      const db = await openTestDb(dbName);
+      const b = new IdbBackend({ db });
+
+      await b.writePage("/file", 0, filledPage(0x01));
+
+      db.close();
+
+      await expect(b.maxPageIndex("/file")).rejects.toThrow();
+
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    });
   });
 
   describe("edge cases", () => {
