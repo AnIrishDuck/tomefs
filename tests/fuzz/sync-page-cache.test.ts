@@ -254,7 +254,9 @@ type OpType =
   | "collectCommit"
   | "evictFile"
   | "getPage"
-  | "markPageDirty";
+  | "getPageNoRead"
+  | "markPageDirty"
+  | "markPageDirtyNoRead";
 
 const OP_WEIGHTS: Array<[OpType, number]> = [
   ["write", 20],
@@ -269,8 +271,10 @@ const OP_WEIGHTS: Array<[OpType, number]> = [
   ["truncate", 4],
   ["collectCommit", 4],
   ["evictFile", 2],
-  ["getPage", 6],
-  ["markPageDirty", 3],
+  ["getPage", 5],
+  ["getPageNoRead", 3],
+  ["markPageDirty", 2],
+  ["markPageDirtyNoRead", 3],
 ];
 
 function pickOp(rng: Rng): OpType {
@@ -425,6 +429,28 @@ function runFuzzSession(
           break;
         }
 
+        case "getPageNoRead": {
+          // Get a page beyond file extent without reading from backend.
+          // This exercises the code path used during file extension writes
+          // where we know the page doesn't exist in the backend.
+          const path = rng.pick(FILE_POOL);
+          const fileSize = model.fileSizes.get(path) ?? 0;
+          const firstNewPage = fileSize > 0
+            ? Math.ceil(fileSize / PAGE_SIZE)
+            : 0;
+          const pageIndex = firstNewPage + rng.int(3);
+
+          const page = cache.getPageNoRead(path, pageIndex);
+          // Page should be zero-filled (no data exists beyond file extent)
+          expect(page.data).toEqual(new Uint8Array(PAGE_SIZE));
+          expect(page.evicted).toBe(false);
+          activeFiles.add(path);
+          if (!model.fileSizes.has(path)) {
+            model.fileSizes.set(path, 0);
+          }
+          break;
+        }
+
         case "flushFile": {
           if (activeFiles.size === 0) break;
           const path = rng.pick([...activeFiles]);
@@ -490,10 +516,15 @@ function runFuzzSession(
             cache.invalidatePagesFrom(path, neededPages);
             backend.deletePagesFrom(path, neededPages);
           } else {
-            // Grow: mark sentinel page dirty
+            // Grow: mark sentinel page dirty (matching tomefs behavior)
             const lastPageIdx = Math.ceil(newSize / PAGE_SIZE) - 1;
             const firstNewPage = fileSize > 0 ? Math.ceil(fileSize / PAGE_SIZE) : 0;
             if (lastPageIdx >= firstNewPage) {
+              // Use markPageDirtyNoRead for pages beyond extent (matches
+              // tomefs resizeFileStorage which skips backend reads for
+              // sentinel pages that can't exist yet)
+              cache.markPageDirtyNoRead(path, lastPageIdx);
+            } else {
               cache.markPageDirty(path, lastPageIdx);
             }
           }
@@ -522,12 +553,29 @@ function runFuzzSession(
           const path = rng.pick(FILE_POOL);
           const pageIndex = rng.int(4);
           cache.markPageDirty(path, pageIndex);
-          // markPageDirty on the cache doesn't change data — it just ensures
-          // the page exists and is dirty. The model doesn't need updating.
-          // But we need to track it if it creates a new file.
           if (!model.fileSizes.has(path)) {
-            // The page was created but with zero data. The model should know
-            // about this file's pages for verification.
+            model.fileSizes.set(path, 0);
+          }
+          activeFiles.add(path);
+          break;
+        }
+
+        case "markPageDirtyNoRead": {
+          // Mark a page beyond file extent as dirty without reading from
+          // backend. This is the code path used by tomefs's
+          // resizeFileStorage when growing a file via allocate() — the
+          // sentinel page is always beyond the current extent, so the
+          // backend read would be a wasted round-trip returning null.
+          const path = rng.pick(FILE_POOL);
+          const fileSize = model.fileSizes.get(path) ?? 0;
+          const firstNewPage = fileSize > 0
+            ? Math.ceil(fileSize / PAGE_SIZE)
+            : 0;
+          const pageIndex = firstNewPage + rng.int(3);
+
+          cache.markPageDirtyNoRead(path, pageIndex);
+          expect(cache.isDirty(path, pageIndex)).toBe(true);
+          if (!model.fileSizes.has(path)) {
             model.fileSizes.set(path, 0);
           }
           activeFiles.add(path);
