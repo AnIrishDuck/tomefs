@@ -569,6 +569,89 @@ describe("PreloadBackend flush ordering", () => {
     expect(sa.metas.includes("/f")).toBe(true);
   });
 
+  it("@fast flush deletes metadata before pages for crash safety", async () => {
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0xaa;
+    await innerRemote.writePage("/remove", 0, data);
+    await innerRemote.writeMeta("/remove", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+    await innerRemote.writePage("/keep", 0, data);
+    await innerRemote.writeMeta("/keep", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+    remote.clearLog();
+
+    backend.deleteFile("/remove");
+    backend.deleteMeta("/remove");
+
+    await backend.flush();
+
+    const deleteMetasIdx = remote.log.findIndex(
+      ([op, arg]) =>
+        (op === "deleteMetas" && (arg as string[]).includes("/remove")) ||
+        (op === "deleteMeta" && arg === "/remove"),
+    );
+    const deleteFilesIdx = remote.log.findIndex(
+      ([op, arg]) =>
+        (op === "deleteFiles" && (arg as string[]).includes("/remove")) ||
+        (op === "deleteFile" && arg === "/remove"),
+    );
+
+    expect(deleteMetasIdx).toBeGreaterThanOrEqual(0);
+    expect(deleteFilesIdx).toBeGreaterThanOrEqual(0);
+    expect(deleteMetasIdx).toBeLessThan(deleteFilesIdx);
+  });
+
+  it("crash between deleteMetas and deleteFiles leaves orphaned pages, not ghost metadata", async () => {
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0xaa;
+    await innerRemote.writePage("/remove", 0, data);
+    await innerRemote.writeMeta("/remove", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+    await innerRemote.writePage("/keep", 0, data);
+    await innerRemote.writeMeta("/keep", {
+      size: PAGE_SIZE,
+      mode: 0o100644,
+      ctime: 1000,
+      mtime: 1000,
+    });
+
+    // crashAfterOps=1: allows deleteMetas to succeed, crashes on deleteFiles
+    const crashBackend = new CrashAfterNOpsBackend(innerRemote, 1);
+    const backend = new PreloadBackend(crashBackend);
+    await backend.init();
+
+    backend.deleteFile("/remove");
+    backend.deleteMeta("/remove");
+
+    await expect(backend.flush()).rejects.toThrow("SIMULATED_CRASH");
+
+    // Metadata is gone — file is invisible to listFiles (safe)
+    expect(await innerRemote.listFiles()).toEqual(["/keep"]);
+    expect(await innerRemote.readMeta("/remove")).toBeNull();
+
+    // Pages are orphaned but invisible — cleaned up by cleanupOrphanedPages
+    expect(await innerRemote.readPage("/remove", 0)).not.toBeNull();
+
+    // Kept file is untouched
+    expect(await innerRemote.readPage("/keep", 0)).toEqual(data);
+    expect(await innerRemote.readMeta("/keep")).not.toBeNull();
+  });
+
   it("crash during syncAll is atomic — no partial page+meta writes", async () => {
     // With syncAll, a crash during the atomic operation should leave the
     // remote in a consistent state: either both pages and metadata are

@@ -644,17 +644,20 @@ export class PreloadBackend implements SyncStorageBackend {
       await this.remote.syncAll(earlyBatch, earlyMeta);
     }
 
-    // 3. Batch-delete files from remote (single call instead of O(n))
-    if (this.deletedFiles.size > 0) {
-      await this.remote.deleteFiles([...this.deletedFiles]);
-    }
-    this.deletedFiles.clear();
-
-    // 4. Batch-delete metadata
+    // 3. Batch-delete metadata BEFORE pages. A crash between the two
+    // phases must leave orphaned pages (invisible, cleaned by
+    // cleanupOrphanedPages) rather than ghost metadata (visible in
+    // listFiles with no backing data — silent data corruption).
     if (this.deletedMeta.size > 0) {
       await this.remote.deleteMetas([...this.deletedMeta]);
     }
     this.deletedMeta.clear();
+
+    // 4. Batch-delete files (pages) from remote
+    if (this.deletedFiles.size > 0) {
+      await this.remote.deleteFiles([...this.deletedFiles]);
+    }
+    this.deletedFiles.clear();
 
     // 5. Atomically write pages + metadata for delete-then-recreate paths.
     // Same syncAll guarantee as step 2 — IDB commits both in one transaction.
