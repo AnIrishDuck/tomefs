@@ -10,17 +10,17 @@
  * Phases:
  *   1. deletePagesFrom (truncations)  → truncations.clear()
  *   2. syncAll (early batch)          → (no clear, dirty stays)
- *   3. deleteFiles                    → deletedFiles.clear()
- *   4. deleteMetas                    → deletedMeta.clear()
+ *   3. deleteMetas                    → deletedMeta.clear()
+ *   4. deleteFiles                    → deletedFiles.clear()
  *   5. syncAll (late batch)           → (no clear, dirty stays)
  *   6. clear dirtyPages/dirtyMeta for flushed keys
  *
  * Key interactions tested:
  * - Truncations applied then syncAll fails: retry doesn't re-truncate,
  *   dirty pages at truncation points are correctly re-applied
- * - DeleteFiles succeeds then deleteMetas fails: retry handles the
- *   reclassification of late-batch pages as early-batch
- * - Delete-then-recreate: phase 3 failure leaves deletedFiles intact,
+ * - DeleteMetas succeeds then deleteFiles fails: orphaned pages are
+ *   safely invisible to listFiles, retry removes them
+ * - Delete-then-recreate: phase 4 failure leaves deletedFiles intact,
  *   retry correctly defers recreated data to late batch
  * - Phase 5 failure: late-batch data (delete-then-recreate) is preserved
  *   for retry
@@ -285,7 +285,7 @@ describe("PreloadBackend flush() partial failure recovery", () => {
     });
   });
 
-  describe("phase 3 failure (deleteFiles) after phase 2 (early syncAll)", () => {
+  describe("phase 4 failure (deleteFiles) after phase 3 (deleteMetas)", () => {
     it("@fast early batch written, deleteFiles fails: retry re-applies deletion", async () => {
       const remote = new PhaseFailingBackend();
       const preload = new PreloadBackend(remote);
@@ -304,7 +304,8 @@ describe("PreloadBackend flush() partial failure recovery", () => {
       preload.deleteFile("/delete");
       preload.deleteMeta("/delete");
 
-      // Fail deleteFiles (phase 3) — early syncAll (phase 2) already wrote /keep
+      // Fail deleteFiles (phase 4) — early syncAll (phase 2) already
+      // wrote /keep, and deleteMetas (phase 3) already removed metadata
       remote.failNext("deleteFiles");
       await expect(preload.flush()).rejects.toThrow(
         "injected deleteFiles failure",
@@ -314,7 +315,8 @@ describe("PreloadBackend flush() partial failure recovery", () => {
       const keepPage = await remote.readPage("/keep", 0);
       expect(keepPage![0]).toBe(0x33);
 
-      // /delete still exists in remote (phase 3 failed)
+      // /delete pages still in remote (phase 4 failed), but metadata is
+      // gone (phase 3 succeeded) — orphaned pages, not ghost metadata
       const deletePage = await remote.readPage("/delete", 0);
       expect(deletePage).not.toBeNull();
 
@@ -330,8 +332,8 @@ describe("PreloadBackend flush() partial failure recovery", () => {
     });
   });
 
-  describe("phase 4 failure (deleteMetas) after phase 3 (deleteFiles)", () => {
-    it("@fast pages deleted, metadata delete fails: retry cleans up metadata", async () => {
+  describe("phase 3 failure (deleteMetas) before phase 4 (deleteFiles)", () => {
+    it("@fast metadata delete fails: both pages and metadata survive, retry cleans up", async () => {
       const remote = new PhaseFailingBackend();
       const preload = new PreloadBackend(remote);
       await preload.init();
@@ -345,18 +347,17 @@ describe("PreloadBackend flush() partial failure recovery", () => {
       preload.deleteFile("/victim");
       preload.deleteMeta("/victim");
 
-      // Fail deleteMetas (phase 4) — deleteFiles (phase 3) already removed pages
+      // Fail deleteMetas (phase 3) — deleteFiles (phase 4) never runs
       remote.failNext("deleteMetas");
       await expect(preload.flush()).rejects.toThrow(
         "injected deleteMetas failure",
       );
 
-      // Pages gone (phase 3 succeeded)
-      expect(await remote.readPage("/victim", 0)).toBeNull();
-      // Metadata still present (phase 4 failed)
+      // Both pages and metadata survive (phase 3 failed, phase 4 never ran)
+      expect(await remote.readPage("/victim", 0)).not.toBeNull();
       expect(await remote.readMeta("/victim")).not.toBeNull();
 
-      // Retry removes the orphaned metadata
+      // Retry removes both metadata (phase 3) and pages (phase 4)
       await preload.flush();
       expect(preload.isDirty).toBe(false);
 
@@ -365,7 +366,7 @@ describe("PreloadBackend flush() partial failure recovery", () => {
       expect(fresh.listFiles()).toEqual([]);
     });
 
-    it("deleteFiles clears then deleteMetas fails: late-batch reclassification on retry", async () => {
+    it("deleteMetas fails: late-batch reclassification on retry", async () => {
       const remote = new PhaseFailingBackend();
       const preload = new PreloadBackend(remote);
       await preload.init();
@@ -386,20 +387,20 @@ describe("PreloadBackend flush() partial failure recovery", () => {
       preload.deleteFile("/orphan");
       preload.deleteMeta("/orphan");
 
-      // Fail deleteMetas — deleteFiles succeeds (clears deletedFiles)
+      // Fail deleteMetas (phase 3) — deleteFiles (phase 4) never runs
       remote.failNext("deleteMetas");
       await expect(preload.flush()).rejects.toThrow(
         "injected deleteMetas failure",
       );
 
-      // deleteFiles was cleared (phase 3 succeeded): both /old and /orphan pages gone
-      expect(await remote.readPage("/old", 0)).toBeNull();
-      expect(await remote.readPage("/orphan", 0)).toBeNull();
-      // /orphan's metadata still present (phase 4 failed)
+      // Phase 3 failed: nothing was deleted from the remote.
+      // All pages and metadata survive.
+      expect(await remote.readPage("/old", 0)).not.toBeNull();
+      expect(await remote.readPage("/orphan", 0)).not.toBeNull();
       expect(await remote.readMeta("/orphan")).not.toBeNull();
 
-      // On retry: /old is no longer in deletedFiles → goes to early batch.
-      // /orphan's metadata deletion retried in phase 4.
+      // On retry: deleteMetas and deleteFiles both succeed, then late
+      // batch writes new /old data.
       await preload.flush();
       expect(preload.isDirty).toBe(false);
 
@@ -413,7 +414,7 @@ describe("PreloadBackend flush() partial failure recovery", () => {
   });
 
   describe("phase 5 failure (late syncAll) after delete-then-recreate", () => {
-    it("@fast delete-then-recreate: phases 3-4 succeed, late syncAll fails, retry works", async () => {
+    it("@fast delete-then-recreate: delete phases succeed, late syncAll fails, retry works", async () => {
       const remote = new PhaseFailingBackend();
       const preload = new PreloadBackend(remote);
       await preload.init();
@@ -444,7 +445,7 @@ describe("PreloadBackend flush() partial failure recovery", () => {
       // /other was written in early batch (phase 2 succeeded)
       expect((await remote.readPage("/other", 0))![0]).toBe(0x88);
 
-      // Pages for /file were deleted (phase 3 succeeded)
+      // Pages for /file were deleted (phase 4 succeeded)
       expect(await remote.readPage("/file", 0)).toBeNull();
 
       // Retry: now deletedFiles is clear, so /file goes to early batch
@@ -493,7 +494,7 @@ describe("PreloadBackend flush() partial failure recovery", () => {
       // /z was written in early batch (phase 2 succeeded)
       expect((await remote.readPage("/z", 0))![0]).toBe(0x33);
 
-      // /x and /y pages deleted (phase 3), but new data not yet written
+      // /x and /y pages deleted (phase 4), but new data not yet written
       expect(await remote.readPage("/x", 0)).toBeNull();
       expect(await remote.readPage("/y", 0)).toBeNull();
 
