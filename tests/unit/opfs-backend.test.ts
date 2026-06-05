@@ -1210,4 +1210,74 @@ describe("OpfsBackend", () => {
       expect(await backend.maxPageIndex("/crash-file")).toBe(-1);
     });
   });
+
+  // -------------------------------------------------------------------
+  // Non-numeric OPFS entry resilience
+  // -------------------------------------------------------------------
+
+  describe("non-numeric directory entry resilience", () => {
+    it("maxPageIndex skips non-numeric entries @fast", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 3, filledPage(0x03));
+
+      // Inject a non-numeric file into the page directory via the fake OPFS
+      const root = (backend as any).root;
+      const pagesDir = await root.getDirectoryHandle("pages");
+      const encoded = hexEncode("/file");
+      const fileDir = await pagesDir.getDirectoryHandle(encoded);
+      await fileDir.getFileHandle("not-a-number", { create: true });
+
+      const max = await backend.maxPageIndex("/file");
+      expect(max).toBe(3);
+    });
+
+    it("deletePagesFrom skips non-numeric entries @fast", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 1, filledPage(0x02));
+      await backend.writePage("/file", 2, filledPage(0x03));
+
+      // Inject non-numeric entry
+      const root = (backend as any).root;
+      const pagesDir = await root.getDirectoryHandle("pages");
+      const encoded = hexEncode("/file");
+      const fileDir = await pagesDir.getDirectoryHandle(encoded);
+      await fileDir.getFileHandle("metadata.json", { create: true });
+
+      // Delete pages from index 1 onwards
+      await backend.deletePagesFrom("/file", 1);
+
+      // Page 0 should survive
+      expect(await backend.readPage("/file", 0)).toEqual(filledPage(0x01));
+      // Pages 1 and 2 should be deleted
+      expect(await backend.readPage("/file", 1)).toBeNull();
+      expect(await backend.readPage("/file", 2)).toBeNull();
+      // Non-numeric entry should not cause an error (it's skipped)
+    });
+
+    it("countPages counts all entries including non-numeric @fast", async () => {
+      await backend.writePage("/file", 0, filledPage(0x01));
+      await backend.writePage("/file", 1, filledPage(0x02));
+
+      const countBefore = await backend.countPages("/file");
+      expect(countBefore).toBe(2);
+
+      // Inject non-numeric entry
+      const root = (backend as any).root;
+      const pagesDir = await root.getDirectoryHandle("pages");
+      const encoded = hexEncode("/file");
+      const fileDir = await pagesDir.getDirectoryHandle(encoded);
+      await fileDir.getFileHandle("stray-file", { create: true });
+
+      // countPages counts raw entries — this is a known limitation
+      const countAfter = await backend.countPages("/file");
+      expect(countAfter).toBe(3);
+    });
+  });
 });
+
+function hexEncode(path: string): string {
+  const bytes = new TextEncoder().encode(path);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}

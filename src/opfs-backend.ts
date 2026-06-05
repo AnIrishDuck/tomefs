@@ -266,6 +266,7 @@ export class OpfsBackend implements StorageBackend {
       let max = -1;
       for await (const name of fileDir.keys()) {
         const idx = parseInt(name, 10);
+        if (Number.isNaN(idx)) continue;
         if (idx > max) max = idx;
       }
       return max;
@@ -393,6 +394,7 @@ export class OpfsBackend implements StorageBackend {
     const toRemove: string[] = [];
     for await (const name of (fileDir as IterableDirectoryHandle).keys()) {
       const idx = parseInt(name, 10);
+      if (Number.isNaN(idx)) continue;
       if (idx >= fromPageIndex) {
         toRemove.push(name);
       }
