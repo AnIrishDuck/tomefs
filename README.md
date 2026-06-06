@@ -30,7 +30,8 @@ tomefs
   ├── LRU Page Cache (bounded, in-memory)
   ├── File Metadata Cache
   └── Storage Backend
-      └── IndexedDB (persistent, page-level)
+      ├── IndexedDB (persistent, page-level)
+      └── OPFS (Origin Private File System)
 ```
 
 ### Sync Bridge
@@ -55,7 +56,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 
 ## Status
 
-**Core complete.** The filesystem, page cache, IDB backend, SAB bridge, and full-stack integration are tested and working (2300+ tests). See [plans/](plans/) for architecture and design rationale.
+**Core complete.** The filesystem, page cache, IDB backend, OPFS backend, SAB bridge, and full-stack integration are tested and working (2300+ tests). See [plans/ethos.md](plans/ethos.md) for design rationale.
 
 ### Roadmap
 

@@ -21,20 +21,25 @@ The `TOMEFS_BACKEND=tomefs` env var switches conformance tests to run against to
 ## Architecture
 
 ```
-src/tomefs.ts          — Emscripten FS implementation (node_ops, stream_ops)
-src/sync-page-cache.ts — Bounded LRU page cache with dirty tracking
-src/page-cache.ts      — Async page cache variant
-src/idb-backend.ts     — IndexedDB storage backend
-src/opfs-backend.ts    — OPFS storage backend
-src/preload-backend.ts — Graceful degradation without SharedArrayBuffer
-src/sab-client.ts      — SAB+Atomics sync bridge (worker side)
-src/sab-worker.ts      — SAB+Atomics sync bridge (storage worker side)
-src/sab-protocol.ts    — Shared protocol constants
-src/pglite-fs.ts       — PGlite adapter (extends MemoryFS)
-src/pglite.ts          — Public re-export for tomefs/pglite entry point
-src/worker.ts          — Public re-export for tomefs/worker entry point
-src/index.ts           — Main public API
-src/types.ts           — PAGE_SIZE (8192), FileMeta, PageKey, constants
+src/tomefs.ts              — Emscripten FS implementation (node_ops, stream_ops)
+src/sync-page-cache.ts     — Bounded LRU page cache with dirty tracking
+src/page-cache.ts          — Async page cache variant
+src/sync-storage-backend.ts — SyncStorageBackend interface (synchronous storage)
+src/storage-backend.ts     — StorageBackend interface (async storage)
+src/sync-memory-backend.ts — In-memory sync backend (testing, non-persistent PGlite)
+src/memory-backend.ts      — In-memory async backend (worker-side testing)
+src/idb-backend.ts         — IndexedDB storage backend
+src/opfs-backend.ts        — OPFS storage backend (async, file-per-page)
+src/opfs-sah-backend.ts    — OPFS SAH storage backend (sync access handles)
+src/preload-backend.ts     — Graceful degradation without SharedArrayBuffer
+src/sab-client.ts          — SAB+Atomics sync bridge (worker side)
+src/sab-worker.ts          — SAB+Atomics sync bridge (storage worker side)
+src/sab-protocol.ts        — Shared protocol constants
+src/pglite-fs.ts           — PGlite adapter (extends MemoryFS)
+src/pglite.ts              — Public re-export for tomefs/pglite entry point
+src/worker.ts              — Public re-export for tomefs/worker entry point
+src/index.ts               — Main public API
+src/types.ts               — PAGE_SIZE (8192), FileMeta, PageKey, constants
 ```
 
 Three package entry points: `.` (main), `./worker`, `./pglite`.
@@ -70,7 +75,7 @@ Test harness: `tests/harness/emscripten-fs.ts` provides `createFS()` which retur
 
 - `SyncStorageBackend` — synchronous storage (used by tomefs directly)
 - `StorageBackend` — async storage (used in worker context)
-- Both define: `readPage`, `writePage`, `readPages`, `writePages`, `deleteFile`, `deletePagesFrom`, `renameFile`, `readMeta`, `writeMeta`, `deleteMeta`, `listFiles`
+- Both define: `readPage`, `readPages`, `writePage`, `writePages`, `deleteFile`, `deleteFiles`, `deletePagesFrom`, `renameFile`, `countPages`, `countPagesBatch`, `maxPageIndex`, `maxPageIndexBatch`, `readMeta`, `readMetas`, `writeMeta`, `writeMetas`, `deleteMeta`, `deleteMetas`, `listFiles`, `syncAll`, `deleteAll`
 
 ## Design Decisions
 
