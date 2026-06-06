@@ -175,8 +175,8 @@ class CrashAfterNOpsSyncBackend implements SyncStorageBackend {
     this.writeMetas(metas);
   }
   deleteAll(paths: string[]): void {
-    this.deleteFiles(paths);
     this.deleteMetas(paths);
+    this.deleteFiles(paths);
   }
 }
 
