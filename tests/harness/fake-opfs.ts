@@ -85,6 +85,10 @@ class FakeWritableFileStream {
     }
     this.onClose(result);
   }
+
+  async abort(): Promise<void> {
+    this.committed = true;
+  }
 }
 
 /** Fake FileSystemSyncAccessHandle for testing createSyncAccessHandle(). */
