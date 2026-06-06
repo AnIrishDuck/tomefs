@@ -885,10 +885,33 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     }
 
     // Now move pages — metadata at new paths already exists.
-    for (const { child, oldPath, newPath } of pageRenames) {
-      pageCache.renameFile(oldPath, newPath);
-      child.storagePath = newPath;
-      child._pages = [];
+    // Wrap in try/catch to roll back completed renames on failure.
+    // Without rollback, a partial failure leaves some children with
+    // storagePaths pointing to new paths while the node tree stays at
+    // old paths (Emscripten doesn't rewire on exception). Subsequent
+    // operations on those children would use stale paths, corrupting
+    // data on the next rename or syncfs.
+    const completed: Array<{ child: any; oldPath: string; newPath: string }> = [];
+    try {
+      for (const { child, oldPath, newPath } of pageRenames) {
+        pageCache.renameFile(oldPath, newPath);
+        child.storagePath = newPath;
+        child._pages = [];
+        completed.push({ child, oldPath, newPath });
+      }
+    } catch (e) {
+      for (let i = completed.length - 1; i >= 0; i--) {
+        const { child, oldPath, newPath } = completed[i];
+        try {
+          pageCache.renameFile(newPath, oldPath);
+        } catch {
+          // Best-effort rollback — if the backend can't undo the page
+          // move, we accept inconsistency (crash recovery handles it).
+        }
+        child.storagePath = oldPath;
+        child._pages = [];
+      }
+      throw e;
     }
 
     // Delete old metadata last.
