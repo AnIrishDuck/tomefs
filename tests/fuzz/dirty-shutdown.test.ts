@@ -1046,6 +1046,7 @@ async function runDirtyShutdown(
   const ctxDirty = `after dirty shutdown (seed ${seed})`;
   try {
     instance.tomefs.assertInvariants();
+    backend.assertInvariants();
     walkAndVerifyNavigable(instance.rawFS, ctxDirty);
   } catch (e: any) {
     const recentOps = ops.slice(Math.max(0, ops.length - 20));
@@ -1062,11 +1063,13 @@ async function runDirtyShutdown(
   // Phase 4: Recovery — clean syncfs to reconcile backend state.
   doSyncfs(instance.rawFS);
   instance.tomefs.assertInvariants();
+  backend.assertInvariants();
   instance = await mountTome(backend, maxPages);
 
   const ctxRecovery = `after recovery sync (seed ${seed})`;
   try {
     instance.tomefs.assertInvariants();
+    backend.assertInvariants();
     verifyCleanState(instance.rawFS, backend, ctxRecovery);
   } catch (e: any) {
     const recentOps = ops.slice(Math.max(0, ops.length - 20));
@@ -1077,11 +1080,13 @@ async function runDirtyShutdown(
   // identical results (recovery didn't introduce new inconsistencies).
   doSyncfs(instance.rawFS);
   instance.tomefs.assertInvariants();
+  backend.assertInvariants();
   instance = await mountTome(backend, maxPages);
 
   const ctxStable = `after stability check (seed ${seed})`;
   try {
     instance.tomefs.assertInvariants();
+    backend.assertInvariants();
     verifyCleanState(instance.rawFS, backend, ctxStable);
   } catch (e: any) {
     const recentOps = ops.slice(Math.max(0, ops.length - 20));
@@ -1224,6 +1229,7 @@ describe("fuzz: dirty shutdown recovery", () => {
       model.openFds.clear();
       instance = await mountTome(backend, 8);
       instance.tomefs.assertInvariants();
+      backend.assertInvariants();
       walkAndVerifyNavigable(instance.rawFS, "cycle 1 dirty");
 
       // Cycle 2: recover, more work, sync, dirty ops, crash
@@ -1246,6 +1252,7 @@ describe("fuzz: dirty shutdown recovery", () => {
       model.openFds.clear();
       instance = await mountTome(backend, 8);
       instance.tomefs.assertInvariants();
+      backend.assertInvariants();
       walkAndVerifyNavigable(instance.rawFS, "cycle 2 dirty");
 
       // Cycle 3: one more recovery + dirty shutdown
@@ -1258,12 +1265,14 @@ describe("fuzz: dirty shutdown recovery", () => {
       model.openFds.clear();
       instance = await mountTome(backend, 8);
       instance.tomefs.assertInvariants();
+      backend.assertInvariants();
       walkAndVerifyNavigable(instance.rawFS, "cycle 3 dirty");
 
       // Final recovery — must produce a stable, clean filesystem
       doSyncfs(instance.rawFS);
       instance = await mountTome(backend, 8);
       instance.tomefs.assertInvariants();
+      backend.assertInvariants();
       verifyCleanState(instance.rawFS, backend, "final recovery (seed 76001)");
     }, 60_000);
   });
