@@ -56,7 +56,7 @@ This requires `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedd
 
 ## Status
 
-**Core complete.** The filesystem, page cache, IDB backend, OPFS backend, SAB bridge, and full-stack integration are tested and working (2300+ tests). See [plans/ethos.md](plans/ethos.md) for design rationale.
+**Core complete.** The filesystem, page cache, IDB backend, OPFS backend, SAB bridge, and full-stack integration are tested and working (4000+ tests). See [plans/ethos.md](plans/ethos.md) for design rationale.
 
 ### Roadmap
 
