@@ -566,6 +566,58 @@ describe("SAB bridge: timeout", () => {
   });
 });
 
+describe("SAB bridge: dead bridge after unrecoverable timeout", () => {
+  let sab: SharedArrayBuffer;
+  let clientWorker: Worker;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  afterEach(async () => {
+    await clientWorker.terminate();
+  });
+
+  it("bridge marked dead after recovery failure — subsequent calls fail immediately @fast", async () => {
+    sab = SabClient.createBuffer();
+
+    // Start a worker but do NOT start a SabWorker — no one processes requests.
+    // This simulates a crashed/dead storage worker.
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 50 },
+    });
+    await waitReady(clientWorker);
+
+    // First call: times out after 50ms (no worker to respond)
+    await expect(
+      callClient(clientWorker, "readPage", ["/test", 0]),
+    ).rejects.toThrow(/SAB bridge timeout/);
+
+    // Second call: enters recoverFromTimeout, waits recovery timeout
+    // (max(50*10, 5000) = 5000ms), times out, marks bridge as dead.
+    await expect(
+      callClient(clientWorker, "readPage", ["/test", 0]),
+    ).rejects.toThrow(/unresponsive after timeout recovery/);
+    // Third call: should fail IMMEDIATELY (bridge is dead)
+    const deadStart = Date.now();
+    await expect(
+      callClient(clientWorker, "readPage", ["/test", 0]),
+    ).rejects.toThrow(/permanently unresponsive/);
+    const deadDuration = Date.now() - deadStart;
+
+    // Dead-bridge call should be near-instant (well under recovery timeout)
+    expect(deadDuration).toBeLessThan(1000);
+
+    // Stats should show dead=true
+    const stats = (await callClient(clientWorker, "getStats", [])) as {
+      dead: boolean;
+      timeouts: number;
+    };
+    expect(stats.dead).toBe(true);
+    expect(stats.timeouts).toBe(1);
+  }, 30000);
+});
+
 describe("SAB bridge: backend error propagation", () => {
   let failingBackend: FailingBackend;
   let sabWorker: SabWorker;

@@ -690,7 +690,7 @@ describe("SAB+Atomics Bridge", () => {
   describe("stats", () => {
     it("@fast getStats returns zero counters initially", async () => {
       const stats = await callClient(clientWorker, "getStats", []);
-      expect(stats).toEqual({ calls: 0, timeouts: 0, errors: 0 });
+      expect(stats).toEqual({ calls: 0, timeouts: 0, errors: 0, dead: false });
     });
 
     it("@fast getStats tracks call count", async () => {

@@ -57,6 +57,13 @@ export class SabClient implements SyncStorageBackend {
    */
   private recovering = false;
 
+  /**
+   * True after recovery itself fails (the worker didn't respond even
+   * during the extended recovery wait). Once set, all subsequent calls
+   * throw immediately — no point waiting 30s per call for a dead worker.
+   */
+  private dead = false;
+
   private _calls = 0;
   private _timeouts = 0;
   private _errors = 0;
@@ -127,6 +134,7 @@ export class SabClient implements SyncStorageBackend {
       calls: this._calls,
       timeouts: this._timeouts,
       errors: this._errors,
+      dead: this.dead,
     };
   }
 
@@ -588,6 +596,14 @@ export class SabClient implements SyncStorageBackend {
    * data region are visible to us (acquire via Atomics.wait/load).
    */
   private recoverFromTimeout(): void {
+    if (this.dead) {
+      throw new Error(
+        "SAB bridge: worker is permanently unresponsive. " +
+          "The storage worker crashed or is permanently blocked. " +
+          "Restart the PGlite instance to recover.",
+      );
+    }
+
     const status = Atomics.load(this.controlView, SLOT_STATUS);
 
     if (status === STATUS_IDLE) {
@@ -600,6 +616,7 @@ export class SabClient implements SyncStorageBackend {
         recoveryTimeout,
       );
       if (result === "timed-out") {
+        this.dead = true;
         throw new Error(
           "SAB bridge: worker is unresponsive after timeout recovery. " +
             "The storage worker may have crashed or is permanently blocked.",

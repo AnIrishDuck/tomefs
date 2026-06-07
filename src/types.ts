@@ -74,6 +74,8 @@ export interface SabStats {
   timeouts: number;
   /** Calls where the worker returned an error. */
   errors: number;
+  /** True if the bridge has been marked dead after failed recovery. */
+  dead: boolean;
 }
 
 /** Snapshot of filesystem-level performance counters. */
