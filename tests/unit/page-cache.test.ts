@@ -1393,4 +1393,116 @@ describe("PageCache", () => {
       expect(buf[0]).toBe(0xCD);
     });
   });
+
+  describe("async flush safety", () => {
+    class InterceptBackend extends MemoryBackend {
+      onWritePages: (() => Promise<void>) | null = null;
+
+      async writePages(
+        pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
+      ): Promise<void> {
+        await super.writePages(pages);
+        if (this.onWritePages) await this.onWritePages();
+      }
+    }
+
+    it("flushFile tolerates page eviction during writePages await", async () => {
+      const ib = new InterceptBackend();
+      const small = new PageCache(ib, 2);
+
+      await small.write("/a", fillBuf(PAGE_SIZE, 0xaa), 0, PAGE_SIZE, 0, 0);
+      expect(small.dirtyCount).toBe(1);
+
+      ib.onWritePages = async () => {
+        // Evict /a's page by filling the cache with other files
+        await small.getPage("/b", 0);
+        await small.getPage("/c", 0);
+      };
+
+      // Should not crash with a null dereference
+      const flushed = await small.flushFile("/a");
+      expect(flushed).toBe(1);
+
+      // Data was persisted to the backend before eviction
+      const stored = await ib.readPage("/a", 0);
+      expect(stored).not.toBeNull();
+      expect(stored![0]).toBe(0xaa);
+    });
+
+    it("flushFile tolerates file deletion during writePages await", async () => {
+      const ib = new InterceptBackend();
+      const c = new PageCache(ib, 4);
+
+      await c.write("/a", fillBuf(PAGE_SIZE, 0xbb), 0, PAGE_SIZE, 0, 0);
+      await c.write("/a", fillBuf(PAGE_SIZE, 0xcc), 0, PAGE_SIZE, PAGE_SIZE, 2 * PAGE_SIZE);
+
+      ib.onWritePages = async () => {
+        await c.deleteFile("/a");
+      };
+
+      const flushed = await c.flushFile("/a");
+      expect(flushed).toBe(2);
+      expect(c.dirtyCount).toBe(0);
+    });
+
+    it("flushAll tolerates page eviction during writePages await", async () => {
+      const ib = new InterceptBackend();
+      const small = new PageCache(ib, 2);
+
+      await small.write("/a", fillBuf(PAGE_SIZE, 0xdd), 0, PAGE_SIZE, 0, 0);
+      await small.write("/b", fillBuf(PAGE_SIZE, 0xee), 0, PAGE_SIZE, 0, 0);
+
+      ib.onWritePages = async () => {
+        ib.onWritePages = null;
+        // Evict both pages by loading different files
+        await small.getPage("/c", 0);
+        await small.getPage("/d", 0);
+      };
+
+      const flushed = await small.flushAll();
+      expect(flushed).toBe(2);
+
+      const storedA = await ib.readPage("/a", 0);
+      expect(storedA![0]).toBe(0xdd);
+      const storedB = await ib.readPage("/b", 0);
+      expect(storedB![0]).toBe(0xee);
+    });
+
+    it("flushFile preserves new dirty pages added during writePages await", async () => {
+      const ib = new InterceptBackend();
+      const c = new PageCache(ib, 8);
+
+      await c.write("/a", fillBuf(PAGE_SIZE, 0x11), 0, PAGE_SIZE, 0, 0);
+
+      ib.onWritePages = async () => {
+        ib.onWritePages = null;
+        // Dirty a new page for the same file during the flush
+        await c.write("/a", fillBuf(PAGE_SIZE, 0x22), 0, PAGE_SIZE, PAGE_SIZE, 2 * PAGE_SIZE);
+      };
+
+      await c.flushFile("/a");
+
+      // The new page (page 1) should still be dirty
+      expect(c.isDirty("/a", 1)).toBe(true);
+      expect(c.dirtyCount).toBe(1);
+    });
+
+    it("flushAll preserves new dirty pages added during writePages await", async () => {
+      const ib = new InterceptBackend();
+      const c = new PageCache(ib, 8);
+
+      await c.write("/a", fillBuf(PAGE_SIZE, 0x33), 0, PAGE_SIZE, 0, 0);
+
+      ib.onWritePages = async () => {
+        ib.onWritePages = null;
+        await c.write("/b", fillBuf(PAGE_SIZE, 0x44), 0, PAGE_SIZE, 0, 0);
+      };
+
+      await c.flushAll();
+
+      // /b was dirtied during the flush — it should still be dirty
+      expect(c.isDirty("/b", 0)).toBe(true);
+      expect(c.dirtyCount).toBe(1);
+    });
+  });
 });

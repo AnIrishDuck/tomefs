@@ -467,13 +467,16 @@ export class PageCache {
     const keys = this.dirtyFileKeys.get(path);
     if (!keys || keys.size === 0) return 0;
 
+    // Snapshot keys before the await. The live Set and cache may be
+    // modified by concurrent async operations during writePages.
+    const keySnapshot = [...keys];
     const dirtyPages: Array<{
       path: string;
       pageIndex: number;
       data: Uint8Array;
     }> = [];
 
-    for (const key of keys) {
+    for (const key of keySnapshot) {
       const page = this.cache.get(key)!;
       dirtyPages.push({
         path: page.path,
@@ -484,11 +487,22 @@ export class PageCache {
 
     await this.backend.writePages(dirtyPages);
     this._flushes += dirtyPages.length;
-    for (const key of keys) {
-      this.cache.get(key)!.dirty = false;
+    for (const key of keySnapshot) {
+      const page = this.cache.get(key);
+      if (page) page.dirty = false;
       this.dirtyKeys.delete(key);
     }
-    this.dirtyFileKeys.delete(path);
+    // Remove only the keys we flushed. New dirty keys added during
+    // the await (by concurrent operations) are preserved.
+    const currentKeys = this.dirtyFileKeys.get(path);
+    if (currentKeys) {
+      for (const key of keySnapshot) {
+        currentKeys.delete(key);
+      }
+      if (currentKeys.size === 0) {
+        this.dirtyFileKeys.delete(path);
+      }
+    }
 
     return dirtyPages.length;
   }
@@ -500,13 +514,15 @@ export class PageCache {
   async flushAll(): Promise<number> {
     if (this.dirtyKeys.size === 0) return 0;
 
+    // Snapshot before the await — same rationale as flushFile.
+    const keySnapshot = [...this.dirtyKeys];
     const dirtyPages: Array<{
       path: string;
       pageIndex: number;
       data: Uint8Array;
     }> = [];
 
-    for (const key of this.dirtyKeys) {
+    for (const key of keySnapshot) {
       const page = this.cache.get(key)!;
       dirtyPages.push({
         path: page.path,
@@ -517,11 +533,22 @@ export class PageCache {
 
     await this.backend.writePages(dirtyPages);
     this._flushes += dirtyPages.length;
-    for (const key of this.dirtyKeys) {
-      this.cache.get(key)!.dirty = false;
+    for (const key of keySnapshot) {
+      const page = this.cache.get(key);
+      if (page) page.dirty = false;
+      this.dirtyKeys.delete(key);
     }
-    this.dirtyKeys.clear();
-    this.dirtyFileKeys.clear();
+    // Clear file-level dirty tracking for flushed keys only.
+    // dirtyPages[i] corresponds to keySnapshot[i].
+    for (let i = 0; i < keySnapshot.length; i++) {
+      const fileSet = this.dirtyFileKeys.get(dirtyPages[i].path);
+      if (fileSet) {
+        fileSet.delete(keySnapshot[i]);
+        if (fileSet.size === 0) {
+          this.dirtyFileKeys.delete(dirtyPages[i].path);
+        }
+      }
+    }
 
     return dirtyPages.length;
   }
