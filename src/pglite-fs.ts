@@ -127,7 +127,12 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
         syncError = e as Error;
       }
     }
-    await originalCloseFs();
+    try {
+      await originalCloseFs();
+    } catch (closeError) {
+      if (syncError) throw syncError;
+      throw closeError;
+    }
     if (syncError) throw syncError;
   };
 
