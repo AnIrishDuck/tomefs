@@ -314,20 +314,37 @@ export class OpfsSahBackend implements StorageBackend {
     }
     oldSah.close();
 
-    // Write to new file
+    // Write to new file — wrap in try/catch so we can clean up the
+    // partial new file on failure. The old file is still intact at this
+    // point, so cleanup just removes the new file.
     if (data && data.byteLength > 0) {
       const newFileHandle = await this.pagesDir!.getFileHandle(newEncoded, {
         create: true,
       });
       const newSah = await (newFileHandle as any).createSyncAccessHandle() as SyncAccessHandle;
-      newSah.write(data, { at: 0 });
-      newSah.flush();
+      try {
+        newSah.write(data, { at: 0 });
+        newSah.flush();
+      } catch (err) {
+        newSah.close();
+        try {
+          await this.pagesDir!.removeEntry(newEncoded);
+        } catch (cleanupErr) {
+          if (!isNotFoundError(cleanupErr)) {
+            throw new Error(
+              `OpfsSahBackend renameFile: write failed (${err instanceof Error ? err.message : String(err)}) ` +
+                `and cleanup also failed (${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)})`,
+            );
+          }
+        }
+        throw err;
+      }
       newSah.close();
     } else {
       await this.pagesDir!.getFileHandle(newEncoded, { create: true });
     }
 
-    // Remove old file
+    // Remove old file only after successful write.
     await this.pagesDir!.removeEntry(oldEncoded);
   }
 
