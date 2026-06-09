@@ -468,8 +468,8 @@ export class PreloadBackend implements SyncStorageBackend {
   }
 
   deleteAll(paths: string[]): void {
-    this.deleteFiles(paths);
     this.deleteMetas(paths);
+    this.deleteFiles(paths);
   }
 
   // --- Flush: persist dirty state back to the async backend ---

@@ -500,8 +500,12 @@ export class OpfsSahBackend implements StorageBackend {
 
   async deleteAll(paths: string[]): Promise<void> {
     if (paths.length === 0) return;
-    await this.deleteFiles(paths);
+    // Delete metadata BEFORE pages. OPFS has no multi-operation transactions,
+    // so a crash between the two phases is possible. Metadata-first ensures a
+    // crash leaves orphaned pages (cleaned up by cleanupOrphanedPages) rather
+    // than ghost metadata entries (files visible in listFiles with no data).
     await this.deleteMetas(paths);
+    await this.deleteFiles(paths);
   }
 
   async destroy(): Promise<void> {
