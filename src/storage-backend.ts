@@ -92,4 +92,15 @@ export interface StorageBackend {
    * leave pages deleted but metadata intact (or vice versa).
    */
   deleteAll(paths: string[]): Promise<void>;
+
+  /**
+   * Find and delete pages that have no corresponding metadata entry.
+   *
+   * Returns the number of orphaned page paths removed. Orphaned pages
+   * accumulate when a crash occurs between page eviction (which writes
+   * pages to the backend) and the next syncfs (which writes metadata).
+   *
+   * Optional — backends that don't support persistence may omit this.
+   */
+  cleanupOrphanedPages?(): Promise<number>;
 }
