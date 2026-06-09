@@ -94,4 +94,16 @@ export interface SyncStorageBackend {
    * SAB bridge, this halves round-trips from 2 to 1.
    */
   deleteAll(paths: string[]): void;
+
+  /**
+   * Find and delete pages that have no corresponding metadata entry.
+   *
+   * Returns the number of orphaned page paths removed. Orphaned pages
+   * accumulate when a crash occurs between page eviction (which writes
+   * pages to the backend) and the next syncfs (which writes metadata).
+   *
+   * Optional — backends that don't support persistence (e.g.,
+   * SyncMemoryBackend) may omit this.
+   */
+  cleanupOrphanedPages?(): number;
 }

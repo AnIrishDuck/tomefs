@@ -110,6 +110,10 @@ export class MemoryBackend implements StorageBackend {
     this.inner.deleteAll(paths);
   }
 
+  async cleanupOrphanedPages(): Promise<number> {
+    return this.inner.cleanupOrphanedPages();
+  }
+
   assertInvariants(): void {
     this.inner.assertInvariants();
   }

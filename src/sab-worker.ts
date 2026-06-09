@@ -421,6 +421,18 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.CLEANUP_ORPHANED_PAGES: {
+        let removed = 0;
+        if (typeof (this.backend as any).cleanupOrphanedPages === "function") {
+          removed = await (this.backend as any).cleanupOrphanedPages();
+        }
+        const respLen = encodeMessage(this.dataView, this.uint8View, {
+          removed,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       default:
         throw new Error(`Unknown opcode: ${opcode}`);
     }

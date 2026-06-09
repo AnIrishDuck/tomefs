@@ -687,6 +687,45 @@ describe("SAB+Atomics Bridge", () => {
     });
   });
 
+  describe("cleanupOrphanedPages", () => {
+    it("@fast returns 0 when no orphans exist", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      await callClient(clientWorker, "writePage", ["/a", 0, data]);
+      await callClient(clientWorker, "writeMeta", ["/a", { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 }]);
+
+      const removed = await callClient(clientWorker, "cleanupOrphanedPages", []);
+      expect(removed).toBe(0);
+    });
+
+    it("@fast removes pages without metadata", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      data.fill(0xdd);
+      await callClient(clientWorker, "writePage", ["/orphan", 0, data]);
+      await callClient(clientWorker, "writePage", ["/orphan", 1, data]);
+      // No writeMeta for /orphan — these are orphaned pages
+
+      await callClient(clientWorker, "writePage", ["/good", 0, data]);
+      await callClient(clientWorker, "writeMeta", ["/good", { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 }]);
+
+      const removed = await callClient(clientWorker, "cleanupOrphanedPages", []);
+      expect(removed).toBe(1); // 1 path (/orphan) removed
+
+      // Orphaned pages gone
+      expect(await callClient(clientWorker, "readPage", ["/orphan", 0])).toBeNull();
+      expect(await callClient(clientWorker, "readPage", ["/orphan", 1])).toBeNull();
+      // Good file survives
+      expect(toUint8Array(await callClient(clientWorker, "readPage", ["/good", 0]))[0]).toBe(0xdd);
+    });
+
+    it("@fast idempotent — second call returns 0", async () => {
+      const data = new Uint8Array(PAGE_SIZE);
+      await callClient(clientWorker, "writePage", ["/orphan2", 0, data]);
+
+      expect(await callClient(clientWorker, "cleanupOrphanedPages", [])).toBe(1);
+      expect(await callClient(clientWorker, "cleanupOrphanedPages", [])).toBe(0);
+    });
+  });
+
   describe("stats", () => {
     it("@fast getStats returns zero counters initially", async () => {
       const stats = await callClient(clientWorker, "getStats", []);
