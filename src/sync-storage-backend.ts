@@ -106,4 +106,13 @@ export interface SyncStorageBackend {
    * SyncMemoryBackend) may omit this.
    */
   cleanupOrphanedPages?(): number;
+
+  /**
+   * Flush dirty data to persistent storage.
+   *
+   * Optional — only needed by backends with deferred writes (e.g.,
+   * PreloadBackend, which buffers writes in memory and propagates
+   * to its underlying async backend on flush).
+   */
+  flush?(): Promise<void>;
 }
