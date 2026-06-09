@@ -63,6 +63,9 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
     maxPageIndexBatch: async (ps) => sync.maxPageIndexBatch(ps),
     syncAll: async (pages, metas) => sync.syncAll(pages, metas),
     deleteAll: async (paths) => sync.deleteAll(paths),
+    cleanupOrphanedPages: sync.cleanupOrphanedPages
+      ? async () => sync.cleanupOrphanedPages!()
+      : undefined,
   };
 }
 
@@ -1325,6 +1328,75 @@ for (const factory of factories) {
 
         const results = await backend.readMetas(["/f", "/f"]);
         expect(results).toEqual([meta, meta]);
+      });
+    });
+
+    // ---------------------------------------------------------------
+    // cleanupOrphanedPages
+    // ---------------------------------------------------------------
+
+    describe("cleanupOrphanedPages", () => {
+      it("removes pages with no corresponding metadata @fast", async () => {
+        if (!backend.cleanupOrphanedPages) return;
+
+        await backend.writePage("/orphan", 0, filledPage(0xaa));
+        await backend.writePage("/orphan", 1, filledPage(0xbb));
+        await backend.writePage("/keep", 0, filledPage(0x01));
+        await backend.writeMeta("/keep", meta);
+
+        const removed = await backend.cleanupOrphanedPages();
+        expect(removed).toBe(1);
+
+        expect(await backend.readPage("/orphan", 0)).toBeNull();
+        expect(await backend.readPage("/orphan", 1)).toBeNull();
+        expect(await backend.readPage("/keep", 0)).toEqual(filledPage(0x01));
+        expect(await backend.readMeta("/keep")).toEqual(meta);
+      });
+
+      it("returns 0 when no orphans exist @fast", async () => {
+        if (!backend.cleanupOrphanedPages) return;
+
+        await backend.writePage("/f", 0, filledPage(0x42));
+        await backend.writeMeta("/f", meta);
+
+        const removed = await backend.cleanupOrphanedPages();
+        expect(removed).toBe(0);
+      });
+
+      it("returns 0 on empty backend @fast", async () => {
+        if (!backend.cleanupOrphanedPages) return;
+
+        const removed = await backend.cleanupOrphanedPages();
+        expect(removed).toBe(0);
+      });
+
+      it("handles multiple orphaned paths", async () => {
+        if (!backend.cleanupOrphanedPages) return;
+
+        await backend.writePage("/orphan1", 0, filledPage(0x01));
+        await backend.writePage("/orphan2", 0, filledPage(0x02));
+        await backend.writePage("/orphan2", 1, filledPage(0x03));
+        await backend.writePage("/valid", 0, filledPage(0x04));
+        await backend.writeMeta("/valid", meta);
+
+        const removed = await backend.cleanupOrphanedPages();
+        expect(removed).toBe(2);
+
+        expect(await backend.readPage("/orphan1", 0)).toBeNull();
+        expect(await backend.readPage("/orphan2", 0)).toBeNull();
+        expect(await backend.readPage("/valid", 0)).toEqual(filledPage(0x04));
+      });
+
+      it("is idempotent — second call returns 0", async () => {
+        if (!backend.cleanupOrphanedPages) return;
+
+        await backend.writePage("/orphan", 0, filledPage(0xdd));
+
+        const first = await backend.cleanupOrphanedPages();
+        expect(first).toBe(1);
+
+        const second = await backend.cleanupOrphanedPages();
+        expect(second).toBe(0);
       });
     });
   });
