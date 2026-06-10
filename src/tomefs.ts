@@ -1091,6 +1091,25 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       writePages(node, buffer, 0, length, offset);
       return 0;
     },
+
+    fsync(stream: any) {
+      const node = stream.node;
+      if (FS.isFile(node.mode)) {
+        pageCache.flushFile(node.storagePath);
+        backend.writeMeta(node.storagePath, {
+          size: node.usedBytes,
+          mode: node.mode,
+          ctime: node.ctime,
+          mtime: node.mtime,
+          atime: node.atime,
+        });
+        if (node._metaDirty) {
+          node._metaDirty = false;
+          dirtyMetaNodes.delete(node);
+        }
+      }
+      return 0;
+    },
   };
 
   const dir_stream_ops = {
