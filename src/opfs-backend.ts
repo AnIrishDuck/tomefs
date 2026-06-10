@@ -502,14 +502,15 @@ export class OpfsBackend implements StorageBackend {
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void> {
     // OPFS has no multi-operation transactions, so execute sequentially.
-    // Write metadata BEFORE pages so that a crash mid-sync leaves metadata
-    // pointing at stale/missing pages (recoverable via maxPageIndex on
-    // remount) rather than orphaned page directories with no metadata
-    // (permanently leaked storage, invisible to listFiles/orphan cleanup).
-    // IDB doesn't have this problem — its syncAll uses a single atomic
-    // multi-store transaction.
-    await this.writeMetas(metas);
+    // Write pages BEFORE metadata so that a crash mid-sync leaves orphaned
+    // pages (cleaned up by cleanupOrphanedPages on next mount) rather than
+    // metadata pointing at stale page content. The metadata batch includes
+    // the clean-shutdown marker — writing it before pages would tell the
+    // next mount the backend is consistent when page data is stale, causing
+    // silent data corruption. Pages-first ensures the marker is absent
+    // after a mid-sync crash, forcing a full recovery pass.
     await this.writePages(pages);
+    await this.writeMetas(metas);
   }
 
   /**
