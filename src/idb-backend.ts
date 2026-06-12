@@ -608,6 +608,7 @@ export class IdbBackend implements StorageBackend {
           cursor.continue();
         }
       };
+      cursorReq.onerror = () => reject(cursorReq.error);
 
       const metaReq = metaStore.getAllKeys();
       metaReq.onsuccess = () => {
@@ -615,6 +616,7 @@ export class IdbBackend implements StorageBackend {
           metaPaths.add(key as string);
         }
       };
+      metaReq.onerror = () => reject(metaReq.error);
 
       tx.oncomplete = () => resolve({ pagePaths, metaPaths });
       tx.onerror = () => reject(tx.error);

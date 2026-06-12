@@ -463,8 +463,12 @@ export class OpfsSahBackend implements StorageBackend {
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
     metas: Array<{ path: string; meta: FileMeta }>,
   ): Promise<void> {
-    await this.writeMetas(metas);
+    // Write pages BEFORE metadata: a crash after pages but before metadata
+    // leaves orphaned pages (cleaned up by cleanupOrphanedPages on next
+    // mount). The reverse would persist the clean-shutdown marker (part of
+    // the metadata batch) with stale page data — silent data corruption.
     await this.writePages(pages);
+    await this.writeMetas(metas);
   }
 
   async cleanupOrphanedPages(): Promise<number> {
