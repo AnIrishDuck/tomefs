@@ -423,8 +423,8 @@ export class SabWorker {
 
       case OpCode.CLEANUP_ORPHANED_PAGES: {
         let removed = 0;
-        if (typeof (this.backend as any).cleanupOrphanedPages === "function") {
-          removed = await (this.backend as any).cleanupOrphanedPages();
+        if (this.backend.cleanupOrphanedPages) {
+          removed = await this.backend.cleanupOrphanedPages();
         }
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           removed,
