@@ -38,14 +38,10 @@ function decodePath(hex: string): string {
   return textDecoder.decode(bytes);
 }
 
-interface SyncAccessHandle {
-  read(buffer: ArrayBufferView, options?: { at?: number }): number;
-  write(buffer: ArrayBufferView, options?: { at?: number }): number;
-  truncate(size: number): void;
-  getSize(): number;
-  flush(): void;
-  close(): void;
-}
+// FileSystemSyncAccessHandle is declared in src/opfs-augments.d.ts
+// (the Web API lives in lib.webworker.d.ts but this project only
+// includes lib.dom.d.ts).
+type SyncAccessHandle = FileSystemSyncAccessHandle;
 
 export interface OpfsSahBackendOptions {
   root?: FileSystemDirectoryHandle;
@@ -128,7 +124,7 @@ export class OpfsSahBackend implements StorageBackend {
       this.evictHandle();
     }
 
-    const sah = await (fileHandle as any).createSyncAccessHandle() as SyncAccessHandle;
+    const sah = await fileHandle.createSyncAccessHandle();
     this.handleCache.set(encoded, sah);
     this.handleLru.push(encoded);
     return sah;
@@ -305,7 +301,7 @@ export class OpfsSahBackend implements StorageBackend {
       throw err;
     }
 
-    const oldSah = await (oldHandle as any).createSyncAccessHandle() as SyncAccessHandle;
+    const oldSah = await oldHandle.createSyncAccessHandle();
     const size = oldSah.getSize();
     let data: Uint8Array | null = null;
     if (size > 0) {
@@ -321,7 +317,7 @@ export class OpfsSahBackend implements StorageBackend {
       const newFileHandle = await this.pagesDir!.getFileHandle(newEncoded, {
         create: true,
       });
-      const newSah = await (newFileHandle as any).createSyncAccessHandle() as SyncAccessHandle;
+      const newSah = await newFileHandle.createSyncAccessHandle();
       try {
         newSah.write(data, { at: 0 });
         newSah.flush();

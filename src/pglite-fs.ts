@@ -51,7 +51,7 @@ export interface TomeFSPGliteOptions {
  *   const pg = new PGlite({ fs });
  */
 export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
-  const backend = options.backend ?? new SyncMemoryBackend();
+  const backend: SyncStorageBackend = options.backend ?? new SyncMemoryBackend();
   const maxPages = options.maxPages ?? 4096;
   const { MemoryFS } = options;
 
@@ -103,8 +103,8 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
         else resolve();
       });
     });
-    if (typeof (backend as any).flush === "function") {
-      await (backend as any).flush();
+    if (backend.flush) {
+      await backend.flush();
     }
   };
 
