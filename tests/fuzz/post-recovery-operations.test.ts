@@ -291,13 +291,16 @@ function rw(p: string): string {
 
 /**
  * After an operation that extends a file, re-read the file from the FS
- * to capture the actual gap byte values. After dirty shutdown recovery,
- * pages in the backend may have non-zero data beyond the old file end
- * (left over from before a truncation that wasn't synced). When the file
- * is extended, the model assumes the gap is zero-filled (per POSIX), but
- * the FS loads the page from backend which may have stale data. This is
- * a known limitation of tomefs crash recovery — the zeroTailAfterTruncate
- * from the dirty phase is lost in the crash.
+ * to capture the actual byte values. After dirty shutdown recovery,
+ * pages at a reused storage path may contain data from a previous file
+ * that was deleted and recreated at the same path. The model's zero-fill
+ * assumption doesn't hold because the backend page has data from the
+ * prior file. Re-reading ensures the model tracks what the FS actually
+ * contains.
+ *
+ * Note: stale TAIL bytes (beyond file extent) are now zeroed during
+ * restoreTree. This workaround handles the remaining case of stale
+ * BODY bytes from storage path reuse.
  */
 function resyncFileFromFS(
   FS: EmscriptenFS,
@@ -319,13 +322,6 @@ function resyncFileFromFS(
   }
 }
 
-/**
- * After operations that extend a file (writeAt beyond end, appendWrite,
- * allocate), re-read the file from the FS. After crash recovery, pages
- * may have non-zero stale data beyond the old file end, so the model's
- * zero-fill assumption doesn't hold. Re-reading ensures the model
- * tracks what the FS actually contains.
- */
 function resyncIfExtended(
   FS: EmscriptenFS,
   model: FSModel,
