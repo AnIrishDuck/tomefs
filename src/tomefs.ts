@@ -108,6 +108,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
   // the backend is consistent and can skip the first full tree walk.
   let needsOrphanCleanup = true;
 
+  // True during restoreTree — prevents createNode from deleting backend
+  // pages that are being restored. Outside of restoreTree, createNode
+  // deletes any existing backend pages at the new file's storage path
+  // to prevent orphan pages from a previous file at the same path from
+  // surviving and being misinterpreted as the new file's data on remount.
+  let _restoring = false;
+
   /** Backend key for the clean-shutdown marker. */
   const CLEAN_MARKER_PATH = "/__tomefs_clean";
 
@@ -1218,8 +1225,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
    * File page data remains in the backend and is loaded on demand.
    */
   function restoreTree(root: any): void {
+    _restoring = true;
     const paths = backend.listFiles();
-    if (paths.length === 0) return;
+    if (paths.length === 0) {
+      _restoring = false;
+      return;
+    }
 
     // Single pass: classify all paths into live vs internal markers.
     // Replaces 3 sequential O(n) scans (includes, some, filter) with one.
@@ -1382,6 +1393,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     for (const node of sizeCorrectedNodes) {
       markMetaDirty(node);
     }
+
+    _restoring = false;
   }
 
   // ---------------------------------------------------------------
@@ -1802,6 +1815,12 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.storagePath = parent
           ? computeStoragePath(parent, name)
           : `/__root_${nextPathId++}`;
+        // Clean up orphan pages from a previous file at this path.
+        // Without this, orphan pages survive and restoreTree extends
+        // the new file's size on remount.
+        if (!_restoring && parent) {
+          backend.deleteFile(node.storagePath);
+        }
         // Track this file node for persistence
         allFileNodes.add(node);
       } else if (FS.isLink(node.mode)) {
