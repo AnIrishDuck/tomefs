@@ -586,11 +586,19 @@ export class PreloadBackend implements SyncStorageBackend {
     // Complex path: deletes or truncations are pending. Partition dirty
     // pages into early (pre-delete) and late (post-delete) batches to
     // handle delete-then-recreate at the same path.
-    // Snapshot the dirty keys we intend to flush. We must NOT clear
-    // dirtyPages/dirtyMeta until all operations succeed — otherwise a
-    // mid-flush failure loses dirty tracking and the data is never retried.
+    //
+    // Snapshot ALL mutable tracking sets before any async work begins.
+    // The async operations below yield to the event loop, during which
+    // sync methods (writePage, deleteFile, etc.) may mutate these sets.
+    // Without snapshots, .clear() after the async work would silently
+    // discard entries added during the flush — losing truncations,
+    // deletions, or metadata removals that the next flush cycle should
+    // have processed.
     const flushedPageKeys = new Set(this.dirtyPages);
     const flushedMetaPaths = new Set(this.dirtyMeta);
+    const flushedTruncations = new Map(this.truncations);
+    const flushedDeletedFiles = new Set(this.deletedFiles);
+    const flushedDeletedMeta = new Set(this.deletedMeta);
 
     const earlyBatch: Array<{
       path: string;
@@ -609,7 +617,7 @@ export class PreloadBackend implements SyncStorageBackend {
         const path = key.substring(0, nullIdx);
         const pageIndex = parseInt(key.substring(nullIdx + 1), 10);
         const entry = { path, pageIndex, data };
-        if (this.deletedFiles.has(path)) {
+        if (flushedDeletedFiles.has(path)) {
           lateBatch.push(entry);
         } else {
           earlyBatch.push(entry);
@@ -630,7 +638,7 @@ export class PreloadBackend implements SyncStorageBackend {
     for (const path of flushedMetaPaths) {
       const m = this.meta.get(path);
       if (m) {
-        if (this.deletedMeta.has(path) || this.deletedFiles.has(path)) {
+        if (flushedDeletedMeta.has(path) || flushedDeletedFiles.has(path)) {
           lateMeta.push({ path, meta: m });
         } else {
           earlyMeta.push({ path, meta: m });
@@ -644,14 +652,18 @@ export class PreloadBackend implements SyncStorageBackend {
     // at offset 8192), the new page at the truncation point is dirty and
     // will be written in step 2. Without this ordering, page writes would
     // go to the remote first, then the truncation would delete them.
-    if (this.truncations.size > 0) {
+    if (flushedTruncations.size > 0) {
       await Promise.all(
-        [...this.truncations].map(([path, fromIndex]) =>
+        [...flushedTruncations].map(([path, fromIndex]) =>
           this.remote.deletePagesFrom(path, fromIndex),
         ),
       );
     }
-    this.truncations.clear();
+    for (const [path, fromIndex] of flushedTruncations) {
+      if (this.truncations.get(path) === fromIndex) {
+        this.truncations.delete(path);
+      }
+    }
 
     // 2. Atomically write pages + metadata for non-deleted paths.
     // Uses syncAll so IDB backends commit both in a single transaction,
@@ -662,16 +674,20 @@ export class PreloadBackend implements SyncStorageBackend {
     }
 
     // 3. Batch-delete files from remote (single call instead of O(n))
-    if (this.deletedFiles.size > 0) {
-      await this.remote.deleteFiles([...this.deletedFiles]);
+    if (flushedDeletedFiles.size > 0) {
+      await this.remote.deleteFiles([...flushedDeletedFiles]);
     }
-    this.deletedFiles.clear();
+    for (const path of flushedDeletedFiles) {
+      this.deletedFiles.delete(path);
+    }
 
     // 4. Batch-delete metadata
-    if (this.deletedMeta.size > 0) {
-      await this.remote.deleteMetas([...this.deletedMeta]);
+    if (flushedDeletedMeta.size > 0) {
+      await this.remote.deleteMetas([...flushedDeletedMeta]);
     }
-    this.deletedMeta.clear();
+    for (const path of flushedDeletedMeta) {
+      this.deletedMeta.delete(path);
+    }
 
     // 5. Atomically write pages + metadata for delete-then-recreate paths.
     // Same syncAll guarantee as step 2 — IDB commits both in one transaction.
