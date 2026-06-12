@@ -41,7 +41,7 @@ async function mountTome(backend: SyncMemoryBackend, maxPages?: number) {
   return { FS, tomefs, Module };
 }
 
-function syncAndUnmount(FS: any, tomefs: any): void {
+function syncAndUnmount(FS: any): void {
   let err: Error | null = null;
   FS.syncfs(false, (e: Error | null) => { err = e; });
   if (err) throw err;
@@ -57,14 +57,14 @@ describe("orphan page cleanup on file creation", () => {
   it("single orphan page cleaned up when new file created at same path @fast", async () => {
     backend.writePage("/target", 0, new Uint8Array(PAGE_SIZE).fill(0xaa));
 
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     const fd = FS.open(`${MOUNT}/target`, O.RDWR | O.CREAT, 0o666);
     FS.write(fd, new Uint8Array([1, 2, 3]), 0, 3);
     FS.close(fd);
 
     // Orphan page should be gone from backend after file creation
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     expect(backend.countPages("/target")).toBe(1);
 
     // Remount — file should have correct size, not extended by orphan
@@ -78,7 +78,7 @@ describe("orphan page cleanup on file creation", () => {
     backend.writePage("/multi", 2, new Uint8Array(PAGE_SIZE).fill(0x33));
     backend.writePage("/multi", 3, new Uint8Array(PAGE_SIZE).fill(0x44));
 
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Write a small file at the orphan path
     const data = new Uint8Array(100);
@@ -87,7 +87,7 @@ describe("orphan page cleanup on file creation", () => {
     FS.write(fd, data, 0, 100);
     FS.close(fd);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     const { FS: FS2 } = await mountTome(backend);
 
     // File has correct size — no extension from orphan pages
@@ -114,7 +114,7 @@ describe("orphan page cleanup on file creation", () => {
     backend.writePage("/existing", 0, new Uint8Array(PAGE_SIZE).fill(0xaa));
     backend.writePage("/existing", 1, new Uint8Array(PAGE_SIZE).fill(0xbb));
 
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Restored file should have all its pages intact
     const stat = FS.stat(`${MOUNT}/existing`);
@@ -126,7 +126,7 @@ describe("orphan page cleanup on file creation", () => {
     FS.close(fd);
     expect(buf[0]).toBe(0xaa);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     expect(backend.countPages("/existing")).toBe(2);
   });
 
@@ -135,7 +135,7 @@ describe("orphan page cleanup on file creation", () => {
     backend.writePage("/ops", 0, new Uint8Array(PAGE_SIZE).fill(0xff));
     backend.writePage("/ops", 1, new Uint8Array(PAGE_SIZE).fill(0xfe));
 
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create new file, write, truncate, extend
     const s = FS.open(`${MOUNT}/ops`, O.RDWR | O.CREAT, 0o666);
@@ -146,7 +146,7 @@ describe("orphan page cleanup on file creation", () => {
     FS.write(s2, new Uint8Array([1, 2, 3]), 0, 3, 50);
     FS.close(s2);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     const { FS: FS2 } = await mountTome(backend);
 
     expect(FS2.stat(`${MOUNT}/ops`).size).toBe(53);
@@ -164,7 +164,7 @@ describe("orphan page cleanup on file creation", () => {
     // Orphan pages at /sub/file
     backend.writePage("/sub/file", 0, new Uint8Array(PAGE_SIZE).fill(0xcc));
 
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create subdirectory and file at the orphan path
     FS.mkdir(`${MOUNT}/sub`);
@@ -172,7 +172,7 @@ describe("orphan page cleanup on file creation", () => {
     FS.write(fd, new Uint8Array([10, 20, 30]), 0, 3);
     FS.close(fd);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     const { FS: FS2 } = await mountTome(backend);
 
     expect(FS2.stat(`${MOUNT}/sub/file`).size).toBe(3);
@@ -180,13 +180,13 @@ describe("orphan page cleanup on file creation", () => {
 
   it("no orphan pages: create is not affected by cleanup call @fast", async () => {
     // No orphan pages — file creation should work normally
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     const fd = FS.open(`${MOUNT}/clean`, O.RDWR | O.CREAT, 0o666);
     FS.write(fd, new Uint8Array(500).fill(0x77), 0, 500);
     FS.close(fd);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     const { FS: FS2 } = await mountTome(backend);
 
     expect(FS2.stat(`${MOUNT}/clean`).size).toBe(500);
@@ -198,7 +198,7 @@ describe("orphan page cleanup on file creation", () => {
     backend.writePage("/pressure", 1, new Uint8Array(PAGE_SIZE).fill(0x22));
     backend.writePage("/pressure", 2, new Uint8Array(PAGE_SIZE).fill(0x33));
 
-    const { FS, tomefs } = await mountTome(backend, 4);
+    const { FS } = await mountTome(backend, 4);
 
     // Create file and write enough to exercise cache eviction
     const fd = FS.open(`${MOUNT}/pressure`, O.RDWR | O.CREAT, 0o666);
@@ -209,7 +209,7 @@ describe("orphan page cleanup on file creation", () => {
     }
     FS.close(fd);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     const { FS: FS2 } = await mountTome(backend, 4);
 
     expect(FS2.stat(`${MOUNT}/pressure`).size).toBe(PAGE_SIZE * 6);
@@ -225,23 +225,23 @@ describe("orphan page cleanup on file creation", () => {
   });
 
   it("delete then recreate at same path cleans orphans @fast", async () => {
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create a file, sync to persist
     const fd1 = FS.open(`${MOUNT}/recycle`, O.RDWR | O.CREAT, 0o666);
     FS.write(fd1, new Uint8Array(PAGE_SIZE * 3).fill(0xab), 0, PAGE_SIZE * 3);
     FS.close(fd1);
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
 
     expect(backend.countPages("/recycle")).toBe(3);
 
     // Remount, delete, recreate smaller
-    const { FS: FS2, tomefs: t2 } = await mountTome(backend);
+    const { FS: FS2 } = await mountTome(backend);
     FS2.unlink(`${MOUNT}/recycle`);
     const fd2 = FS2.open(`${MOUNT}/recycle`, O.RDWR | O.CREAT, 0o666);
     FS2.write(fd2, new Uint8Array([42]), 0, 1);
     FS2.close(fd2);
-    syncAndUnmount(FS2, t2);
+    syncAndUnmount(FS2);
 
     // Only 1 page should remain
     expect(backend.countPages("/recycle")).toBe(1);
@@ -265,7 +265,7 @@ describe("orphan page cleanup on file creation", () => {
     });
     backend.writePage("/keeper", 0, new Uint8Array(PAGE_SIZE).fill(0x99));
 
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // Create new file at orphan path
     const fd = FS.open(`${MOUNT}/orphan`, O.RDWR | O.CREAT, 0o666);
@@ -279,7 +279,7 @@ describe("orphan page cleanup on file creation", () => {
     FS.close(kfd);
     expect(buf[0]).toBe(0x99);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
 
     // Verify keeper survives syncfs
     expect(backend.countPages("/keeper")).toBe(1);
@@ -299,7 +299,7 @@ describe("orphan page cleanup on file creation", () => {
     backend.writePage("/ghost", 0, new Uint8Array(PAGE_SIZE).fill(0x11));
     backend.writePage("/ghost", 1, new Uint8Array(PAGE_SIZE).fill(0x22));
 
-    const { FS, tomefs } = await mountTome(backend);
+    const { FS } = await mountTome(backend);
 
     // The ghost file was restored by restoreTree. Delete it, then create new.
     FS.unlink(`${MOUNT}/ghost`);
@@ -307,7 +307,7 @@ describe("orphan page cleanup on file creation", () => {
     FS.write(fd, new Uint8Array([7, 8, 9]), 0, 3);
     FS.close(fd);
 
-    syncAndUnmount(FS, tomefs);
+    syncAndUnmount(FS);
     const { FS: FS2 } = await mountTome(backend);
 
     expect(FS2.stat(`${MOUNT}/ghost`).size).toBe(3);
