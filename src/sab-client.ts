@@ -29,6 +29,51 @@ import {
 } from "./sab-protocol.js";
 
 /**
+ * Validate that a batch response contains an array of the expected length.
+ * All batch SAB bridge methods return a JSON object with a named array field
+ * that must be parallel to the request array. A mismatch indicates a protocol
+ * bug or buffer corruption.
+ */
+export function validateBatchArray<T>(
+  json: unknown,
+  field: string,
+  expectedLength: number,
+  method: string,
+): T[] {
+  const obj = json as Record<string, unknown>;
+  const arr = obj[field];
+  if (!Array.isArray(arr) || arr.length !== expectedLength) {
+    throw new Error(
+      `SAB bridge ${method}: expected ${expectedLength} ${field} entries, got ${
+        Array.isArray(arr) ? arr.length : typeof arr
+      }`,
+    );
+  }
+  return arr as T[];
+}
+
+/**
+ * Validate a LIST_FILES_RANGE response has the expected structure.
+ */
+export function validateListFilesResponse(
+  json: unknown,
+  method: string,
+): { files: string[]; total: number } {
+  const obj = json as Record<string, unknown>;
+  if (!Array.isArray(obj.files)) {
+    throw new Error(
+      `SAB bridge ${method}: expected files array, got ${typeof obj.files}`,
+    );
+  }
+  if (typeof obj.total !== "number") {
+    throw new Error(
+      `SAB bridge ${method}: expected total number, got ${typeof obj.total}`,
+    );
+  }
+  return obj as unknown as { files: string[]; total: number };
+}
+
+/**
  * SAB+Atomics client that implements SyncStorageBackend.
  *
  * This is the synchronous side of the bridge: it runs in the PGlite/Emscripten
@@ -169,17 +214,10 @@ export class SabClient implements SyncStorageBackend {
       path,
       pageIndices,
     });
-    const result = json as { sizes: number[] };
-    if (!Array.isArray(result.sizes) || result.sizes.length !== pageIndices.length) {
-      throw new Error(
-        `SAB bridge readPages: expected ${pageIndices.length} size entries, got ${
-          Array.isArray(result.sizes) ? result.sizes.length : "non-array"
-        }`,
-      );
-    }
+    const sizes = validateBatchArray<number>(json, "sizes", pageIndices.length, "readPages");
     const pages: Array<Uint8Array | null> = [];
     let offset = 0;
-    for (const size of result.sizes) {
+    for (const size of sizes) {
       if (size < 0) {
         pages.push(null);
       } else {
@@ -270,7 +308,7 @@ export class SabClient implements SyncStorageBackend {
     // Single chunk fast path
     if (paths.length <= this.maxBatchFiles) {
       const { json } = this.call(OpCode.COUNT_PAGES_BATCH, { paths });
-      return (json as { counts: number[] }).counts;
+      return validateBatchArray<number>(json, "counts", paths.length, "countPagesBatch");
     }
 
     // Multi-chunk: split paths to avoid SAB buffer overflow
@@ -278,7 +316,7 @@ export class SabClient implements SyncStorageBackend {
     for (let i = 0; i < paths.length; i += this.maxBatchFiles) {
       const chunk = paths.slice(i, i + this.maxBatchFiles);
       const { json } = this.call(OpCode.COUNT_PAGES_BATCH, { paths: chunk });
-      allCounts.push(...(json as { counts: number[] }).counts);
+      allCounts.push(...validateBatchArray<number>(json, "counts", chunk.length, "countPagesBatch"));
     }
     return allCounts;
   }
@@ -322,14 +360,14 @@ export class SabClient implements SyncStorageBackend {
     // (the worker encodes all FileMeta objects into the shared buffer).
     if (paths.length <= this.maxBatchMetas) {
       const { json } = this.call(OpCode.READ_METAS, { paths });
-      return (json as { metas: Array<FileMeta | null> }).metas;
+      return validateBatchArray<FileMeta | null>(json, "metas", paths.length, "readMetas");
     }
 
     const results: Array<FileMeta | null> = [];
     for (let i = 0; i < paths.length; i += this.maxBatchMetas) {
       const chunk = paths.slice(i, i + this.maxBatchMetas);
       const { json } = this.call(OpCode.READ_METAS, { paths: chunk });
-      results.push(...(json as { metas: Array<FileMeta | null> }).metas);
+      results.push(...validateBatchArray<FileMeta | null>(json, "metas", chunk.length, "readMetas"));
     }
     return results;
   }
@@ -362,7 +400,7 @@ export class SabClient implements SyncStorageBackend {
     // Single chunk fast path
     if (paths.length <= this.maxBatchFiles) {
       const { json } = this.call(OpCode.MAX_PAGE_INDEX_BATCH, { paths });
-      return (json as { maxIndices: number[] }).maxIndices;
+      return validateBatchArray<number>(json, "maxIndices", paths.length, "maxPageIndexBatch");
     }
 
     // Multi-chunk: split paths to avoid SAB buffer overflow
@@ -370,7 +408,7 @@ export class SabClient implements SyncStorageBackend {
     for (let i = 0; i < paths.length; i += this.maxBatchFiles) {
       const chunk = paths.slice(i, i + this.maxBatchFiles);
       const { json } = this.call(OpCode.MAX_PAGE_INDEX_BATCH, { paths: chunk });
-      allIndices.push(...(json as { maxIndices: number[] }).maxIndices);
+      allIndices.push(...validateBatchArray<number>(json, "maxIndices", chunk.length, "maxPageIndexBatch"));
     }
     return allIndices;
   }
@@ -383,7 +421,7 @@ export class SabClient implements SyncStorageBackend {
       offset: 0,
       limit: this.maxBatchFiles,
     });
-    const first = firstResult.json as { files: string[]; total: number };
+    const first = validateListFilesResponse(firstResult.json, "listFiles");
 
     // Fast path: all files fit in the first chunk
     if (first.total <= this.maxBatchFiles) {
@@ -398,10 +436,10 @@ export class SabClient implements SyncStorageBackend {
         offset,
         limit: this.maxBatchFiles,
       });
-      const chunk = (json as { files: string[]; total: number }).files;
-      allFiles.push(...chunk);
-      offset += chunk.length;
-      if (chunk.length === 0) break; // safety: avoid infinite loop
+      const chunk = validateListFilesResponse(json, "listFiles");
+      allFiles.push(...chunk.files);
+      offset += chunk.files.length;
+      if (chunk.files.length === 0) break; // safety: avoid infinite loop
     }
     return allFiles;
   }
