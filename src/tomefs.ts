@@ -1307,6 +1307,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // - highIdx == lastPageIndex: extent matches → trust meta.size
     // - highIdx > lastPageIndex: file extended past metadata → recover
     // - highIdx < lastPageIndex: crash truncation → adjust size
+    const sizeCorrectedNodes: any[] = [];
     if (fileEntries.length > 0) {
       const storagePaths = fileEntries.map((e) => e.storagePath);
       const allMaxIndices = backend.maxPageIndexBatch(storagePaths);
@@ -1341,6 +1342,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node.mtime = meta.mtime;
         node.ctime = meta.ctime;
         node._metaDirty = false;
+        if (fileSize !== meta.size) {
+          sizeCorrectedNodes.push(node);
+        }
       }
     }
 
@@ -1352,6 +1356,13 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       node._metaDirty = false;
     }
     dirtyMetaNodes.clear();
+
+    // Files whose sizes were corrected during recovery need their
+    // metadata persisted so subsequent mounts see consistent state
+    // and skip unnecessary re-recovery.
+    for (const node of sizeCorrectedNodes) {
+      markMetaDirty(node);
+    }
   }
 
   // ---------------------------------------------------------------
