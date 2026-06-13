@@ -1763,6 +1763,14 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         }
       }
 
+      for (const node of allFileNodes) {
+        if (node._metaDirty && !dirtyMetaNodes.has(node)) {
+          errors.push(
+            `file node ${node.storagePath} has _metaDirty=true but is not in dirtyMetaNodes`,
+          );
+        }
+      }
+
       pageCache.assertInvariants();
 
       if (errors.length > 0) {

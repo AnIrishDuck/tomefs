@@ -15,6 +15,7 @@
  *   - unlink (removes from tracking sets)
  *   - truncate (invalidates pages, modifies dirty state)
  *   - write (marks dirty, triggers eviction)
+ *   - fsync (flushes per-file pages + metadata, clears dirty flags)
  *   - syncfs (clears dirty state, transitions mode)
  *
  * Ethos §9: "Write tests designed to break tomefs specifically — target
@@ -140,6 +141,7 @@ type Op =
   | { type: "writeFd"; fdId: number; data: Uint8Array }
   | { type: "closeFd"; fdId: number }
   | { type: "allocate"; path: string; offset: number; length: number }
+  | { type: "fsyncFd"; fdId: number }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["aa", "bb", "cc"];
@@ -169,6 +171,7 @@ function generateOp(rng: Rng, model: Model): Op {
     ["writeFd", activeFdIds.length > 0 ? 12 : 0],
     ["closeFd", model.openFds.size > 0 ? 6 : 0],
     ["allocate", allFiles.length > 0 ? 8 : 0],
+    ["fsyncFd", activeFdIds.length > 0 ? 8 : 0],
     ["syncfs", 6],
   ];
 
@@ -260,6 +263,10 @@ function generateOp(rng: Rng, model: Model): Op {
       const offsets = [0, currentSize, currentSize + PAGE_SIZE];
       const lengths = [1, PAGE_SIZE, PAGE_SIZE * 2];
       return { type: "allocate", path, offset: rng.pick(offsets), length: rng.pick(lengths) };
+    }
+    case "fsyncFd": {
+      const fdId = rng.pick(activeFdIds);
+      return { type: "fsyncFd", fdId };
     }
     default:
       return { type: "syncfs" };
@@ -366,6 +373,7 @@ function applyToModel(op: Op, model: Model): void {
       model.files.set(op.path, Math.max(cur, op.offset + op.length));
       break;
     }
+    case "fsyncFd":
     case "syncfs":
       break;
   }
@@ -437,6 +445,14 @@ function execOp(
         const s = FS.open(op.path, O.RDWR);
         (FS as any).allocate(s, op.offset, op.length);
         FS.close(s);
+        return true;
+      }
+      case "fsyncFd": {
+        const stream = fdStreams.get(op.fdId);
+        if (!stream) return false;
+        if (stream.stream_ops?.fsync) {
+          stream.stream_ops.fsync(stream);
+        }
         return true;
       }
       case "syncfs":
@@ -557,6 +573,7 @@ function prefixOp(op: Op): Op {
       return { ...op, path: MOUNT + op.path };
     case "writeFd":
     case "closeFd":
+    case "fsyncFd":
     case "syncfs":
       return op;
   }
