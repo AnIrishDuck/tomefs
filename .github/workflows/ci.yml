@@ -59,6 +59,7 @@ jobs:
   full-tests:
     name: Full test suite (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         node-version: [20, 22]
@@ -74,10 +75,10 @@ jobs:
       - run: npm ci
 
       - name: Full test suite (MEMFS)
-        run: npm test
+        run: npx vitest run --pool=forks --poolOptions.forks.maxForks=2
 
       - name: Full test suite (tomefs)
-        run: TOMEFS_BACKEND=tomefs npm test
+        run: TOMEFS_BACKEND=tomefs npx vitest run --pool=forks --poolOptions.forks.maxForks=2
 
   preload-backend-tests:
     name: PreloadBackend conformance (graceful degradation)
