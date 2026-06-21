@@ -53,6 +53,60 @@ export function validateBatchArray<T>(
 }
 
 /**
+ * Validate that a singleton response contains a field of the expected type.
+ * Singleton SAB bridge methods return a JSON object with a named field whose
+ * type is known at compile time. A missing or wrong-typed field indicates a
+ * protocol bug or buffer corruption.
+ */
+export function validateSingletonField<T>(
+  json: unknown,
+  field: string,
+  expectedType: string,
+  method: string,
+): T {
+  const obj = json as Record<string, unknown>;
+  if (!(field in obj)) {
+    throw new Error(
+      `SAB bridge ${method}: response missing '${field}' field`,
+    );
+  }
+  const value = obj[field];
+  if (typeof value !== expectedType) {
+    if (value === null && expectedType === "object") {
+      return value as T;
+    }
+    throw new Error(
+      `SAB bridge ${method}: expected ${field} to be ${expectedType}, got ${value === null ? "null" : typeof value}`,
+    );
+  }
+  return value as T;
+}
+
+/**
+ * Validate a readMeta singleton response. The meta field can be null (file
+ * not found) or an object (FileMeta). Anything else is a protocol error.
+ */
+export function validateMetaResponse(
+  json: unknown,
+  method: string,
+): FileMeta | null {
+  const obj = json as Record<string, unknown>;
+  if (!("meta" in obj)) {
+    throw new Error(
+      `SAB bridge ${method}: response missing 'meta' field`,
+    );
+  }
+  const meta = obj.meta;
+  if (meta === null) return null;
+  if (typeof meta !== "object") {
+    throw new Error(
+      `SAB bridge ${method}: expected meta to be object or null, got ${typeof meta}`,
+    );
+  }
+  return meta as FileMeta;
+}
+
+/**
  * Validate a LIST_FILES_RANGE response has the expected structure.
  */
 export function validateListFilesResponse(
@@ -183,8 +237,8 @@ export class SabClient implements SyncStorageBackend {
 
   readPage(path: string, pageIndex: number): Uint8Array | null {
     const { json, binary } = this.call(OpCode.READ_PAGE, { path, pageIndex });
-    const result = json as { found: boolean };
-    if (!result.found) return null;
+    const found = validateSingletonField<boolean>(json, "found", "boolean", "readPage");
+    if (!found) return null;
     return binary;
   }
 
@@ -299,7 +353,7 @@ export class SabClient implements SyncStorageBackend {
 
   countPages(path: string): number {
     const { json } = this.call(OpCode.COUNT_PAGES, { path });
-    return (json as { count: number }).count;
+    return validateSingletonField<number>(json, "count", "number", "countPages");
   }
 
   countPagesBatch(paths: string[]): number[] {
@@ -323,8 +377,7 @@ export class SabClient implements SyncStorageBackend {
 
   readMeta(path: string): FileMeta | null {
     const { json } = this.call(OpCode.READ_META, { path });
-    const result = json as { meta: FileMeta | null };
-    return result.meta;
+    return validateMetaResponse(json, "readMeta");
   }
 
   writeMeta(path: string, meta: FileMeta): void {
@@ -391,7 +444,7 @@ export class SabClient implements SyncStorageBackend {
 
   maxPageIndex(path: string): number {
     const { json } = this.call(OpCode.MAX_PAGE_INDEX, { path });
-    return (json as { maxIdx: number }).maxIdx;
+    return validateSingletonField<number>(json, "maxIdx", "number", "maxPageIndex");
   }
 
   maxPageIndexBatch(paths: string[]): number[] {
@@ -461,7 +514,7 @@ export class SabClient implements SyncStorageBackend {
 
   cleanupOrphanedPages(): number {
     const { json } = this.call(OpCode.CLEANUP_ORPHANED_PAGES, {});
-    return (json as { removed: number }).removed;
+    return validateSingletonField<number>(json, "removed", "number", "cleanupOrphanedPages");
   }
 
   syncAll(
