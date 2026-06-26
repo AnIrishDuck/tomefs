@@ -1385,7 +1385,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // backend to prevent stale data from leaking through when files are
       // later extended. Bypasses the page cache to avoid cache pollution
       // and eviction overhead during mount.
+      //
+      // Collects all zeroed pages into a batch and writes them in a single
+      // writePages call to reduce SAB bridge round-trips from O(stale) to 1.
       if (!hasCleanMarker) {
+        const staleTailPages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
         for (let i = 0; i < fileEntries.length; i++) {
           const fileSize = fileSizes[i];
           const tailOffset = fileSize & PAGE_MASK;
@@ -1399,10 +1403,17 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
               }
               if (hasStale) {
                 pageData.fill(0, tailOffset);
-                backend.writePage(fileEntries[i].storagePath, lastPageIndex, pageData);
+                staleTailPages.push({
+                  path: fileEntries[i].storagePath,
+                  pageIndex: lastPageIndex,
+                  data: pageData,
+                });
               }
             }
           }
+        }
+        if (staleTailPages.length > 0) {
+          backend.writePages(staleTailPages);
         }
       }
     }
