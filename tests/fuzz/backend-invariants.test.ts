@@ -160,8 +160,47 @@ class ReferenceBackend {
     this.meta.set(path, { ...meta });
   }
 
+  writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
+    for (const { path, meta } of entries) {
+      this.writeMeta(path, meta);
+    }
+  }
+
+  readMeta(path: string): FileMeta | null {
+    return this.meta.get(path) ?? null;
+  }
+
   deleteMeta(path: string): void {
     this.meta.delete(path);
+  }
+
+  deleteMetas(paths: string[]): void {
+    for (const path of paths) {
+      this.deleteMeta(path);
+    }
+  }
+
+  deleteFiles(paths: string[]): void {
+    for (const path of paths) {
+      this.deleteFile(path);
+    }
+  }
+
+  cleanupOrphanedPages(): number {
+    const metaPaths = new Set(this.meta.keys());
+    const pagePaths = new Set<string>();
+    for (const key of this.pages.keys()) {
+      const nullIdx = key.indexOf("\0");
+      pagePaths.add(key.substring(0, nullIdx));
+    }
+    let removed = 0;
+    for (const path of pagePaths) {
+      if (!metaPaths.has(path)) {
+        this.deleteFile(path);
+        removed++;
+      }
+    }
+    return removed;
   }
 
   listFiles(): string[] {
@@ -177,17 +216,21 @@ type Op =
   | { type: "writePage"; path: string; pageIndex: number; data: Uint8Array }
   | { type: "writePages"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> }
   | { type: "deleteFile"; path: string }
+  | { type: "deleteFiles"; paths: string[] }
   | { type: "deletePagesFrom"; path: string; fromPageIndex: number }
   | { type: "renameFile"; oldPath: string; newPath: string }
   | { type: "writeMeta"; path: string; meta: FileMeta }
+  | { type: "writeMetas"; metas: Array<{ path: string; meta: FileMeta }> }
   | { type: "deleteMeta"; path: string }
+  | { type: "deleteMetas"; paths: string[] }
   | { type: "syncAll"; pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>; metas: Array<{ path: string; meta: FileMeta }> }
-  | { type: "deleteAll"; paths: string[] };
+  | { type: "deleteAll"; paths: string[] }
+  | { type: "cleanupOrphanedPages" };
 
 const FILE_PATHS = ["/a", "/b", "/c", "/d", "/e"];
 
 function generateOp(rng: Rng): Op {
-  const opType = rng.int(0, 8);
+  const opType = rng.int(0, 12);
   switch (opType) {
     case 0: {
       return {
@@ -263,6 +306,36 @@ function generateOp(rng: Rng): Op {
       }
       return { type: "deleteAll", paths: [...paths] };
     }
+    case 9: {
+      const count = rng.int(1, 3);
+      const paths = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        paths.add(rng.pick(FILE_PATHS));
+      }
+      return { type: "deleteFiles", paths: [...paths] };
+    }
+    case 10: {
+      const count = rng.int(1, 3);
+      const metas: Array<{ path: string; meta: FileMeta }> = [];
+      for (let i = 0; i < count; i++) {
+        metas.push({
+          path: rng.pick(FILE_PATHS),
+          meta: { size: rng.int(0, PAGE_SIZE * 8), mode: 0o100644, ctime: Date.now(), mtime: Date.now() },
+        });
+      }
+      return { type: "writeMetas", metas };
+    }
+    case 11: {
+      const count = rng.int(1, 3);
+      const paths = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        paths.add(rng.pick(FILE_PATHS));
+      }
+      return { type: "deleteMetas", paths: [...paths] };
+    }
+    case 12: {
+      return { type: "cleanupOrphanedPages" };
+    }
     default:
       throw new Error(`unreachable: opType=${opType}`);
   }
@@ -286,6 +359,10 @@ function applyOp(backend: SyncMemoryBackend, ref: ReferenceBackend, op: Op): voi
       backend.deleteFile(op.path);
       ref.deleteFile(op.path);
       break;
+    case "deleteFiles":
+      backend.deleteFiles(op.paths);
+      ref.deleteFiles(op.paths);
+      break;
     case "deletePagesFrom":
       backend.deletePagesFrom(op.path, op.fromPageIndex);
       ref.deletePagesFrom(op.path, op.fromPageIndex);
@@ -298,9 +375,17 @@ function applyOp(backend: SyncMemoryBackend, ref: ReferenceBackend, op: Op): voi
       backend.writeMeta(op.path, op.meta);
       ref.writeMeta(op.path, op.meta);
       break;
+    case "writeMetas":
+      backend.writeMetas(op.metas);
+      ref.writeMetas(op.metas);
+      break;
     case "deleteMeta":
       backend.deleteMeta(op.path);
       ref.deleteMeta(op.path);
+      break;
+    case "deleteMetas":
+      backend.deleteMetas(op.paths);
+      ref.deleteMetas(op.paths);
       break;
     case "syncAll":
       backend.syncAll(op.pages, op.metas);
@@ -316,6 +401,12 @@ function applyOp(backend: SyncMemoryBackend, ref: ReferenceBackend, op: Op): voi
         ref.deleteMeta(path);
       }
       break;
+    case "cleanupOrphanedPages": {
+      const backendRemoved = backend.cleanupOrphanedPages();
+      const refRemoved = ref.cleanupOrphanedPages();
+      expect(backendRemoved, "cleanupOrphanedPages count mismatch").toBe(refRemoved);
+      break;
+    }
   }
 }
 
@@ -346,7 +437,32 @@ function verifyAgainstReference(
         ).toBe(true);
       }
     }
+
+    const bMeta = backend.readMeta(path);
+    const rMeta = ref.readMeta(path);
+    if (rMeta === null) {
+      expect(bMeta, `${context}: readMeta(${path})`).toBeNull();
+    } else {
+      expect(bMeta, `${context}: readMeta(${path}) missing`).not.toBeNull();
+      expect(bMeta, `${context}: readMeta(${path}) data`).toEqual(rMeta);
+    }
   }
+
+  const bFiles = backend.listFiles().sort();
+  const rFiles = ref.listFiles().sort();
+  expect(bFiles, `${context}: listFiles`).toEqual(rFiles);
+
+  const bCounts = backend.countPagesBatch(FILE_PATHS);
+  const rCounts = FILE_PATHS.map((p) => ref.countPages(p));
+  expect(bCounts, `${context}: countPagesBatch`).toEqual(rCounts);
+
+  const bMaxBatch = backend.maxPageIndexBatch(FILE_PATHS);
+  const rMaxBatch = FILE_PATHS.map((p) => ref.maxPageIndex(p));
+  expect(bMaxBatch, `${context}: maxPageIndexBatch`).toEqual(rMaxBatch);
+
+  const bMetas = backend.readMetas(FILE_PATHS);
+  const rMetas = FILE_PATHS.map((p) => ref.readMeta(p));
+  expect(bMetas, `${context}: readMetas`).toEqual(rMetas);
 }
 
 // ---------------------------------------------------------------
@@ -407,6 +523,10 @@ function applyOpToPreload(
       backend.deleteFile(op.path);
       ref.deleteFile(op.path);
       break;
+    case "deleteFiles":
+      backend.deleteFiles(op.paths);
+      ref.deleteFiles(op.paths);
+      break;
     case "deletePagesFrom":
       backend.deletePagesFrom(op.path, op.fromPageIndex);
       ref.deletePagesFrom(op.path, op.fromPageIndex);
@@ -419,9 +539,17 @@ function applyOpToPreload(
       backend.writeMeta(op.path, op.meta);
       ref.writeMeta(op.path, op.meta);
       break;
+    case "writeMetas":
+      backend.writeMetas(op.metas);
+      ref.writeMetas(op.metas);
+      break;
     case "deleteMeta":
       backend.deleteMeta(op.path);
       ref.deleteMeta(op.path);
+      break;
+    case "deleteMetas":
+      backend.deleteMetas(op.paths);
+      ref.deleteMetas(op.paths);
       break;
     case "syncAll":
       backend.syncAll(op.pages, op.metas);
@@ -437,6 +565,12 @@ function applyOpToPreload(
         ref.deleteMeta(path);
       }
       break;
+    case "cleanupOrphanedPages": {
+      const backendRemoved = backend.cleanupOrphanedPages();
+      const refRemoved = ref.cleanupOrphanedPages();
+      expect(backendRemoved, "cleanupOrphanedPages count mismatch").toBe(refRemoved);
+      break;
+    }
   }
 }
 
@@ -467,7 +601,32 @@ function verifyPreloadAgainstReference(
         ).toBe(true);
       }
     }
+
+    const bMeta = backend.readMeta(path);
+    const rMeta = ref.readMeta(path);
+    if (rMeta === null) {
+      expect(bMeta, `${context}: readMeta(${path})`).toBeNull();
+    } else {
+      expect(bMeta, `${context}: readMeta(${path}) missing`).not.toBeNull();
+      expect(bMeta, `${context}: readMeta(${path}) data`).toEqual(rMeta);
+    }
   }
+
+  const bFiles = backend.listFiles().sort();
+  const rFiles = ref.listFiles().sort();
+  expect(bFiles, `${context}: listFiles`).toEqual(rFiles);
+
+  const bCounts = backend.countPagesBatch(FILE_PATHS);
+  const rCounts = FILE_PATHS.map((p) => ref.countPages(p));
+  expect(bCounts, `${context}: countPagesBatch`).toEqual(rCounts);
+
+  const bMaxBatch = backend.maxPageIndexBatch(FILE_PATHS);
+  const rMaxBatch = FILE_PATHS.map((p) => ref.maxPageIndex(p));
+  expect(bMaxBatch, `${context}: maxPageIndexBatch`).toEqual(rMaxBatch);
+
+  const bMetas = backend.readMetas(FILE_PATHS);
+  const rMetas = FILE_PATHS.map((p) => ref.readMeta(p));
+  expect(bMetas, `${context}: readMetas`).toEqual(rMetas);
 }
 
 async function runPreloadFuzz(seed: number, numOps: number): Promise<void> {
@@ -772,5 +931,161 @@ describe("targeted: index-stressing operation patterns", () => {
 
     await backend.flush();
     backend.assertInvariants();
+  });
+
+  it("deleteFiles batch cleans up indexes for all paths @fast", () => {
+    const backend = new SyncMemoryBackend();
+    const data = new Uint8Array(PAGE_SIZE).fill(0xaa);
+
+    backend.writePage("/a", 0, data);
+    backend.writePage("/a", 1, data);
+    backend.writePage("/b", 0, data);
+    backend.writePage("/c", 0, data);
+    backend.writePage("/c", 3, data);
+    backend.assertInvariants();
+
+    backend.deleteFiles(["/a", "/c"]);
+    backend.assertInvariants();
+    expect(backend.countPages("/a")).toBe(0);
+    expect(backend.maxPageIndex("/a")).toBe(-1);
+    expect(backend.countPages("/b")).toBe(1);
+    expect(backend.countPages("/c")).toBe(0);
+    expect(backend.maxPageIndex("/c")).toBe(-1);
+  });
+
+  it("writeMetas batch stores all entries @fast", () => {
+    const backend = new SyncMemoryBackend();
+    const m1 = { size: 100, mode: 0o100644, ctime: 1, mtime: 1 };
+    const m2 = { size: 200, mode: 0o100755, ctime: 2, mtime: 2 };
+
+    backend.writeMetas([
+      { path: "/a", meta: m1 },
+      { path: "/b", meta: m2 },
+    ]);
+    backend.assertInvariants();
+    expect(backend.readMeta("/a")).toEqual(m1);
+    expect(backend.readMeta("/b")).toEqual(m2);
+    expect(backend.listFiles().sort()).toEqual(["/a", "/b"]);
+  });
+
+  it("deleteMetas batch removes all entries @fast", () => {
+    const backend = new SyncMemoryBackend();
+    const meta = { size: 100, mode: 0o100644, ctime: 1, mtime: 1 };
+
+    backend.writeMeta("/a", meta);
+    backend.writeMeta("/b", meta);
+    backend.writeMeta("/c", meta);
+    backend.assertInvariants();
+
+    backend.deleteMetas(["/a", "/c"]);
+    backend.assertInvariants();
+    expect(backend.readMeta("/a")).toBeNull();
+    expect(backend.readMeta("/b")).toEqual(meta);
+    expect(backend.readMeta("/c")).toBeNull();
+    expect(backend.listFiles()).toEqual(["/b"]);
+  });
+
+  it("cleanupOrphanedPages removes pages without metadata @fast", () => {
+    const backend = new SyncMemoryBackend();
+    const data = new Uint8Array(PAGE_SIZE).fill(0xdd);
+    const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 };
+
+    backend.writePage("/orphan1", 0, data);
+    backend.writePage("/orphan1", 1, data);
+    backend.writePage("/orphan2", 0, data);
+    backend.writePage("/valid", 0, data);
+    backend.writeMeta("/valid", meta);
+    backend.assertInvariants();
+
+    const removed = backend.cleanupOrphanedPages();
+    backend.assertInvariants();
+    expect(removed).toBe(2);
+    expect(backend.readPage("/orphan1", 0)).toBeNull();
+    expect(backend.readPage("/orphan2", 0)).toBeNull();
+    expect(backend.readPage("/valid", 0)).toEqual(data);
+    expect(backend.countPages("/valid")).toBe(1);
+  });
+
+  it("cleanupOrphanedPages returns 0 when no orphans @fast", () => {
+    const backend = new SyncMemoryBackend();
+    const data = new Uint8Array(PAGE_SIZE).fill(0xee);
+    const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 };
+
+    backend.writePage("/f", 0, data);
+    backend.writeMeta("/f", meta);
+    backend.assertInvariants();
+
+    expect(backend.cleanupOrphanedPages()).toBe(0);
+    backend.assertInvariants();
+  });
+
+  it("PreloadBackend deleteFiles + writeMetas batch @fast", async () => {
+    const remote = new MemoryBackend();
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+
+    const data = new Uint8Array(PAGE_SIZE).fill(0x11);
+    backend.writePage("/a", 0, data);
+    backend.writePage("/b", 0, data);
+    backend.writePage("/c", 0, data);
+    backend.assertInvariants();
+
+    backend.deleteFiles(["/a", "/b"]);
+    backend.assertInvariants();
+    expect(backend.countPages("/a")).toBe(0);
+    expect(backend.countPages("/b")).toBe(0);
+    expect(backend.countPages("/c")).toBe(1);
+
+    const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 };
+    backend.writeMetas([
+      { path: "/c", meta },
+      { path: "/d", meta: { ...meta, size: 0 } },
+    ]);
+    backend.assertInvariants();
+    expect(backend.readMeta("/c")).toEqual(meta);
+    expect(backend.readMeta("/d")).toEqual({ ...meta, size: 0 });
+
+    await backend.flush();
+    backend.assertInvariants();
+  });
+
+  it("PreloadBackend cleanupOrphanedPages + flush @fast", async () => {
+    const remote = new MemoryBackend();
+    const backend = new PreloadBackend(remote);
+    await backend.init();
+
+    const data = new Uint8Array(PAGE_SIZE).fill(0x22);
+    const meta = { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 };
+
+    backend.writePage("/orphan", 0, data);
+    backend.writePage("/valid", 0, data);
+    backend.writeMeta("/valid", meta);
+    backend.assertInvariants();
+
+    const removed = backend.cleanupOrphanedPages();
+    backend.assertInvariants();
+    expect(removed).toBe(1);
+    expect(backend.countPages("/orphan")).toBe(0);
+    expect(backend.countPages("/valid")).toBe(1);
+
+    await backend.flush();
+    backend.assertInvariants();
+  });
+
+  it("deleteMetas + writeMetas interleave on same paths @fast", () => {
+    const backend = new SyncMemoryBackend();
+    const m1 = { size: 100, mode: 0o100644, ctime: 1, mtime: 1 };
+    const m2 = { size: 200, mode: 0o100755, ctime: 2, mtime: 2 };
+
+    backend.writeMetas([{ path: "/a", meta: m1 }, { path: "/b", meta: m1 }]);
+    backend.assertInvariants();
+
+    backend.deleteMetas(["/a"]);
+    backend.assertInvariants();
+
+    backend.writeMetas([{ path: "/a", meta: m2 }]);
+    backend.assertInvariants();
+    expect(backend.readMeta("/a")).toEqual(m2);
+    expect(backend.readMeta("/b")).toEqual(m1);
   });
 });
