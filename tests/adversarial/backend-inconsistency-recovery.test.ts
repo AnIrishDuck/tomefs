@@ -768,17 +768,11 @@ describe("recovery: post-recovery operations produce correct state", () => {
     expect(backend.countPages("/todelete")).toBe(0);
   });
 
-  it("new file at orphan path: fresh data correct, stale page extends file", async () => {
-    // Known limitation: when orphan pages exist at a path and a new smaller
-    // file is created at the same path, cleanupOrphanedPages doesn't remove
-    // the stale pages because the path now has metadata. On remount,
-    // restoreTree sees the stale page beyond the file's extent and extends
-    // the file. The fresh data at offset 0 is correct, but the file size
-    // includes the orphan page.
-    //
-    // In practice this is rare: it requires a crash that leaves orphan pages,
-    // followed by a new file at the exact same storage path that's smaller
-    // than the orphan extent.
+  it("new file at orphan path: orphan pages cleaned up on file creation", async () => {
+    // Orphan pages at a path are cleaned up when a new file is created
+    // at the same path. createNode calls backend.deleteFile() to remove
+    // stale pages before the new file's data is written, preventing
+    // restoreTree from misinterpreting orphan pages as the new file's data.
 
     // Orphan pages at "/reborn"
     backend.writePage("/reborn", 0, new Uint8Array(PAGE_SIZE).fill(0xdd));
@@ -804,9 +798,8 @@ describe("recovery: post-recovery operations produce correct state", () => {
     FS2.close(s2);
     expect(buf).toEqual(fresh);
 
-    // File size is extended by the stale orphan page at index 1.
-    // restoreTree sees maxPageIndex=1 > lastPageIndex=0 and extends.
-    expect(FS2.stat(`${MOUNT}/reborn`).size).toBe(PAGE_SIZE * 2);
+    // File size matches the written data — orphan pages were cleaned up.
+    expect(FS2.stat(`${MOUNT}/reborn`).size).toBe(200);
   });
 
   it("orphan pages at unused path are cleaned up by full tree sync", async () => {
