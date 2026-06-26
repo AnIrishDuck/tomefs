@@ -169,7 +169,8 @@ type Op =
   | { type: "ftruncateFd"; fdId: number; size: number }
   | { type: "allocate"; path: string; offset: number; length: number }
   | { type: "utime"; path: string; atime: number; mtime: number }
-  | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array };
+  | { type: "mmapWriteAt"; path: string; position: number; data: Uint8Array }
+  | { type: "fsyncFd"; fdId: number };
 
 const DIR_NAMES = ["alpha", "beta", "gamma"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"];
@@ -245,6 +246,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["allocate", allFiles.length > 0 ? 8 : 0],
     ["utime", allFiles.length > 0 ? 6 : 0],
     ["mmapWriteAt", allFiles.length > 0 ? 6 : 0],
+    ["fsyncFd", openFdIds.length > 0 ? 8 : 0],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -470,6 +472,11 @@ function generateOp(rng: Rng, model: FSModel): Op {
       return { type: "mmapWriteAt", path, position, data };
     }
 
+    case "fsyncFd": {
+      const fdId = rng.pick(openFdIds);
+      return { type: "fsyncFd", fdId };
+    }
+
     default:
       return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(10) };
   }
@@ -626,6 +633,15 @@ function execOp(FS: EmscriptenFS, op: Op, streams: StreamMap): boolean {
         buf.set(op.data);
         s.stream_ops.msync(s, buf, op.position, op.data.length, 0);
         FS.close(s);
+        return true;
+      }
+
+      case "fsyncFd": {
+        const s = streams.get(op.fdId);
+        if (!s) return false;
+        if (s.stream_ops.fsync) {
+          s.stream_ops.fsync(s);
+        }
         return true;
       }
 
@@ -934,6 +950,12 @@ function updateModel(model: FSModel, op: Op): void {
       file.mtime = null;
       break;
     }
+
+    case "fsyncFd":
+      // fsync doesn't change visible state — it flushes dirty pages and
+      // metadata to the backend for durability, but doesn't alter file
+      // contents, size, or timestamps.
+      break;
   }
 }
 
@@ -985,6 +1007,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] utime(${op.path}, atime=${op.atime}, mtime=${op.mtime})`;
     case "mmapWriteAt":
       return `[${index}] mmapWriteAt(${op.path}, @${op.position}, ${op.data.length}B)`;
+    case "fsyncFd":
+      return `[${index}] fsyncFd(fdId=${op.fdId})`;
   }
 }
 
@@ -1517,6 +1541,32 @@ describe("fuzz: persistence roundtrip testing", () => {
     it("seed 100004, medium cache, long dup + write sequence", async () => {
       await runPersistenceRoundtrip(100004, 150, 64, 25);
     }, 60_000);
+  });
+
+  describe("fsyncFd — per-file fsync interleaved with syncfs + remount", () => {
+    it("seed 130001, tiny cache, fsync + write + remount @fast", async () => {
+      await runPersistenceRoundtrip(130001, 80, 4, 15);
+    }, 30_000);
+
+    it("seed 130002, small cache, fsync between syncfs cycles", async () => {
+      await runPersistenceRoundtrip(130002, 100, 16, 20);
+    }, 30_000);
+
+    it("seed 130003, tiny cache, frequent remount with fsync", async () => {
+      await runPersistenceRoundtrip(130003, 60, 4, 5);
+    }, 30_000);
+
+    it("seed 130004, medium cache, long fsync + rename sequence", async () => {
+      await runPersistenceRoundtrip(130004, 150, 64, 25);
+    }, 60_000);
+
+    it("seed 130005, tiny cache, fsync + mid-sync interleave @fast", async () => {
+      await runPersistenceRoundtrip(130005, 80, 4, 15, { midSyncInterval: 5 });
+    }, 30_000);
+
+    it("seed 130006, small cache, fsync + truncate + remount", async () => {
+      await runPersistenceRoundtrip(130006, 100, 16, 20);
+    }, 30_000);
   });
 
   describe("intermediate syncfs — sync with open FDs between remounts", () => {
