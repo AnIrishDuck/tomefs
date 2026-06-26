@@ -22,7 +22,80 @@ import {
   SLOT_DATA_LEN,
   encodeMessage,
   decodeMessage,
+  opcodeName,
 } from "./sab-protocol.js";
+
+/**
+ * Validate that a request parameter is a string.
+ * Throws a descriptive error on type mismatch or missing field.
+ */
+export function validateStringParam(
+  params: Record<string, unknown>,
+  field: string,
+  op: string,
+): string {
+  const value = params[field];
+  if (typeof value !== "string") {
+    throw new Error(
+      `${op}: expected ${field} to be string, got ${value === null ? "null" : typeof value}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Validate that a request parameter is a number.
+ * Throws a descriptive error on type mismatch or missing field.
+ */
+export function validateNumberParam(
+  params: Record<string, unknown>,
+  field: string,
+  op: string,
+): number {
+  const value = params[field];
+  if (typeof value !== "number") {
+    throw new Error(
+      `${op}: expected ${field} to be number, got ${value === null ? "null" : typeof value}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Validate that a request parameter is an array.
+ * Throws a descriptive error on type mismatch or missing field.
+ */
+export function validateArrayParam(
+  params: Record<string, unknown>,
+  field: string,
+  op: string,
+): unknown[] {
+  const value = params[field];
+  if (!Array.isArray(value)) {
+    throw new Error(
+      `${op}: expected ${field} to be array, got ${value === null ? "null" : typeof value}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Validate that a request parameter is a non-null object (for FileMeta).
+ * Throws a descriptive error on type mismatch or missing field.
+ */
+export function validateObjectParam(
+  params: Record<string, unknown>,
+  field: string,
+  op: string,
+): Record<string, unknown> {
+  const value = params[field];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(
+      `${op}: expected ${field} to be object, got ${value === null ? "null" : Array.isArray(value) ? "array" : typeof value}`,
+    );
+  }
+  return value as Record<string, unknown>;
+}
 
 export class SabWorker {
   private readonly backend: StorageBackend;
@@ -136,10 +209,9 @@ export class SabWorker {
   ): Promise<void> {
     switch (opcode) {
       case OpCode.READ_PAGE: {
-        const data = await this.backend.readPage(
-          params.path as string,
-          params.pageIndex as number,
-        );
+        const path = validateStringParam(params, "path", "READ_PAGE");
+        const pageIndex = validateNumberParam(params, "pageIndex", "READ_PAGE");
+        const data = await this.backend.readPage(path, pageIndex);
         if (data) {
           const respLen = encodeMessage(
             this.dataView,
@@ -158,8 +230,8 @@ export class SabWorker {
       }
 
       case OpCode.READ_PAGES: {
-        const path = params.path as string;
-        const pageIndices = params.pageIndices as number[];
+        const path = validateStringParam(params, "path", "READ_PAGES");
+        const pageIndices = validateArrayParam(params, "pageIndices", "READ_PAGES") as number[];
         const pages = await this.backend.readPages(path, pageIndices);
         const sizes: number[] = [];
         const chunks: Uint8Array[] = [];
@@ -182,18 +254,16 @@ export class SabWorker {
       }
 
       case OpCode.WRITE_PAGE: {
-        const dataLen = params.dataLen as number;
+        const path = validateStringParam(params, "path", "WRITE_PAGE");
+        const pageIndex = validateNumberParam(params, "pageIndex", "WRITE_PAGE");
+        const dataLen = validateNumberParam(params, "dataLen", "WRITE_PAGE");
         if (dataLen < 0 || dataLen > binary.length) {
           throw new Error(
             `WRITE_PAGE: dataLen ${dataLen} out of bounds [0, ${binary.length}]`,
           );
         }
         const pageData = new Uint8Array(binary.buffer, binary.byteOffset, dataLen);
-        await this.backend.writePage(
-          params.path as string,
-          params.pageIndex as number,
-          pageData,
-        );
+        await this.backend.writePage(path, pageIndex, pageData);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
         });
@@ -202,7 +272,7 @@ export class SabWorker {
       }
 
       case OpCode.WRITE_PAGES: {
-        const pageMeta = params.pages as Array<{
+        const pageMeta = validateArrayParam(params, "pages", "WRITE_PAGES") as Array<{
           path: string;
           pageIndex: number;
           dataLen: number;
@@ -227,7 +297,8 @@ export class SabWorker {
       }
 
       case OpCode.DELETE_FILE: {
-        await this.backend.deleteFile(params.path as string);
+        const path = validateStringParam(params, "path", "DELETE_FILE");
+        await this.backend.deleteFile(path);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
         });
@@ -236,7 +307,7 @@ export class SabWorker {
       }
 
       case OpCode.DELETE_FILES: {
-        const paths = params.paths as string[];
+        const paths = validateArrayParam(params, "paths", "DELETE_FILES") as string[];
         await this.backend.deleteFiles(paths);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
@@ -246,10 +317,9 @@ export class SabWorker {
       }
 
       case OpCode.DELETE_PAGES_FROM: {
-        await this.backend.deletePagesFrom(
-          params.path as string,
-          params.fromPageIndex as number,
-        );
+        const path = validateStringParam(params, "path", "DELETE_PAGES_FROM");
+        const fromPageIndex = validateNumberParam(params, "fromPageIndex", "DELETE_PAGES_FROM");
+        await this.backend.deletePagesFrom(path, fromPageIndex);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
         });
@@ -258,17 +328,17 @@ export class SabWorker {
       }
 
       case OpCode.READ_META: {
-        const meta = await this.backend.readMeta(params.path as string);
+        const path = validateStringParam(params, "path", "READ_META");
+        const meta = await this.backend.readMeta(path);
         const respLen = encodeMessage(this.dataView, this.uint8View, { meta });
         Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
         break;
       }
 
       case OpCode.WRITE_META: {
-        await this.backend.writeMeta(
-          params.path as string,
-          params.meta as FileMeta,
-        );
+        const path = validateStringParam(params, "path", "WRITE_META");
+        const meta = validateObjectParam(params, "meta", "WRITE_META") as unknown as FileMeta;
+        await this.backend.writeMeta(path, meta);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
         });
@@ -277,7 +347,8 @@ export class SabWorker {
       }
 
       case OpCode.DELETE_META: {
-        await this.backend.deleteMeta(params.path as string);
+        const path = validateStringParam(params, "path", "DELETE_META");
+        await this.backend.deleteMeta(path);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
         });
@@ -286,10 +357,9 @@ export class SabWorker {
       }
 
       case OpCode.RENAME_FILE: {
-        await this.backend.renameFile(
-          params.oldPath as string,
-          params.newPath as string,
-        );
+        const oldPath = validateStringParam(params, "oldPath", "RENAME_FILE");
+        const newPath = validateStringParam(params, "newPath", "RENAME_FILE");
+        await this.backend.renameFile(oldPath, newPath);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
         });
@@ -298,7 +368,8 @@ export class SabWorker {
       }
 
       case OpCode.COUNT_PAGES: {
-        const count = await this.backend.countPages(params.path as string);
+        const path = validateStringParam(params, "path", "COUNT_PAGES");
+        const count = await this.backend.countPages(path);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           count,
         });
@@ -307,7 +378,7 @@ export class SabWorker {
       }
 
       case OpCode.WRITE_METAS: {
-        const entries = params.entries as Array<{
+        const entries = validateArrayParam(params, "entries", "WRITE_METAS") as Array<{
           path: string;
           meta: FileMeta;
         }>;
@@ -320,7 +391,7 @@ export class SabWorker {
       }
 
       case OpCode.READ_METAS: {
-        const paths = params.paths as string[];
+        const paths = validateArrayParam(params, "paths", "READ_METAS") as string[];
         const metas = await this.backend.readMetas(paths);
         const respLen = encodeMessage(this.dataView, this.uint8View, { metas });
         Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
@@ -328,7 +399,7 @@ export class SabWorker {
       }
 
       case OpCode.DELETE_METAS: {
-        const paths = params.paths as string[];
+        const paths = validateArrayParam(params, "paths", "DELETE_METAS") as string[];
         await this.backend.deleteMetas(paths);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
@@ -338,9 +409,8 @@ export class SabWorker {
       }
 
       case OpCode.MAX_PAGE_INDEX: {
-        const maxIdx = await this.backend.maxPageIndex(
-          params.path as string,
-        );
+        const path = validateStringParam(params, "path", "MAX_PAGE_INDEX");
+        const maxIdx = await this.backend.maxPageIndex(path);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           maxIdx,
         });
@@ -349,7 +419,7 @@ export class SabWorker {
       }
 
       case OpCode.COUNT_PAGES_BATCH: {
-        const paths = params.paths as string[];
+        const paths = validateArrayParam(params, "paths", "COUNT_PAGES_BATCH") as string[];
         const counts = await this.backend.countPagesBatch(paths);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           counts,
@@ -359,7 +429,7 @@ export class SabWorker {
       }
 
       case OpCode.MAX_PAGE_INDEX_BATCH: {
-        const paths = params.paths as string[];
+        const paths = validateArrayParam(params, "paths", "MAX_PAGE_INDEX_BATCH") as string[];
         const maxIndices = await this.backend.maxPageIndexBatch(paths);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           maxIndices,
@@ -369,8 +439,8 @@ export class SabWorker {
       }
 
       case OpCode.LIST_FILES_RANGE: {
-        const offset = params.offset as number;
-        const limit = params.limit as number;
+        const offset = validateNumberParam(params, "offset", "LIST_FILES_RANGE");
+        const limit = validateNumberParam(params, "limit", "LIST_FILES_RANGE");
         const allFiles = await this.backend.listFiles();
         const total = allFiles.length;
         const files = allFiles.slice(offset, offset + limit);
@@ -383,12 +453,12 @@ export class SabWorker {
       }
 
       case OpCode.SYNC_ALL: {
-        const pageMeta = params.pages as Array<{
+        const pageMeta = validateArrayParam(params, "pages", "SYNC_ALL") as Array<{
           path: string;
           pageIndex: number;
           dataLen: number;
         }>;
-        const metaEntries = params.metas as Array<{
+        const metaEntries = validateArrayParam(params, "metas", "SYNC_ALL") as Array<{
           path: string;
           meta: FileMeta;
         }>;
@@ -412,7 +482,7 @@ export class SabWorker {
       }
 
       case OpCode.DELETE_ALL: {
-        const paths = params.paths as string[];
+        const paths = validateArrayParam(params, "paths", "DELETE_ALL") as string[];
         await this.backend.deleteAll(paths);
         const respLen = encodeMessage(this.dataView, this.uint8View, {
           ok: true,
@@ -434,7 +504,7 @@ export class SabWorker {
       }
 
       default:
-        throw new Error(`Unknown opcode: ${opcode}`);
+        throw new Error(`Unknown opcode: ${opcodeName(opcode as number)}`);
     }
   }
 }
