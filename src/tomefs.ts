@@ -1338,6 +1338,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
     // - highIdx > lastPageIndex: file extended past metadata → recover
     // - highIdx < lastPageIndex: crash truncation → adjust size
     const sizeCorrectedNodes: any[] = [];
+    const fileSizes = new Array<number>(fileEntries.length);
     if (fileEntries.length > 0) {
       const storagePaths = fileEntries.map((e) => e.storagePath);
       const allMaxIndices = backend.maxPageIndexBatch(storagePaths);
@@ -1374,6 +1375,34 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
         node._metaDirty = false;
         if (fileSize !== meta.size) {
           sizeCorrectedNodes.push(node);
+        }
+        fileSizes[i] = fileSize;
+      }
+
+      // After dirty shutdown, backend pages may retain stale data beyond
+      // the file extent from pre-crash truncations whose zeroTailAfterTruncate
+      // dirty pages weren't flushed. Zero the tail bytes directly in the
+      // backend to prevent stale data from leaking through when files are
+      // later extended. Bypasses the page cache to avoid cache pollution
+      // and eviction overhead during mount.
+      if (!hasCleanMarker) {
+        for (let i = 0; i < fileEntries.length; i++) {
+          const fileSize = fileSizes[i];
+          const tailOffset = fileSize & PAGE_MASK;
+          if (fileSize > 0 && tailOffset !== 0) {
+            const lastPageIndex = fileSize >>> PAGE_SHIFT;
+            const pageData = backend.readPage(fileEntries[i].storagePath, lastPageIndex);
+            if (pageData) {
+              let hasStale = false;
+              for (let j = tailOffset; j < pageData.length; j++) {
+                if (pageData[j] !== 0) { hasStale = true; break; }
+              }
+              if (hasStale) {
+                pageData.fill(0, tailOffset);
+                backend.writePage(fileEntries[i].storagePath, lastPageIndex, pageData);
+              }
+            }
+          }
         }
       }
     }
