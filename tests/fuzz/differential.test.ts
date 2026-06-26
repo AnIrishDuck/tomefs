@@ -180,6 +180,7 @@ type Op =
   | { type: "lstatOp"; path: string }
   | { type: "lstatSymlink"; path: string }
   | { type: "statThroughSymlink"; path: string }
+  | { type: "fsyncFd"; fdId: number }
   | { type: "syncfs" };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
@@ -237,6 +238,7 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["lstatOp", allFiles.length > 0 ? 5 : 0],
     ["lstatSymlink", allSymlinks.length > 0 ? 5 : 0],
     ["statThroughSymlink", validSymlinks.length > 0 ? 5 : 0],
+    ["fsyncFd", model.openFds.size > 0 ? 6 : 0],
     ["syncfs", 3],
   ];
 
@@ -571,6 +573,11 @@ function generateOp(rng: Rng, model: FSModel): Op {
 
     case "statThroughSymlink": {
       return { type: "statThroughSymlink", path: rng.pick(validSymlinks) };
+    }
+
+    case "fsyncFd": {
+      const fds = [...model.openFds.keys()];
+      return { type: "fsyncFd", fdId: rng.pick(fds) };
     }
 
     case "syncfs":
@@ -925,6 +932,15 @@ function execOp(FS: EmscriptenFS, op: Op, syncfsFn?: () => void, fdStreams?: FdS
         return { error: null, size: 0 };
       }
 
+      case "fsyncFd": {
+        const stream = fdStreams?.get(op.fdId);
+        if (!stream) return { error: null };
+        if (stream.stream_ops?.fsync) {
+          stream.stream_ops.fsync(stream);
+        }
+        return { error: null };
+      }
+
       case "syncfs": {
         if (syncfsFn) syncfsFn();
         return { error: null };
@@ -1081,6 +1097,7 @@ function updateModel(model: FSModel, op: Op, result: OpResult): void {
     // readAt, readFd, readFdAt, readlink, readThroughSymlink, seekFd, mmapRead, fstatFd, lstatOp, lstatSymlink, statThroughSymlink don't modify file state
     // mmapWrite modifies file contents via msync but doesn't change size
     // fchmodFd modifies mode bits but not file size or contents
+    // fsyncFd flushes to backend but doesn't change observable file state
   }
 }
 
@@ -1165,6 +1182,8 @@ function formatOp(op: Op, index: number): string {
       return `[${index}] fchmodFd(fdId=${op.fdId}, 0o${op.mode.toString(8)})`;
     case "openTrunc":
       return `[${index}] openTrunc(${op.path})`;
+    case "fsyncFd":
+      return `[${index}] fsyncFd(fdId=${op.fdId})`;
     case "syncfs":
       return `[${index}] syncfs()`;
   }
