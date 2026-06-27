@@ -94,14 +94,20 @@ interface FileState {
   data: Uint8Array;
 }
 
+interface OpenFdState {
+  path: string;
+  position: number;
+}
+
 interface FSModel {
   files: Map<string, FileState>;
   dirs: Set<string>;
   symlinks: Map<string, string>;
+  openFds: Map<number, OpenFdState>;
 }
 
 function newModel(): FSModel {
-  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map() };
+  return { files: new Map(), dirs: new Set(["/"]), symlinks: new Map(), openFds: new Map() };
 }
 
 function filesInDir(model: FSModel, dir: string): string[] {
@@ -152,7 +158,11 @@ type Op =
   | { type: "symlink"; target: string; path: string }
   | { type: "unlinkSymlink"; path: string }
   | { type: "renameSymlink"; oldPath: string; newPath: string }
-  | { type: "overwrite"; path: string; data: Uint8Array };
+  | { type: "overwrite"; path: string; data: Uint8Array }
+  | { type: "openFd"; path: string; fdId: number }
+  | { type: "writeFd"; fdId: number; data: Uint8Array }
+  | { type: "fsyncFd"; fdId: number }
+  | { type: "closeFd"; fdId: number };
 
 const DIR_NAMES = ["alpha", "beta", "gamma", "delta"];
 const FILE_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat", "e.dat"];
@@ -163,6 +173,10 @@ function generateOp(rng: Rng, model: FSModel): Op {
   const allDirs = [...model.dirs].filter((d) => d !== "/");
   const allContainerDirs = [...model.dirs];
   const allSymlinks = [...model.symlinks.keys()];
+  const openFdIds = [...model.openFds.keys()];
+  const unopenedFiles = allFiles.filter(
+    (p) => ![...model.openFds.values()].some((fd) => fd.path === p),
+  );
 
   const weights: Array<[string, number]> = [
     ["createFile", 15],
@@ -177,6 +191,10 @@ function generateOp(rng: Rng, model: FSModel): Op {
     ["symlink", allFiles.length > 0 ? 6 : 0],
     ["unlinkSymlink", allSymlinks.length > 0 ? 6 : 0],
     ["renameSymlink", allSymlinks.length > 0 ? 8 : 0],
+    ["openFd", unopenedFiles.length > 0 && model.openFds.size < 4 ? 8 : 0],
+    ["writeFd", openFdIds.length > 0 ? 8 : 0],
+    ["fsyncFd", openFdIds.length > 0 ? 10 : 0],
+    ["closeFd", openFdIds.length > 0 ? 4 : 0],
   ];
 
   const totalWeight = weights.reduce((s, [, w]) => s + w, 0);
@@ -264,6 +282,21 @@ function generateOp(rng: Rng, model: FSModel): Op {
       const newPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
       return { type: "renameSymlink", oldPath, newPath };
     }
+    case "openFd": {
+      const path = rng.pick(unopenedFiles);
+      const fdId = rng.int(10000);
+      return { type: "openFd", path, fdId };
+    }
+    case "writeFd": {
+      const fdId = rng.pick(openFdIds);
+      const sizeChoices = [1, 50, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1];
+      const data = rng.bytes(rng.pick(sizeChoices));
+      return { type: "writeFd", fdId, data };
+    }
+    case "fsyncFd":
+      return { type: "fsyncFd", fdId: rng.pick(openFdIds) };
+    case "closeFd":
+      return { type: "closeFd", fdId: rng.pick(openFdIds) };
     default:
       return { type: "createFile", path: `/${rng.pick(FILE_NAMES)}`, data: rng.bytes(10) };
   }
@@ -286,6 +319,15 @@ const TOME_MOUNT = "/tome";
 function rw(p: string): string {
   if (p === "/") return TOME_MOUNT;
   return TOME_MOUNT + p;
+}
+
+const liveFds = new Map<number, any>();
+
+function closeAllLiveFds(FS: any): void {
+  for (const [, stream] of liveFds) {
+    try { FS.close(stream); } catch { /* ignore */ }
+  }
+  liveFds.clear();
 }
 
 function execOp(FS: any, op: Op): boolean {
@@ -330,6 +372,32 @@ function execOp(FS: any, op: Op): boolean {
       case "symlink":
         FS.symlink(rw(op.target), rw(op.path));
         return true;
+      case "openFd": {
+        const s = FS.open(rw(op.path), O.RDWR);
+        liveFds.set(op.fdId, s);
+        return true;
+      }
+      case "writeFd": {
+        const s = liveFds.get(op.fdId);
+        if (!s) return false;
+        FS.write(s, op.data, 0, op.data.length);
+        return true;
+      }
+      case "fsyncFd": {
+        const s = liveFds.get(op.fdId);
+        if (!s) return false;
+        if (s.stream_ops.fsync) {
+          s.stream_ops.fsync(s);
+        }
+        return true;
+      }
+      case "closeFd": {
+        const s = liveFds.get(op.fdId);
+        if (!s) return false;
+        FS.close(s);
+        liveFds.delete(op.fdId);
+        return true;
+      }
       default:
         return true;
     }
@@ -429,6 +497,27 @@ function updateModel(model: FSModel, op: Op): void {
       model.symlinks.set(op.newPath, target);
       break;
     }
+    case "openFd":
+      model.openFds.set(op.fdId, { path: op.path, position: 0 });
+      break;
+    case "writeFd": {
+      const fd = model.openFds.get(op.fdId);
+      if (!fd) break;
+      const file = model.files.get(fd.path);
+      if (!file) break;
+      const newSize = Math.max(file.data.length, fd.position + op.data.length);
+      const newData = new Uint8Array(newSize);
+      newData.set(file.data);
+      newData.set(op.data, fd.position);
+      file.data = newData;
+      fd.position += op.data.length;
+      break;
+    }
+    case "fsyncFd":
+      break;
+    case "closeFd":
+      model.openFds.delete(op.fdId);
+      break;
   }
 }
 
@@ -638,6 +727,8 @@ async function runFullTreeWalkTest(config: {
     const op = generateOp(rng, model);
     if (execOp(instance.rawFS, op)) updateModel(model, op);
   }
+  closeAllLiveFds(instance.rawFS);
+  model.openFds.clear();
   doSyncfs(instance.rawFS);
   instance.tomefs.assertInvariants();
   backend.assertInvariants();
@@ -693,6 +784,10 @@ async function runFullTreeWalkTest(config: {
       }
     }
 
+    // Close any open fds before crash — Emscripten module is about to be replaced.
+    closeAllLiveFds(instance.rawFS);
+    dirtyModel.openFds.clear();
+
     // Dirty shutdown: remount WITHOUT syncfs.
     instance = await mountTome(backend, maxPages);
 
@@ -736,6 +831,8 @@ async function runFullTreeWalkTest(config: {
       const op = generateOp(rng, recoveredModel);
       if (execOp(instance.rawFS, op)) updateModel(recoveredModel, op);
     }
+    closeAllLiveFds(instance.rawFS);
+    recoveredModel.openFds.clear();
     doSyncfs(instance.rawFS);
     instance.tomefs.assertInvariants();
     backend.assertInvariants();
@@ -855,6 +952,44 @@ describe("fuzz: full-tree-walk syncfs path", () => {
     it("seed 85002: 10 setup + 60 dirty × 2 cycles, small cache @fast", async () => {
       await runFullTreeWalkTest({
         seed: 85002, setupOps: 10, dirtyOps: 60, maxPages: 16, syncCycles: 2,
+      });
+    }, 60_000);
+  });
+
+  describe("fsync + full-tree-walk — per-file durability across recovery", () => {
+    it("seed 86001: fsync during dirty phase, tiny cache @fast", async () => {
+      await runFullTreeWalkTest({
+        seed: 86001, setupOps: 15, dirtyOps: 30, maxPages: 4, syncCycles: 3,
+      });
+    }, 60_000);
+
+    it("seed 86002: fsync during dirty phase, small cache", async () => {
+      await runFullTreeWalkTest({
+        seed: 86002, setupOps: 20, dirtyOps: 35, maxPages: 16, syncCycles: 3,
+      });
+    }, 60_000);
+
+    it("seed 86003: fsync + rename interleave, tiny cache", async () => {
+      await runFullTreeWalkTest({
+        seed: 86003, setupOps: 12, dirtyOps: 40, maxPages: 4, syncCycles: 4,
+      });
+    }, 60_000);
+
+    it("seed 86004: fsync + unlink + recovery, medium cache @fast", async () => {
+      await runFullTreeWalkTest({
+        seed: 86004, setupOps: 20, dirtyOps: 25, maxPages: 64, syncCycles: 3,
+      });
+    }, 60_000);
+
+    it("seed 86005: many short fsync cycles, small cache", async () => {
+      await runFullTreeWalkTest({
+        seed: 86005, setupOps: 8, dirtyOps: 12, maxPages: 16, syncCycles: 8,
+      });
+    }, 120_000);
+
+    it("seed 86006: fsync + heavy rename, large cache", async () => {
+      await runFullTreeWalkTest({
+        seed: 86006, setupOps: 25, dirtyOps: 40, maxPages: 4096, syncCycles: 3,
       });
     }, 60_000);
   });
