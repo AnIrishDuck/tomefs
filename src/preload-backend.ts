@@ -546,8 +546,16 @@ export class PreloadBackend implements SyncStorageBackend {
     ) {
       if (this.dirtyPages.size === 0 && this.dirtyMeta.size === 0) return;
 
-      const flushedPageKeys = new Set(this.dirtyPages);
-      const flushedMetaPaths = new Set(this.dirtyMeta);
+      // Take ownership of the dirty sets. New writes during the async
+      // syncAll go to the fresh empty sets and survive the flush. On
+      // failure, merge the flushed entries back so retry includes them.
+      // This fixes a subtle bug where writePage() to the same key during
+      // flush was silently lost: Set.add(existingKey) is a no-op, so the
+      // post-flush delete(key) cleared the re-dirtied entry.
+      const flushedPageKeys = this.dirtyPages;
+      const flushedMetaPaths = this.dirtyMeta;
+      this.dirtyPages = new Set();
+      this.dirtyMeta = new Set();
 
       const pageBatch: Array<{
         path: string;
@@ -571,14 +579,13 @@ export class PreloadBackend implements SyncStorageBackend {
       }
 
       if (pageBatch.length > 0 || metaBatch.length > 0) {
-        await this.remote.syncAll(pageBatch, metaBatch);
-      }
-
-      for (const key of flushedPageKeys) {
-        this.dirtyPages.delete(key);
-      }
-      for (const path of flushedMetaPaths) {
-        this.dirtyMeta.delete(path);
+        try {
+          await this.remote.syncAll(pageBatch, metaBatch);
+        } catch (e) {
+          for (const key of flushedPageKeys) this.dirtyPages.add(key);
+          for (const path of flushedMetaPaths) this.dirtyMeta.add(path);
+          throw e;
+        }
       }
       return;
     }
@@ -587,15 +594,19 @@ export class PreloadBackend implements SyncStorageBackend {
     // pages into early (pre-delete) and late (post-delete) batches to
     // handle delete-then-recreate at the same path.
     //
-    // Snapshot ALL mutable tracking sets before any async work begins.
-    // The async operations below yield to the event loop, during which
-    // sync methods (writePage, deleteFile, etc.) may mutate these sets.
-    // Without snapshots, .clear() after the async work would silently
-    // discard entries added during the flush — losing truncations,
-    // deletions, or metadata removals that the next flush cycle should
-    // have processed.
-    const flushedPageKeys = new Set(this.dirtyPages);
-    const flushedMetaPaths = new Set(this.dirtyMeta);
+    // Take ownership of dirty page/meta sets: swap them out so new writes
+    // during the async phases below go to fresh empty sets. On success the
+    // old sets are discarded (their contents were flushed). On failure they
+    // are merged back so retry includes them. See fast path comment above.
+    //
+    // Truncations, deletedFiles, and deletedMeta are still snapshot-copied
+    // because their intermediate cleanups already handle re-addition
+    // correctly (truncations check the value before deleting; delete sets
+    // tolerate idempotent re-deletion).
+    const flushedPageKeys = this.dirtyPages;
+    const flushedMetaPaths = this.dirtyMeta;
+    this.dirtyPages = new Set();
+    this.dirtyMeta = new Set();
     const flushedTruncations = new Map(this.truncations);
     const flushedDeletedFiles = new Set(this.deletedFiles);
     const flushedDeletedMeta = new Set(this.deletedMeta);
@@ -646,63 +657,65 @@ export class PreloadBackend implements SyncStorageBackend {
       }
     }
 
-    // 1. Apply truncations FIRST — before page writes.
-    // Truncations delete stale tail pages from the remote. If a file was
-    // truncated and then extended (e.g., truncate to 100 bytes then write
-    // at offset 8192), the new page at the truncation point is dirty and
-    // will be written in step 2. Without this ordering, page writes would
-    // go to the remote first, then the truncation would delete them.
-    if (flushedTruncations.size > 0) {
-      await Promise.all(
-        [...flushedTruncations].map(([path, fromIndex]) =>
-          this.remote.deletePagesFrom(path, fromIndex),
-        ),
-      );
-    }
-    for (const [path, fromIndex] of flushedTruncations) {
-      if (this.truncations.get(path) === fromIndex) {
-        this.truncations.delete(path);
+    try {
+      // 1. Apply truncations FIRST — before page writes.
+      // Truncations delete stale tail pages from the remote. If a file was
+      // truncated and then extended (e.g., truncate to 100 bytes then write
+      // at offset 8192), the new page at the truncation point is dirty and
+      // will be written in step 2. Without this ordering, page writes would
+      // go to the remote first, then the truncation would delete them.
+      if (flushedTruncations.size > 0) {
+        await Promise.all(
+          [...flushedTruncations].map(([path, fromIndex]) =>
+            this.remote.deletePagesFrom(path, fromIndex),
+          ),
+        );
       }
-    }
+      for (const [path, fromIndex] of flushedTruncations) {
+        if (this.truncations.get(path) === fromIndex) {
+          this.truncations.delete(path);
+        }
+      }
 
-    // 2. Atomically write pages + metadata for non-deleted paths.
-    // Uses syncAll so IDB backends commit both in a single transaction,
-    // eliminating the crash window between separate writePages + writeMetas
-    // calls. This matches the SAB bridge path's atomicity guarantee.
-    if (earlyBatch.length > 0 || earlyMeta.length > 0) {
-      await this.remote.syncAll(earlyBatch, earlyMeta);
-    }
+      // 2. Atomically write pages + metadata for non-deleted paths.
+      // Uses syncAll so IDB backends commit both in a single transaction,
+      // eliminating the crash window between separate writePages + writeMetas
+      // calls. This matches the SAB bridge path's atomicity guarantee.
+      if (earlyBatch.length > 0 || earlyMeta.length > 0) {
+        await this.remote.syncAll(earlyBatch, earlyMeta);
+      }
 
-    // 3. Batch-delete files from remote (single call instead of O(n))
-    if (flushedDeletedFiles.size > 0) {
-      await this.remote.deleteFiles([...flushedDeletedFiles]);
-    }
-    for (const path of flushedDeletedFiles) {
-      this.deletedFiles.delete(path);
-    }
+      // 3. Batch-delete files from remote (single call instead of O(n))
+      if (flushedDeletedFiles.size > 0) {
+        await this.remote.deleteFiles([...flushedDeletedFiles]);
+      }
+      for (const path of flushedDeletedFiles) {
+        this.deletedFiles.delete(path);
+      }
 
-    // 4. Batch-delete metadata
-    if (flushedDeletedMeta.size > 0) {
-      await this.remote.deleteMetas([...flushedDeletedMeta]);
-    }
-    for (const path of flushedDeletedMeta) {
-      this.deletedMeta.delete(path);
-    }
+      // 4. Batch-delete metadata
+      if (flushedDeletedMeta.size > 0) {
+        await this.remote.deleteMetas([...flushedDeletedMeta]);
+      }
+      for (const path of flushedDeletedMeta) {
+        this.deletedMeta.delete(path);
+      }
 
-    // 5. Atomically write pages + metadata for delete-then-recreate paths.
-    // Same syncAll guarantee as step 2 — IDB commits both in one transaction.
-    if (lateBatch.length > 0 || lateMeta.length > 0) {
-      await this.remote.syncAll(lateBatch, lateMeta);
-    }
+      // 5. Atomically write pages + metadata for delete-then-recreate paths.
+      // Same syncAll guarantee as step 2 — IDB commits both in one transaction.
+      if (lateBatch.length > 0 || lateMeta.length > 0) {
+        await this.remote.syncAll(lateBatch, lateMeta);
+      }
 
-    // 6. All operations succeeded — clear dirty tracking for flushed entries.
-    // We clear individual entries (not the whole set) so that writes that
-    // occurred during flush are preserved for the next flush cycle.
-    for (const key of flushedPageKeys) {
-      this.dirtyPages.delete(key);
-    }
-    for (const path of flushedMetaPaths) {
-      this.dirtyMeta.delete(path);
+      // Success: flushedPageKeys/flushedMetaPaths are discarded — their
+      // contents were flushed. Any entries added to this.dirtyPages or
+      // this.dirtyMeta during the async work above survive automatically.
+    } catch (e) {
+      // Merge flushed dirty entries back so retry includes them.
+      // Entries added during the failed flush are already in the live sets.
+      for (const key of flushedPageKeys) this.dirtyPages.add(key);
+      for (const path of flushedMetaPaths) this.dirtyMeta.add(path);
+      throw e;
     }
   }
 
