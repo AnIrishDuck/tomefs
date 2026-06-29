@@ -28,8 +28,12 @@ Skipped files (expected — not regressions):
 TOMEFS_BACKEND=tomefs npx vitest run
 ```
 
-- **Status:** In progress at time of writing (6/187 files complete, 0 failures)
-- All completed files passing; PGlite integration tests (~3-4s each) dominate runtime
+- **Test Files:** 187 passed (187 total)
+- **Tests:** 4,531 passed, 4 skipped (4,535 total)
+- **Duration:** 1,326s (~22 min)
+- **Exit code:** 0
+
+All 187 test files passed (including `enametoolong` and `allocate-mmap` which are skipped under MEMFS). Only 4 individual tests skipped (vs 22 under MEMFS).
 
 ### CI History
 
