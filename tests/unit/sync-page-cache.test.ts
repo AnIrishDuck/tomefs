@@ -1515,6 +1515,61 @@ describe("SyncPageCache", () => {
     });
   });
 
+  describe("collectDirtyPagesForFile", () => {
+    it("returns empty array when file has no dirty pages @fast", () => {
+      const cache = new SyncPageCache(backend, 16);
+      expect(cache.collectDirtyPagesForFile("/nonexistent")).toEqual([]);
+    });
+
+    it("returns empty array when file exists but is clean @fast", () => {
+      const cache = new SyncPageCache(backend, 16);
+      backend.writePage("/file", 0, new Uint8Array(PAGE_SIZE).fill(0x11));
+      cache.getPage("/file", 0); // load into cache (clean)
+      expect(cache.collectDirtyPagesForFile("/file")).toEqual([]);
+    });
+
+    it("returns only dirty pages for the specified file @fast", () => {
+      const cache = new SyncPageCache(backend, 16);
+      cache.write("/a", new Uint8Array(PAGE_SIZE).fill(0xaa), 0, PAGE_SIZE, 0, 0);
+      cache.write("/b", new Uint8Array(PAGE_SIZE).fill(0xbb), 0, PAGE_SIZE, 0, 0);
+      cache.write("/a", new Uint8Array(PAGE_SIZE).fill(0xcc), 0, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE);
+
+      const dirtyA = cache.collectDirtyPagesForFile("/a");
+      expect(dirtyA.length).toBe(2);
+      expect(dirtyA.every(p => p.path === "/a")).toBe(true);
+
+      const dirtyB = cache.collectDirtyPagesForFile("/b");
+      expect(dirtyB.length).toBe(1);
+      expect(dirtyB[0].path).toBe("/b");
+    });
+
+    it("does not clear dirty flags @fast", () => {
+      const cache = new SyncPageCache(backend, 16);
+      cache.write("/f", new Uint8Array(PAGE_SIZE).fill(1), 0, PAGE_SIZE, 0, 0);
+
+      const first = cache.collectDirtyPagesForFile("/f");
+      expect(first.length).toBe(1);
+      expect(cache.isDirty("/f", 0)).toBe(true);
+
+      const second = cache.collectDirtyPagesForFile("/f");
+      expect(second.length).toBe(1);
+    });
+
+    it("works with commitDirtyPages for two-phase pattern @fast", () => {
+      const cache = new SyncPageCache(backend, 16);
+      cache.write("/a", new Uint8Array(PAGE_SIZE).fill(0x11), 0, PAGE_SIZE, 0, 0);
+      cache.write("/b", new Uint8Array(PAGE_SIZE).fill(0x22), 0, PAGE_SIZE, 0, 0);
+
+      const dirtyA = cache.collectDirtyPagesForFile("/a");
+      backend.syncAll(dirtyA, [{ path: "/a", meta: { size: PAGE_SIZE, mode: 0o100644, ctime: 1, mtime: 1 } }]);
+      cache.commitDirtyPages(dirtyA);
+
+      expect(cache.isDirty("/a", 0)).toBe(false);
+      expect(cache.isDirty("/b", 0)).toBe(true);
+      expect(cache.dirtyCount).toBe(1);
+    });
+  });
+
   describe("commitDirtyPages", () => {
     it("clears dirty flags for committed pages", () => {
       const cache = new SyncPageCache(backend, 16);

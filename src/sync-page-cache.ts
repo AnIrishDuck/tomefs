@@ -521,6 +521,41 @@ export class SyncPageCache {
   }
 
   /**
+   * Collect dirty pages for a specific file without clearing dirty flags.
+   *
+   * Per-file variant of collectDirtyPages(). Used by fsync to combine
+   * a single file's dirty pages with its metadata into one syncAll()
+   * call — atomic for IDB and one SAB round-trip instead of two.
+   *
+   * Call commitDirtyPages() after the backend write succeeds.
+   */
+  collectDirtyPagesForFile(path: string): Array<{
+    path: string;
+    pageIndex: number;
+    data: Uint8Array;
+  }> {
+    const keys = this.dirtyFileKeys.get(path);
+    if (!keys || keys.size === 0) return [];
+
+    const dirtyPages: Array<{
+      path: string;
+      pageIndex: number;
+      data: Uint8Array;
+    }> = [];
+
+    for (const key of keys) {
+      const page = this.cache.get(key)!;
+      dirtyPages.push({
+        path: page.path,
+        pageIndex: page.pageIndex,
+        data: page.data,
+      });
+    }
+
+    return dirtyPages;
+  }
+
+  /**
    * Collect all dirty pages without clearing their dirty flags.
    *
    * Used by tomefs syncfs to combine dirty pages with metadata into a
