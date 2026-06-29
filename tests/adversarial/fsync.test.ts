@@ -57,6 +57,30 @@ async function mountTome(backend: SyncMemoryBackend, maxPages?: number) {
   return { FS, tomefs, Module };
 }
 
+/**
+ * Wraps a SyncMemoryBackend and records which methods are called,
+ * for verifying that fsync uses syncAll (atomic) instead of
+ * separate writePages + writeMeta (non-atomic).
+ */
+function createTrackingBackend(inner: SyncMemoryBackend) {
+  const calls: string[] = [];
+
+  const handler: ProxyHandler<SyncMemoryBackend> = {
+    get(target, prop, receiver) {
+      const val = Reflect.get(target, prop, receiver);
+      if (typeof val === "function") {
+        return (...args: any[]) => {
+          calls.push(prop as string);
+          return val.apply(target, args);
+        };
+      }
+      return val;
+    },
+  };
+
+  return { backend: new Proxy(inner, handler), calls };
+}
+
 describe("adversarial: fsync", () => {
   it("fsync flushes dirty pages to backend @fast", async () => {
     const backend = new SyncMemoryBackend();
@@ -368,6 +392,102 @@ describe("adversarial: fsync", () => {
 
     const meta = backend.readMeta("/rewrite");
     expect(meta!.size).toBe(11);
+
+    FS.close(stream);
+  });
+
+  // ------------------------------------------------------------------
+  // Atomicity: fsync uses syncAll, not separate writePages + writeMeta
+  // ------------------------------------------------------------------
+
+  it("fsync writes pages and metadata atomically via syncAll @fast", async () => {
+    const inner = new SyncMemoryBackend();
+    const { backend: tracked, calls } = createTrackingBackend(inner);
+    const { FS } = await mountTome(tracked as any);
+
+    const stream = FS.open(`${MOUNT}/atomic`, O.RDWR | O.CREAT, 0o666);
+    const data = encode("atomic fsync test");
+    FS.write(stream, data, 0, data.length, 0);
+
+    calls.length = 0; // reset tracking
+
+    stream.stream_ops.fsync(stream);
+
+    // fsync should use exactly one syncAll call, not separate writePages + writeMeta
+    const syncAllCalls = calls.filter(c => c === "syncAll");
+    const writePagesCalls = calls.filter(c => c === "writePages");
+    const writeMetaCalls = calls.filter(c => c === "writeMeta");
+
+    expect(syncAllCalls.length).toBe(1);
+    expect(writePagesCalls.length).toBe(0);
+    expect(writeMetaCalls.length).toBe(0);
+
+    // Verify data was correctly persisted
+    const page = inner.readPage("/atomic", 0);
+    expect(page).not.toBeNull();
+    expect(decode(page!.subarray(0, data.length))).toBe("atomic fsync test");
+
+    const meta = inner.readMeta("/atomic");
+    expect(meta).not.toBeNull();
+    expect(meta!.size).toBe(data.length);
+
+    FS.close(stream);
+  });
+
+  it("fsync on clean file still writes metadata atomically via syncAll @fast", async () => {
+    const inner = new SyncMemoryBackend();
+    const { backend: tracked, calls } = createTrackingBackend(inner);
+    const { FS } = await mountTome(tracked as any);
+
+    const stream = FS.open(`${MOUNT}/clean-meta`, O.RDWR | O.CREAT, 0o666);
+    FS.write(stream, encode("data"), 0, 4, 0);
+
+    // First fsync to persist everything
+    stream.stream_ops.fsync(stream);
+
+    // No more dirty pages, but file metadata could still be re-written
+    calls.length = 0;
+    stream.stream_ops.fsync(stream);
+
+    // Even for a clean file, fsync uses syncAll (with empty pages array)
+    const syncAllCalls = calls.filter(c => c === "syncAll");
+    expect(syncAllCalls.length).toBe(1);
+    expect(calls.filter(c => c === "writePages").length).toBe(0);
+    expect(calls.filter(c => c === "writeMeta").length).toBe(0);
+
+    FS.close(stream);
+  });
+
+  it("fsync atomicity: multi-page file writes all pages + meta in one call @fast", async () => {
+    const inner = new SyncMemoryBackend();
+    const { backend: tracked, calls } = createTrackingBackend(inner);
+    const { FS } = await mountTome(tracked as any);
+
+    const stream = FS.open(`${MOUNT}/multi`, O.RDWR | O.CREAT, 0o666);
+    // Write 3 pages
+    for (let i = 0; i < 3; i++) {
+      const buf = new Uint8Array(PAGE_SIZE);
+      buf.fill(0x10 + i);
+      FS.write(stream, buf, 0, PAGE_SIZE, i * PAGE_SIZE);
+    }
+
+    calls.length = 0;
+
+    stream.stream_ops.fsync(stream);
+
+    // Single syncAll with 3 pages + 1 metadata entry
+    const syncAllCalls = calls.filter(c => c === "syncAll");
+    expect(syncAllCalls.length).toBe(1);
+
+    // Verify all pages persisted correctly
+    for (let i = 0; i < 3; i++) {
+      const page = inner.readPage("/multi", i);
+      expect(page).not.toBeNull();
+      expect(page![0]).toBe(0x10 + i);
+    }
+
+    const meta = inner.readMeta("/multi");
+    expect(meta!.size).toBe(3 * PAGE_SIZE);
 
     FS.close(stream);
   });
