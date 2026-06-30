@@ -123,6 +123,29 @@ describe("SyncMemoryBackend.cleanupOrphanedPages", () => {
     backend.cleanupOrphanedPages();
     backend.assertInvariants();
   });
+
+  it("correctly identifies orphans among files with many pages @fast", () => {
+    const data = new Uint8Array(PAGE_SIZE);
+    for (let i = 0; i < 20; i++) {
+      backend.writePage("/keep", i, data);
+    }
+    backend.writeMeta("/keep", { size: PAGE_SIZE * 20, mode: 0o100644, ctime: 0, mtime: 0 });
+
+    for (let i = 0; i < 15; i++) {
+      backend.writePage("/orphan", i, data);
+    }
+
+    for (let i = 0; i < 10; i++) {
+      backend.writePage("/also-keep", i, data);
+    }
+    backend.writeMeta("/also-keep", { size: PAGE_SIZE * 10, mode: 0o100644, ctime: 0, mtime: 0 });
+
+    expect(backend.cleanupOrphanedPages()).toBe(1);
+    expect(backend.countPages("/keep")).toBe(20);
+    expect(backend.countPages("/orphan")).toBe(0);
+    expect(backend.countPages("/also-keep")).toBe(10);
+    backend.assertInvariants();
+  });
 });
 
 describe("tomefs orphan page cleanup via syncfs", () => {
