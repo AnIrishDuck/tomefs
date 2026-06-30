@@ -259,15 +259,9 @@ export class SyncMemoryBackend implements SyncStorageBackend {
   }
 
   cleanupOrphanedPages(): number {
-    const metaPaths = new Set(this.meta.keys());
-    const pagePaths = new Set<string>();
-    for (const key of this.pages.keys()) {
-      const nullIdx = key.indexOf("\0");
-      pagePaths.add(key.substring(0, nullIdx));
-    }
     let removed = 0;
-    for (const path of pagePaths) {
-      if (!metaPaths.has(path)) {
+    for (const path of this.filePageKeys.keys()) {
+      if (!this.meta.has(path)) {
         this.deleteFile(path);
         removed++;
       }

@@ -605,7 +605,11 @@ export class IdbBackend implements StorageBackend {
         if (cursor) {
           const [path] = cursor.key as [string, number];
           pagePaths.add(path);
-          cursor.continue();
+          // Skip to the next path group: [path, ""] sorts after all
+          // [path, <number>] keys (strings > numbers in IDB ordering),
+          // so this advances past all pages for the current path in one
+          // step. O(unique_paths) instead of O(total_pages).
+          cursor.continue([path, ""]);
         }
       };
       cursorReq.onerror = () => reject(cursorReq.error);
