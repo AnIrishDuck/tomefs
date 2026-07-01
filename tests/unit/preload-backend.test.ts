@@ -41,6 +41,10 @@ class CountingBackend implements StorageBackend {
     this.count("readPages");
     return this.inner.readPages(path, pageIndices);
   }
+  async readPageBatch(entries: Array<{ path: string; pageIndex: number }>) {
+    this.count("readPageBatch");
+    return this.inner.readPageBatch(entries);
+  }
   async writePage(path: string, pageIndex: number, data: Uint8Array) {
     this.count("writePage");
     return this.inner.writePage(path, pageIndex, data);
@@ -234,6 +238,7 @@ describe("PreloadBackend", () => {
         },
         async readPage() { return null; },
         async readPages(_, indices: number[]) { return indices.map(() => null); },
+        async readPageBatch(entries: Array<{ path: string; pageIndex: number }>) { return entries.map(() => null); },
         async writePage() {},
         async writePages() {},
         async deleteFile() {},
@@ -286,6 +291,7 @@ describe("PreloadBackend", () => {
         async listFiles() { return inner.listFiles(); },
         async readPage(p: string, i: number) { return inner.readPage(p, i); },
         async readPages(p: string, indices: number[]) { return inner.readPages(p, indices); },
+        async readPageBatch(entries: Array<{ path: string; pageIndex: number }>) { return inner.readPageBatch(entries); },
         async writePage(p: string, i: number, d: Uint8Array) { return inner.writePage(p, i, d); },
         async writePages(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) { return inner.writePages(pages); },
         async deleteFile(p: string) { return inner.deleteFile(p); },
@@ -334,6 +340,7 @@ describe("PreloadBackend", () => {
         },
         async readPage() { return null; },
         async readPages(_, indices: number[]) { return indices.map(() => null); },
+        async readPageBatch(entries: Array<{ path: string; pageIndex: number }>) { return entries.map(() => null); },
         async writePage() {},
         async writePages() {},
         async deleteFile() {},
@@ -1291,6 +1298,7 @@ describe("PreloadBackend", () => {
 
       async readPage(path: string, pageIndex: number) { return this.inner.readPage(path, pageIndex); }
       async readPages(path: string, pageIndices: number[]) { return this.inner.readPages(path, pageIndices); }
+      async readPageBatch(entries: Array<{ path: string; pageIndex: number }>) { return Promise.all(entries.map(e => this.readPage(e.path, e.pageIndex))); }
       async writePage(path: string, pageIndex: number, data: Uint8Array) { return this.inner.writePage(path, pageIndex, data); }
       async writePages(pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>) {
         if (this.writePagesFailCount > 0) {

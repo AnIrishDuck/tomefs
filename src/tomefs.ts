@@ -1385,23 +1385,53 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
       // backend to prevent stale data from leaking through when files are
       // later extended. Bypasses the page cache to avoid cache pollution
       // and eviction overhead during mount.
+      //
+      // Batch reads via readPageBatch and writes via writePages to reduce
+      // SAB bridge round-trips from O(2 * stale_files) to O(2).
       if (!hasCleanMarker) {
+        const tailEntries: Array<{ idx: number; tailOffset: number; path: string; lastPageIndex: number }> = [];
         for (let i = 0; i < fileEntries.length; i++) {
           const fileSize = fileSizes[i];
           const tailOffset = fileSize & PAGE_MASK;
           if (fileSize > 0 && tailOffset !== 0) {
-            const lastPageIndex = fileSize >>> PAGE_SHIFT;
-            const pageData = backend.readPage(fileEntries[i].storagePath, lastPageIndex);
+            tailEntries.push({
+              idx: i,
+              tailOffset,
+              path: fileEntries[i].storagePath,
+              lastPageIndex: fileSize >>> PAGE_SHIFT,
+            });
+          }
+        }
+
+        if (tailEntries.length > 0) {
+          const batchEntries = tailEntries.map(e => ({
+            path: e.path,
+            pageIndex: e.lastPageIndex,
+          }));
+          const tailPages = backend.readPageBatch(batchEntries);
+          const staleTailWrites: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
+
+          for (let t = 0; t < tailEntries.length; t++) {
+            const pageData = tailPages[t];
             if (pageData) {
+              const tailOffset = tailEntries[t].tailOffset;
               let hasStale = false;
               for (let j = tailOffset; j < pageData.length; j++) {
                 if (pageData[j] !== 0) { hasStale = true; break; }
               }
               if (hasStale) {
                 pageData.fill(0, tailOffset);
-                backend.writePage(fileEntries[i].storagePath, lastPageIndex, pageData);
+                staleTailWrites.push({
+                  path: tailEntries[t].path,
+                  pageIndex: tailEntries[t].lastPageIndex,
+                  data: pageData,
+                });
               }
             }
+          }
+
+          if (staleTailWrites.length > 0) {
+            backend.writePages(staleTailWrites);
           }
         }
       }
