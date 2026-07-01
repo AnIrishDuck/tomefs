@@ -45,6 +45,9 @@ class OrderTrackingBackend implements StorageBackend {
   async readPages(path: string, pageIndices: number[]) {
     return this.inner.readPages(path, pageIndices);
   }
+  async readPageBatch(entries: Array<{ path: string; pageIndex: number }>): Promise<Array<Uint8Array | null>> {
+    return this.inner.readPageBatch(entries);
+  }
   async writePage(path: string, pageIndex: number, data: Uint8Array) {
     this.log.push(["writePage", path, pageIndex]);
     return this.inner.writePage(path, pageIndex, data);
@@ -146,6 +149,9 @@ class CrashAfterNOpsBackend implements StorageBackend {
   }
   async readPages(path: string, pageIndices: number[]) {
     return this.inner.readPages(path, pageIndices);
+  }
+  async readPageBatch(entries: Array<{ path: string; pageIndex: number }>): Promise<Array<Uint8Array | null>> {
+    return this.inner.readPageBatch(entries);
   }
   async writePage(path: string, pageIndex: number, data: Uint8Array) {
     this.tick();

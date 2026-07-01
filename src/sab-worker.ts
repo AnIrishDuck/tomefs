@@ -503,6 +503,32 @@ export class SabWorker {
         break;
       }
 
+      case OpCode.READ_PAGE_BATCH: {
+        const entries = validateArrayParam(params, "entries", "READ_PAGE_BATCH") as Array<{
+          path: string;
+          pageIndex: number;
+        }>;
+        const pages = await this.backend.readPageBatch(entries);
+        const sizes: number[] = [];
+        const chunks: Uint8Array[] = [];
+        for (const page of pages) {
+          if (page) {
+            sizes.push(page.length);
+            chunks.push(page);
+          } else {
+            sizes.push(-1);
+          }
+        }
+        const respLen = encodeMessage(
+          this.dataView,
+          this.uint8View,
+          { sizes },
+          chunks,
+        );
+        Atomics.store(this.controlView, SLOT_DATA_LEN, respLen);
+        break;
+      }
+
       default:
         throw new Error(`Unknown opcode: ${opcodeName(opcode as number)}`);
     }

@@ -287,6 +287,46 @@ export class SabClient implements SyncStorageBackend {
     return pages;
   }
 
+  readPageBatch(
+    entries: Array<{ path: string; pageIndex: number }>,
+  ): Array<Uint8Array | null> {
+    if (entries.length === 0) return [];
+
+    if (entries.length <= this.maxBatchPages) {
+      return this.readPageBatchChunk(entries);
+    }
+
+    const results: Array<Uint8Array | null> = [];
+    for (let i = 0; i < entries.length; i += this.maxBatchPages) {
+      const chunk = entries.slice(i, i + this.maxBatchPages);
+      results.push(...this.readPageBatchChunk(chunk));
+    }
+    return results;
+  }
+
+  private readPageBatchChunk(
+    entries: Array<{ path: string; pageIndex: number }>,
+  ): Array<Uint8Array | null> {
+    const { json, binary } = this.call(OpCode.READ_PAGE_BATCH, { entries });
+    const sizes = validateBatchArray<number>(json, "sizes", entries.length, "readPageBatch");
+    const pages: Array<Uint8Array | null> = [];
+    let offset = 0;
+    for (const size of sizes) {
+      if (size < 0) {
+        pages.push(null);
+      } else {
+        if (offset + size > binary.length) {
+          throw new Error(
+            `SAB bridge readPageBatch: binary data underflow at offset ${offset} + size ${size} > ${binary.length}`,
+          );
+        }
+        pages.push(binary.slice(offset, offset + size));
+        offset += size;
+      }
+    }
+    return pages;
+  }
+
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     this.call(OpCode.WRITE_PAGE, { path, pageIndex, dataLen: data.length }, [
       data,

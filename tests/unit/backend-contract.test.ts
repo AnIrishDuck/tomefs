@@ -44,6 +44,7 @@ function syncToAsync(sync: SyncStorageBackend): StorageBackend {
   return {
     readPage: async (p, i) => sync.readPage(p, i),
     readPages: async (p, is) => sync.readPages(p, is),
+    readPageBatch: async (e) => sync.readPageBatch(e),
     writePage: async (p, i, d) => sync.writePage(p, i, d),
     writePages: async (ps) => sync.writePages(ps),
     deleteFile: async (p) => sync.deleteFile(p),
@@ -402,6 +403,69 @@ for (const factory of factories) {
       it("returns all nulls for non-existent file", async () => {
         const results = await backend.readPages("/missing", [0, 1]);
         expect(results).toEqual([null, null]);
+      });
+    });
+
+    describe("readPageBatch", () => {
+      it("returns empty array for empty entries", async () => {
+        expect(await backend.readPageBatch([])).toEqual([]);
+      });
+
+      it("reads one page from each of multiple files", async () => {
+        await backend.writePage("/a", 0, filledPage(0xaa));
+        await backend.writePage("/b", 2, filledPage(0xbb));
+        await backend.writePage("/c", 5, filledPage(0xcc));
+
+        const results = await backend.readPageBatch([
+          { path: "/a", pageIndex: 0 },
+          { path: "/b", pageIndex: 2 },
+          { path: "/c", pageIndex: 5 },
+        ]);
+        expect(results).toHaveLength(3);
+        expect(results[0]).toEqual(filledPage(0xaa));
+        expect(results[1]).toEqual(filledPage(0xbb));
+        expect(results[2]).toEqual(filledPage(0xcc));
+      });
+
+      it("returns null for non-existent pages", async () => {
+        await backend.writePage("/a", 0, filledPage(0xaa));
+
+        const results = await backend.readPageBatch([
+          { path: "/a", pageIndex: 0 },
+          { path: "/missing", pageIndex: 0 },
+          { path: "/a", pageIndex: 99 },
+        ]);
+        expect(results).toHaveLength(3);
+        expect(results[0]).toEqual(filledPage(0xaa));
+        expect(results[1]).toBeNull();
+        expect(results[2]).toBeNull();
+      });
+
+      it("reads multiple pages from the same file", async () => {
+        await backend.writePage("/f", 0, filledPage(0x01));
+        await backend.writePage("/f", 3, filledPage(0x03));
+
+        const results = await backend.readPageBatch([
+          { path: "/f", pageIndex: 0 },
+          { path: "/f", pageIndex: 3 },
+        ]);
+        expect(results[0]).toEqual(filledPage(0x01));
+        expect(results[1]).toEqual(filledPage(0x03));
+      });
+
+      it("returns independent copies", async () => {
+        await backend.writePage("/a", 0, filledPage(0xaa));
+        await backend.writePage("/b", 0, filledPage(0xbb));
+
+        const results = await backend.readPageBatch([
+          { path: "/a", pageIndex: 0 },
+          { path: "/b", pageIndex: 0 },
+        ]);
+        results[0]![0] = 0xff;
+        const reread = await backend.readPageBatch([
+          { path: "/a", pageIndex: 0 },
+        ]);
+        expect(reread[0]![0]).toBe(0xaa);
       });
     });
 
