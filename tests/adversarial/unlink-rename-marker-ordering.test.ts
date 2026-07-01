@@ -370,6 +370,9 @@ function createTrackingBackend(
     readPages(path, pageIndices) {
       return inner.readPages(path, pageIndices);
     },
+    readPageBatch(entries: Array<{ path: string; pageIndex: number }>) {
+      return inner.readPageBatch(entries);
+    },
     writePage(path, pageIndex, data) {
       log.push(`writePage:${path}:${pageIndex}`);
       return inner.writePage(path, pageIndex, data);

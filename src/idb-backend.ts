@@ -160,6 +160,33 @@ export class IdbBackend implements StorageBackend {
     });
   }
 
+  async readPageBatch(
+    entries: Array<{ path: string; pageIndex: number }>,
+  ): Promise<Array<Uint8Array | null>> {
+    if (entries.length === 0) return [];
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(PAGES_STORE, "readonly");
+      const store = tx.objectStore(PAGES_STORE);
+      const results: Array<Uint8Array | null> = new Array(entries.length);
+      let completed = 0;
+
+      for (let i = 0; i < entries.length; i++) {
+        const request = store.get(this.pageKey(entries[i].path, entries[i].pageIndex));
+        request.onsuccess = () => {
+          results[i] =
+            request.result == null ? null : new Uint8Array(request.result);
+          completed++;
+          if (completed === entries.length) resolve(results);
+        };
+        request.onerror = () => reject(request.error);
+      }
+
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IDB transaction aborted"));
+    });
+  }
+
   async writePage(
     path: string,
     pageIndex: number,

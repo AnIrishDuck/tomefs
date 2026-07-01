@@ -94,6 +94,9 @@ class CrashAfterNOpsSyncBackend implements SyncStorageBackend {
   readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
     return this.inner.readPages(path, pageIndices);
   }
+  readPageBatch(entries: Array<{ path: string; pageIndex: number }>): Array<Uint8Array | null> {
+    return this.inner.readPageBatch(entries);
+  }
   readMeta(path: string): FileMeta | null {
     return this.inner.readMeta(path);
   }

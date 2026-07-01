@@ -193,6 +193,15 @@ export class OpfsSahBackend implements StorageBackend {
     });
   }
 
+  async readPageBatch(
+    entries: Array<{ path: string; pageIndex: number }>,
+  ): Promise<Array<Uint8Array | null>> {
+    if (entries.length === 0) return [];
+    return Promise.all(
+      entries.map(({ path, pageIndex }) => this.readPage(path, pageIndex)),
+    );
+  }
+
   async writePage(
     path: string,
     pageIndex: number,

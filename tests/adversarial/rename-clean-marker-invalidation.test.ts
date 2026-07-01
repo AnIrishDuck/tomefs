@@ -135,6 +135,9 @@ class CrashBackend implements SyncStorageBackend {
   // Reads never crash
   readPage(p: string, i: number) { return this.inner.readPage(p, i); }
   readPages(p: string, is: number[]) { return this.inner.readPages(p, is); }
+  readPageBatch(entries: Array<{ path: string; pageIndex: number }>): Array<Uint8Array | null> {
+    return this.inner.readPageBatch(entries);
+  }
   readMeta(p: string) { return this.inner.readMeta(p); }
   readMetas(ps: string[]) { return this.inner.readMetas(ps); }
   countPages(p: string) { return this.inner.countPages(p); }

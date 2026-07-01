@@ -96,6 +96,9 @@ class TransientFailBackend implements SyncStorageBackend {
   readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
     return this.inner.readPages(path, pageIndices);
   }
+  readPageBatch(entries: Array<{ path: string; pageIndex: number }>): Array<Uint8Array | null> {
+    return this.inner.readPageBatch(entries);
+  }
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     this.inner.writePage(path, pageIndex, data);
   }

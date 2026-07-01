@@ -44,6 +44,7 @@ export const OpCode = {
   SYNC_ALL: 21,
   DELETE_ALL: 22,
   CLEANUP_ORPHANED_PAGES: 23,
+  READ_PAGE_BATCH: 24,
 } as const;
 
 export type OpCode = (typeof OpCode)[keyof typeof OpCode];
