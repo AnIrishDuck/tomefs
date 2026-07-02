@@ -1777,3 +1777,81 @@ describe("SAB bridge: stats track timeouts", () => {
     ).rejects.toThrow(/READ_PAGE/);
   }, 10000);
 });
+
+describe("SAB bridge: SabWorker double-start guard", () => {
+  let backend: MemoryBackend;
+  let sabWorker: SabWorker;
+  let clientWorker: Worker;
+  let sab: SharedArrayBuffer;
+
+  beforeAll(async () => {
+    await buildWorkerBundle();
+  });
+
+  beforeEach(async () => {
+    backend = new MemoryBackend();
+    sab = SabClient.createBuffer();
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+
+    clientWorker = new Worker(WORKER_BUNDLE, {
+      workerData: { sab, timeout: 0 },
+    });
+    await waitReady(clientWorker);
+  });
+
+  afterEach(async () => {
+    sabWorker.stop();
+    await clientWorker.terminate();
+  });
+
+  it("@fast second start() call is a no-op — bridge still works", async () => {
+    // Call start() again while already running
+    const secondStart = sabWorker.start();
+    // Guard makes it return immediately (resolved promise)
+    await secondStart;
+
+    // Bridge still processes requests correctly
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0xab;
+    await callClient(clientWorker, "writePage", ["/test", 0, data]);
+    const result = await callClient(clientWorker, "readPage", ["/test", 0]);
+    expect(toUint8Array(result)[0]).toBe(0xab);
+  });
+
+  it("@fast stop after double-start cleanly shuts down", async () => {
+    await sabWorker.start();
+    await sabWorker.start();
+
+    // Verify requests work before stop
+    const data = new Uint8Array(PAGE_SIZE);
+    data[0] = 0xcd;
+    await callClient(clientWorker, "writePage", ["/pre-stop", 0, data]);
+
+    sabWorker.stop();
+
+    // Restart and verify data persisted
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+
+    const result = await callClient(clientWorker, "readPage", ["/pre-stop", 0]);
+    expect(toUint8Array(result)[0]).toBe(0xcd);
+  });
+
+  it("@fast start after stop-start cycle works correctly", async () => {
+    // First cycle: already started in beforeEach
+    const data1 = new Uint8Array(PAGE_SIZE);
+    data1[0] = 0x11;
+    await callClient(clientWorker, "writePage", ["/cycle", 0, data1]);
+
+    // Stop then restart
+    sabWorker.stop();
+    sabWorker = new SabWorker(sab, backend);
+    sabWorker.start();
+    // Double-start on fresh instance — should be no-op
+    await sabWorker.start();
+
+    const result = await callClient(clientWorker, "readPage", ["/cycle", 0]);
+    expect(toUint8Array(result)[0]).toBe(0x11);
+  });
+});
