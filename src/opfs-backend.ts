@@ -25,9 +25,12 @@ for (let i = 0; i < 256; i++) {
   HEX_TABLE[i] = i.toString(16).padStart(2, "0");
 }
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 /** Encode a virtual file path as a hex string safe for use as an OPFS name. */
 function encodePath(path: string): string {
-  const bytes = new TextEncoder().encode(path);
+  const bytes = textEncoder.encode(path);
   const parts = new Array<string>(bytes.length);
   for (let i = 0; i < bytes.length; i++) {
     parts[i] = HEX_TABLE[bytes[i]];
@@ -41,7 +44,7 @@ function decodePath(hex: string): string {
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   }
-  return new TextDecoder().decode(bytes);
+  return textDecoder.decode(bytes);
 }
 
 /** Options for creating an OpfsBackend. */
