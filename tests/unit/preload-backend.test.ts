@@ -1521,4 +1521,132 @@ describe("PreloadBackend", () => {
       expect(remoteF1P0![0]).toBe(20);
     });
   });
+
+  describe("cleanupOrphanedPages", () => {
+    it("returns 0 when no pages exist @fast", async () => {
+      const remote = new MemoryBackend();
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+      expect(backend.cleanupOrphanedPages()).toBe(0);
+    });
+
+    it("returns 0 when all pages have metadata @fast", async () => {
+      const remote = new MemoryBackend();
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      const data = new Uint8Array(PAGE_SIZE);
+      backend.writePage("/file", 0, data);
+      backend.writePage("/file", 1, data);
+      backend.writeMeta("/file", { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 0, mtime: 0 });
+      expect(backend.cleanupOrphanedPages()).toBe(0);
+    });
+
+    it("removes pages without metadata @fast", async () => {
+      const remote = new MemoryBackend();
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      const data = new Uint8Array(PAGE_SIZE);
+      backend.writePage("/orphan", 0, data);
+      backend.writePage("/orphan", 1, data);
+      backend.writePage("/good", 0, data);
+      backend.writeMeta("/good", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      expect(backend.cleanupOrphanedPages()).toBe(1);
+      expect(backend.readPage("/orphan", 0)).toBeNull();
+      expect(backend.readPage("/orphan", 1)).toBeNull();
+      expect(backend.readPage("/good", 0)).not.toBeNull();
+      expect(backend.readMeta("/good")).not.toBeNull();
+    });
+
+    it("removes multiple orphan paths @fast", async () => {
+      const remote = new MemoryBackend();
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      const data = new Uint8Array(PAGE_SIZE);
+      backend.writePage("/orphan1", 0, data);
+      backend.writePage("/orphan2", 0, data);
+      backend.writePage("/orphan2", 1, data);
+      backend.writePage("/orphan3", 0, data);
+
+      expect(backend.cleanupOrphanedPages()).toBe(3);
+      expect(backend.readPage("/orphan1", 0)).toBeNull();
+      expect(backend.readPage("/orphan2", 0)).toBeNull();
+      expect(backend.readPage("/orphan3", 0)).toBeNull();
+    });
+
+    it("is idempotent @fast", async () => {
+      const remote = new MemoryBackend();
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      const data = new Uint8Array(PAGE_SIZE);
+      backend.writePage("/orphan", 0, data);
+
+      expect(backend.cleanupOrphanedPages()).toBe(1);
+      expect(backend.cleanupOrphanedPages()).toBe(0);
+    });
+
+    it("preserves invariants after cleanup @fast", async () => {
+      const remote = new MemoryBackend();
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      const data = new Uint8Array(PAGE_SIZE);
+      backend.writePage("/orphan", 0, data);
+      backend.writePage("/orphan", 1, data);
+      backend.writePage("/good", 0, data);
+      backend.writeMeta("/good", { size: PAGE_SIZE, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      backend.cleanupOrphanedPages();
+      backend.assertInvariants();
+    });
+
+    it("handles multi-page orphan files correctly @fast", async () => {
+      const remote = new MemoryBackend();
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      for (let i = 0; i < 50; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data[0] = i;
+        backend.writePage("/orphan", i, data);
+      }
+
+      for (let i = 0; i < 10; i++) {
+        const data = new Uint8Array(PAGE_SIZE);
+        data[0] = i;
+        backend.writePage("/good", i, data);
+      }
+      backend.writeMeta("/good", { size: PAGE_SIZE * 10, mode: 0o100644, ctime: 0, mtime: 0 });
+
+      expect(backend.cleanupOrphanedPages()).toBe(1);
+      for (let i = 0; i < 50; i++) {
+        expect(backend.readPage("/orphan", i)).toBeNull();
+      }
+      for (let i = 0; i < 10; i++) {
+        expect(backend.readPage("/good", i)).not.toBeNull();
+        expect(backend.readPage("/good", i)![0]).toBe(i);
+      }
+      backend.assertInvariants();
+    });
+
+    it("cleans up orphans from metadata deletion @fast", async () => {
+      const remote = new MemoryBackend();
+      await remote.writePage("/file", 0, new Uint8Array(PAGE_SIZE));
+      await remote.writePage("/file", 1, new Uint8Array(PAGE_SIZE));
+      await remote.writeMeta("/file", { size: PAGE_SIZE * 2, mode: 0o100644, ctime: 0, mtime: 0 });
+      const backend = new PreloadBackend(remote);
+      await backend.init();
+
+      backend.deleteMeta("/file");
+
+      expect(backend.cleanupOrphanedPages()).toBe(1);
+      expect(backend.readPage("/file", 0)).toBeNull();
+      expect(backend.readPage("/file", 1)).toBeNull();
+      backend.assertInvariants();
+    });
+  });
 });
