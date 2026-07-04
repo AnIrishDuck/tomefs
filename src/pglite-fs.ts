@@ -15,11 +15,23 @@
  */
 
 import { createTomeFS } from "./tomefs.js";
+import type { TomeFS } from "./tomefs.js";
 import { SyncMemoryBackend } from "./sync-memory-backend.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
+import type { SyncPageCache } from "./sync-page-cache.js";
 
 /** PGlite's data directory inside the WASM filesystem. */
 const PGLITE_DATA = "/pglite/data";
+
+/** Return type of createTomeFSPGlite — a PGlite Filesystem with tomefs internals exposed. */
+export interface TomeFSPGliteAdapter {
+  init(pg: any, emscriptenOptions: any): Promise<{ emscriptenOpts: any }>;
+  syncToFs(relaxedDurability?: boolean): Promise<void>;
+  closeFs(): Promise<void>;
+  readonly storageBackend: SyncStorageBackend;
+  readonly tomefsInstance: TomeFS | null;
+  readonly pageCache: SyncPageCache | undefined;
+}
 
 /** Options for creating a TomeFSPGlite adapter. */
 export interface TomeFSPGliteOptions {
