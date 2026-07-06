@@ -6,10 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: Build & type-check (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         node-version: [20, 22]
@@ -32,7 +37,9 @@ jobs:
 
   smoke-tests:
     name: Smoke tests (Node ${{ matrix.node-version }})
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         node-version: [20, 22]
@@ -58,7 +65,9 @@ jobs:
 
   full-tests:
     name: Full test suite (Node ${{ matrix.node-version }})
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         node-version: [20, 22]
@@ -81,7 +90,9 @@ jobs:
 
   preload-backend-tests:
     name: PreloadBackend conformance (graceful degradation)
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -104,7 +115,9 @@ jobs:
 
   small-cache-tests:
     name: Small-cache stress (4-page cache)
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
