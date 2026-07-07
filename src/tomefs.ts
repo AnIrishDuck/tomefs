@@ -42,6 +42,18 @@ export interface TomeFSOptions {
   maxPages?: number;
 }
 
+/** Return type of createTomeFS — an Emscripten-compatible filesystem object. */
+export interface TomeFS {
+  readonly pageCache: SyncPageCache;
+  readonly backend: SyncStorageBackend;
+  getStats(): TomeFSStats;
+  resetStats(): void;
+  mount(mount: any): any;
+  syncfs(mount: any, populate: boolean, callback: (err: Error | null) => void): void;
+  assertInvariants(): void;
+  createNode(parent: any, name: string, mode: number, dev: number): any;
+}
+
 /** Monotonically increasing path counter for unique file identifiers. */
 let nextPathId = 0;
 
@@ -67,7 +79,7 @@ function nodePath(node: any): string {
  *   FS.mkdir('/data');
  *   FS.mount(tomefs, {}, '/data');
  */
-export function createTomeFS(FS: any, options?: TomeFSOptions): any {
+export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
   const backend = options?.backend ?? new SyncMemoryBackend();
   const maxPages = options?.maxPages ?? 4096;
   const pageCache = new SyncPageCache(backend, maxPages);
@@ -1470,7 +1482,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): any {
      * When populate=false: flush all dirty data + persist metadata.
      * When populate=true: no-op (tree is restored on mount).
      */
-    syncfs(mount: any, populate: boolean, callback: (err?: Error | null) => void) {
+    syncfs(mount: any, populate: boolean, callback: (err: Error | null) => void) {
       try {
         if (!populate) {
           // Fast path: nothing to sync — no dirty pages, no dirty metadata,
