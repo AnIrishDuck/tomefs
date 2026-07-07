@@ -1085,5 +1085,30 @@ describe("IdbBackend", () => {
       expect(await backend.readPage("/victim", 0)).toBeNull();
       expect(await backend.readPage("/victim", 1)).toBeNull();
     });
+
+    it("correctly identifies orphans among files with many pages per file", async () => {
+      const meta = { size: PAGE_SIZE * 20, mode: 0o100644, ctime: 1, mtime: 2 };
+
+      for (let i = 0; i < 20; i++) {
+        await backend.writePage("/keep", i, filledPage(0x01));
+      }
+      await backend.writeMeta("/keep", meta);
+
+      for (let i = 0; i < 15; i++) {
+        await backend.writePage("/orphan", i, filledPage(0x02));
+      }
+
+      for (let i = 0; i < 10; i++) {
+        await backend.writePage("/also-keep", i, filledPage(0x03));
+      }
+      await backend.writeMeta("/also-keep", { ...meta, size: PAGE_SIZE * 10 });
+
+      const removed = await backend.cleanupOrphanedPages();
+
+      expect(removed).toBe(1);
+      expect(await backend.countPages("/keep")).toBe(20);
+      expect(await backend.countPages("/orphan")).toBe(0);
+      expect(await backend.countPages("/also-keep")).toBe(10);
+    });
   });
 });
