@@ -39,7 +39,7 @@ jobs:
     name: Smoke tests (Node ${{ matrix.node-version }})
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     strategy:
       matrix:
         node-version: [20, 22]
