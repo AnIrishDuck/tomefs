@@ -170,8 +170,7 @@ export class OpfsSahBackend implements StorageBackend {
     if (offset >= fileSize) return null;
 
     const buffer = new Uint8Array(PAGE_SIZE);
-    const bytesRead = handle.read(buffer, { at: offset });
-    if (bytesRead === 0 && offset >= fileSize) return null;
+    handle.read(buffer, { at: offset });
     return buffer;
   }
 
