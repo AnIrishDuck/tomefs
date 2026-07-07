@@ -1114,14 +1114,16 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
     fsync(stream: any) {
       const node = stream.node;
       if (FS.isFile(node.mode)) {
-        pageCache.flushFile(node.storagePath);
-        backend.writeMeta(node.storagePath, {
+        const dirtyPages = pageCache.collectDirtyPagesForFile(node.storagePath);
+        const meta = {
           size: node.usedBytes,
           mode: node.mode,
           ctime: node.ctime,
           mtime: node.mtime,
           atime: node.atime,
-        });
+        };
+        backend.syncAll(dirtyPages, [{ path: node.storagePath, meta }]);
+        pageCache.commitDirtyPages(dirtyPages);
         if (node._metaDirty) {
           node._metaDirty = false;
           dirtyMetaNodes.delete(node);
