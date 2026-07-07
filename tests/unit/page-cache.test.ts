@@ -1431,6 +1431,86 @@ describe("PageCache", () => {
     });
   });
 
+  describe("getPageNoRead", () => {
+    function createCountingBackend() {
+      const inner = new MemoryBackend();
+      let readPageCalls = 0;
+
+      const counting: MemoryBackend & {
+        readPageCalls: number;
+        resetCounts(): void;
+      } = Object.create(inner);
+
+      Object.defineProperty(counting, "readPageCalls", {
+        get: () => readPageCalls,
+      });
+      counting.resetCounts = () => { readPageCalls = 0; };
+      counting.readPage = async (path: string, pageIndex: number) => {
+        readPageCalls++;
+        return inner.readPage(path, pageIndex);
+      };
+      counting.readPages = async (path: string, pageIndices: number[]) => {
+        readPageCalls += pageIndices.length;
+        return inner.readPages(path, pageIndices);
+      };
+      return counting;
+    }
+
+    it("@fast creates zero-filled page without reading backend", async () => {
+      const cb = createCountingBackend();
+      const c = new PageCache(cb, 8);
+
+      cb.resetCounts();
+      const page = await c.getPageNoRead("/file", 0);
+
+      expect(cb.readPageCalls).toBe(0);
+      expect(page.data).toEqual(new Uint8Array(PAGE_SIZE));
+      expect(page.dirty).toBe(false);
+    });
+
+    it("returns cached page if already present (no backend read)", async () => {
+      const cb = createCountingBackend();
+      const c = new PageCache(cb, 8);
+
+      const page1 = await c.getPage("/file", 0);
+      page1.data[0] = 0x42;
+
+      cb.resetCounts();
+      const page2 = await c.getPageNoRead("/file", 0);
+
+      expect(cb.readPageCalls).toBe(0);
+      expect(page2.data[0]).toBe(0x42);
+    });
+
+    it("page created by getPageNoRead is writable and flushable", async () => {
+      const cb = createCountingBackend();
+      const c = new PageCache(cb, 8);
+
+      const page = await c.getPageNoRead("/file", 0);
+      page.data.set(new Uint8Array([1, 2, 3, 4, 5]));
+      page.dirty = true;
+      c.addDirtyKey(page.key, "/file");
+
+      await c.flushAll();
+
+      const stored = await cb.readPage("/file", 0);
+      expect(stored).not.toBeNull();
+      expect(stored![0]).toBe(1);
+      expect(stored![4]).toBe(5);
+    });
+  });
+
+  describe("renameFile self-rename", () => {
+    it("self-rename is a no-op that preserves data", async () => {
+      await cache.write("/file", fillBuf(PAGE_SIZE, 0xAA), 0, PAGE_SIZE, 0, PAGE_SIZE);
+      await cache.renameFile("/file", "/file");
+
+      const buf = new Uint8Array(PAGE_SIZE);
+      await cache.read("/file", buf, 0, PAGE_SIZE, 0, PAGE_SIZE);
+      expect(buf[0]).toBe(0xAA);
+    });
+  });
+
   describe("markPageDirty", () => {
     it("loads existing data from backend when page is not cached", async () => {
       await backend.writePage("/file", 2, fillBuf(PAGE_SIZE, 0xCD));
