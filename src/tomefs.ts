@@ -1813,6 +1813,36 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
           errors.push(
             `file node ${node.storagePath} has non-array _pages: ${typeof node._pages}`,
           );
+        } else {
+          const maxPageIdx = node.usedBytes > 0
+            ? (((node.usedBytes as number) + PAGE_MASK) >>> PAGE_SHIFT) - 1
+            : -1;
+
+          for (let i = 0; i < node._pages.length; i++) {
+            const entry = node._pages[i];
+            if (entry == null || entry.evicted) continue;
+
+            if (entry.path !== node.storagePath) {
+              errors.push(
+                `file node ${node.storagePath} _pages[${i}] references wrong path: ${entry.path}`,
+              );
+            }
+            if (entry.pageIndex !== i) {
+              errors.push(
+                `file node ${node.storagePath} _pages[${i}] has wrong pageIndex: ${entry.pageIndex}`,
+              );
+            }
+            if (i > maxPageIdx) {
+              errors.push(
+                `file node ${node.storagePath} _pages[${i}] beyond file extent (usedBytes=${node.usedBytes}, maxPageIdx=${maxPageIdx})`,
+              );
+            }
+            if (!pageCache.has(node.storagePath, i)) {
+              errors.push(
+                `file node ${node.storagePath} _pages[${i}] references page not in cache`,
+              );
+            }
+          }
         }
       }
 
