@@ -1,42 +1,14 @@
 import type { StorageBackend } from "./storage-backend.js";
 import type { FileMeta } from "./types.js";
 import { PAGE_SIZE } from "./types.js";
-
-interface IterableDirectoryHandle extends FileSystemDirectoryHandle {
-  keys(): AsyncIterableIterator<string>;
-}
-
-function isNotFoundError(err: unknown): boolean {
-  return err instanceof DOMException && err.name === "NotFoundError";
-}
-
-const PAGES_DIR = "pages";
-const META_DIR = "meta";
-
-const HEX_TABLE: string[] = new Array(256);
-for (let i = 0; i < 256; i++) {
-  HEX_TABLE[i] = i.toString(16).padStart(2, "0");
-}
-
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
-
-function encodePath(path: string): string {
-  const bytes = textEncoder.encode(path);
-  const parts = new Array<string>(bytes.length);
-  for (let i = 0; i < bytes.length; i++) {
-    parts[i] = HEX_TABLE[bytes[i]];
-  }
-  return parts.join("");
-}
-
-function decodePath(hex: string): string {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return textDecoder.decode(bytes);
-}
+import {
+  type IterableDirectoryHandle,
+  isNotFoundError,
+  PAGES_DIR,
+  META_DIR,
+  encodePath,
+  decodePath,
+} from "./opfs-utils.js";
 
 // FileSystemSyncAccessHandle is declared in src/opfs-augments.d.ts
 // (the Web API lives in lib.webworker.d.ts but this project only
