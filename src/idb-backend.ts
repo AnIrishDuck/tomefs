@@ -87,6 +87,13 @@ export class IdbBackend implements StorageBackend {
         this.initPromise = null;
         reject(request.error);
       };
+
+      request.onblocked = () => {
+        this.initPromise = null;
+        reject(new Error(
+          `IndexedDB open blocked: database "${this.dbName}" is held by another connection`,
+        ));
+      };
     });
 
     return this.initPromise;
