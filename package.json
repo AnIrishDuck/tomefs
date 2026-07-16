@@ -24,6 +24,36 @@
     "dist",
     "LICENSE"
   ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AnIrishDuck/tomefs.git"
+  },
+  "homepage": "https://github.com/AnIrishDuck/tomefs#readme",
+  "bugs": {
+    "url": "https://github.com/AnIrishDuck/tomefs/issues"
+  },
+  "keywords": [
+    "pglite",
+    "emscripten",
+    "filesystem",
+    "indexeddb",
+    "opfs",
+    "page-cache",
+    "lru",
+    "wasm",
+    "postgres"
+  ],
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.4.1"
+  },
+  "peerDependenciesMeta": {
+    "@electric-sql/pglite": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
