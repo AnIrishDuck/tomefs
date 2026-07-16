@@ -482,4 +482,145 @@ describe("open append (wasmfs_open_append.c)", () => {
     }
     FS.close(readStream);
   });
+
+  // -------------------------------------------------------------------
+  // O_APPEND + dup + seek: POSIX requires seek to be irrelevant for writes
+  // -------------------------------------------------------------------
+
+  it("seek on duped O_APPEND fd is ignored for writes @fast", () => {
+    const { FS } = h;
+
+    const stream = FS.open("/dup-seek-append", O.RDWR | O.CREAT | O.APPEND, 0o666);
+    FS.write(stream, encode("AAAA"), 0, 4);
+    expect(FS.fstat(stream.fd).size).toBe(4);
+
+    const dup = FS.dupStream(stream);
+
+    // Seek dup to offset 0 — POSIX says this should be irrelevant for
+    // O_APPEND writes (write atomically seeks to EOF before writing).
+    FS.llseek(dup, 0, SEEK_SET);
+
+    FS.write(dup, encode("BB"), 0, 2);
+
+    // Write must have appended, not overwritten at offset 0
+    expect(FS.fstat(stream.fd).size).toBe(6);
+
+    FS.close(dup);
+    FS.close(stream);
+
+    const content = FS.readFile("/dup-seek-append", { encoding: "utf8" });
+    expect(content).toBe("AAAABB");
+  });
+
+  it("seek on original O_APPEND fd is ignored when dup writes @fast", () => {
+    const { FS } = h;
+
+    const stream = FS.open("/orig-seek-append", O.RDWR | O.CREAT | O.APPEND, 0o666);
+    FS.write(stream, encode("1234"), 0, 4);
+
+    // Seek the original fd to offset 1
+    FS.llseek(stream, 1, SEEK_SET);
+
+    const dup = FS.dupStream(stream);
+
+    // Write via dup — should append despite shared seek position at 1
+    FS.write(dup, encode("XY"), 0, 2);
+    expect(FS.fstat(stream.fd).size).toBe(6);
+
+    // Write via original — should also still append
+    FS.write(stream, encode("Z"), 0, 1);
+    expect(FS.fstat(stream.fd).size).toBe(7);
+
+    FS.close(dup);
+    FS.close(stream);
+
+    const content = FS.readFile("/orig-seek-append", { encoding: "utf8" });
+    expect(content).toBe("1234XYZ");
+  });
+
+  it("interleaved dup append writes after seek to middle @fast", () => {
+    const { FS } = h;
+
+    const stream = FS.open("/interleave-dup-append", O.RDWR | O.CREAT | O.APPEND, 0o666);
+    FS.write(stream, encode("init"), 0, 4);
+
+    const dup1 = FS.dupStream(stream);
+    const dup2 = FS.dupStream(stream);
+
+    // Seek both dups to different positions
+    FS.llseek(dup1, 0, SEEK_SET);
+    FS.llseek(dup2, 2, SEEK_SET);
+
+    // Interleaved writes — all must append regardless of seek position
+    FS.write(dup1, encode("A"), 0, 1);
+    FS.write(dup2, encode("B"), 0, 1);
+    FS.write(stream, encode("C"), 0, 1);
+    FS.write(dup1, encode("D"), 0, 1);
+
+    expect(FS.fstat(stream.fd).size).toBe(8);
+
+    FS.close(dup2);
+    FS.close(dup1);
+    FS.close(stream);
+
+    const content = FS.readFile("/interleave-dup-append", { encoding: "utf8" });
+    expect(content).toBe("initABCD");
+  });
+
+  it("dup O_APPEND fd survives ftruncate and still appends @fast", () => {
+    const { FS } = h;
+
+    const stream = FS.open("/dup-trunc-append", O.RDWR | O.CREAT | O.APPEND, 0o666);
+    FS.write(stream, encode("hello world"), 0, 11);
+    expect(FS.fstat(stream.fd).size).toBe(11);
+
+    const dup = FS.dupStream(stream);
+
+    // Truncate via original fd
+    FS.ftruncate(stream.fd, 5);
+    expect(FS.fstat(stream.fd).size).toBe(5);
+
+    // Write via dup — should append at new EOF (offset 5), not at old
+    FS.write(dup, encode("!"), 0, 1);
+    expect(FS.fstat(stream.fd).size).toBe(6);
+
+    FS.close(dup);
+    FS.close(stream);
+
+    const content = FS.readFile("/dup-trunc-append", { encoding: "utf8" });
+    expect(content).toBe("hello!");
+  });
+
+  it("append via dup across page boundary after seek @fast", () => {
+    const { FS } = h;
+
+    // Fill file to just below a page boundary
+    const initialSize = PAGE_SIZE - 2;
+    const initial = new Uint8Array(initialSize);
+    initial.fill(0x41); // 'A'
+
+    const stream = FS.open("/dup-page-boundary-append", O.RDWR | O.CREAT | O.APPEND, 0o666);
+    FS.write(stream, initial, 0, initialSize);
+    expect(FS.fstat(stream.fd).size).toBe(initialSize);
+
+    const dup = FS.dupStream(stream);
+
+    // Seek dup to offset 0
+    FS.llseek(dup, 0, SEEK_SET);
+
+    // This 6-byte write should append and cross the page boundary
+    FS.write(dup, encode("BCDEFG"), 0, 6);
+    const expectedSize = initialSize + 6;
+    expect(FS.fstat(stream.fd).size).toBe(expectedSize);
+
+    FS.close(dup);
+    FS.close(stream);
+
+    // Verify the last bytes span the page boundary
+    const readStream = FS.open("/dup-page-boundary-append", O.RDONLY);
+    const tail = new Uint8Array(6);
+    FS.read(readStream, tail, 0, 6, initialSize);
+    expect(decode(tail)).toBe("BCDEFG");
+    FS.close(readStream);
+  });
 });
