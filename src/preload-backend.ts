@@ -202,6 +202,14 @@ export class PreloadBackend implements SyncStorageBackend {
     });
   }
 
+  readPageBatch(
+    entries: Array<{ path: string; pageIndex: number }>,
+  ): Array<Uint8Array | null> {
+    this.assertInitialized();
+    if (entries.length === 0) return [];
+    return entries.map(({ path, pageIndex }) => this.readPage(path, pageIndex));
+  }
+
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     this.assertInitialized();
     const key = pageKeyStr(path, pageIndex);

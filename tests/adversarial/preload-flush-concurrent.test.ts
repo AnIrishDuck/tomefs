@@ -58,6 +58,9 @@ class HookableBackend implements StorageBackend {
   async readPages(path: string, pageIndices: number[]) {
     return this.inner.readPages(path, pageIndices);
   }
+  async readPageBatch(entries: Array<{ path: string; pageIndex: number }>) {
+    return this.inner.readPageBatch(entries);
+  }
   async writePage(path: string, pageIndex: number, data: Uint8Array) {
     return this.inner.writePage(path, pageIndex, data);
   }

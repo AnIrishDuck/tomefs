@@ -23,6 +23,12 @@ export class MemoryBackend implements StorageBackend {
     return this.inner.readPages(path, pageIndices);
   }
 
+  async readPageBatch(
+    entries: Array<{ path: string; pageIndex: number }>,
+  ): Promise<Array<Uint8Array | null>> {
+    return this.inner.readPageBatch(entries);
+  }
+
   async writePage(
     path: string,
     pageIndex: number,

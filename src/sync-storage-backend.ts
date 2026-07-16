@@ -20,6 +20,11 @@ export interface SyncStorageBackend {
     pageIndices: number[],
   ): Array<Uint8Array | null>;
 
+  /** Read one page from each of multiple files in a single batch. Returns an array parallel to entries. */
+  readPageBatch(
+    entries: Array<{ path: string; pageIndex: number }>,
+  ): Array<Uint8Array | null>;
+
   /** Write a single page. */
   writePage(path: string, pageIndex: number, data: Uint8Array): void;
 

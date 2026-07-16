@@ -33,6 +33,10 @@ class FailingSyncBackend implements SyncStorageBackend {
     return this.inner.readPages(path, pageIndices);
   }
 
+  readPageBatch(entries: Array<{ path: string; pageIndex: number }>): Array<Uint8Array | null> {
+    return entries.map(e => this.readPage(e.path, e.pageIndex));
+  }
+
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     if (this.writePageFails) {
       this.writeFailCount++;
@@ -149,6 +153,10 @@ class FailingAsyncBackend implements StorageBackend {
     pageIndices: number[],
   ): Promise<Array<Uint8Array | null>> {
     return this.inner.readPages(path, pageIndices);
+  }
+
+  async readPageBatch(entries: Array<{ path: string; pageIndex: number }>): Promise<Array<Uint8Array | null>> {
+    return Promise.all(entries.map(e => this.readPage(e.path, e.pageIndex)));
   }
 
   async writePage(
