@@ -1,4 +1,4 @@
-# Fix flaky scribe-data test timeouts under CPU contention
+# Fix flaky PGlite/scribe-data test timeouts under CPU contention
 
 ## Problem
 
@@ -25,11 +25,14 @@ Full test matrix results (2026-07-19):
 | 4-page cache | workload/scribe (145 tests) | **3 FAIL** (timeouts) then **0 FAIL** in isolation |
 
 Failing tests under contention (non-deterministic — different tests fail each run):
-- `write-patterns.test.ts` > "Burst note creation" > cache=tiny (4 pages) — 30s timeout
-- `write-patterns.test.ts` > "Version chain" > cache=large (4096 pages) — 30s timeout
-- `sync-paging.test.ts` > "single page — all blobs fit in one fetch" — 30s timeout
+- `tests/scribe-data/write-patterns.test.ts` > "Burst note creation" > cache=tiny — 30s timeout
+- `tests/scribe-data/write-patterns.test.ts` > "Version chain" > cache=large — 30s timeout
+- `tests/scribe-data/sync-paging.test.ts` > "single page — all blobs fit in one fetch" — 30s timeout
+- `tests/pglite/bulk-load.test.ts` > "wide rows with large payloads" > cache=tiny — 30s timeout
+- `tests/pglite/cursor-stress.test.ts` > "WITH HOLD cursor across transaction boundaries" > cache=medium — 30s timeout
+- `tests/pglite/join-stress.test.ts` > "LEFT JOIN with unmatched rows" > cache=medium, cache=large — 30s timeout
 
-In isolation, these tests complete in 3-6s. Under CPU contention (10 vitest processes on 4 cores), individual PGlite WASM operations slow down enough to exceed the 30s timeout.
+In isolation, these tests complete in 3-6s. Under CPU contention (multiple vitest processes on limited cores), individual PGlite WASM operations slow down enough to exceed the 30s timeout.
 
 CI on main is green — CI runs test suites sequentially, not in parallel, so contention doesn't occur.
 
@@ -67,6 +70,9 @@ it(`cache=${size} (${pages} pages)`, async () => {
 Files to change:
 - `tests/scribe-data/write-patterns.test.ts` — all `it()` calls (20 tests)
 - `tests/scribe-data/sync-paging.test.ts` — all `it()` calls (16 tests)
+- `tests/pglite/bulk-load.test.ts` — all `it()` calls
+- `tests/pglite/cursor-stress.test.ts` — all `it()` calls
+- `tests/pglite/join-stress.test.ts` — all `it()` calls
 
 ### Option B: Vitest project-level override
 
@@ -93,5 +99,6 @@ Change `vitest.config.ts` line 6 from `testTimeout: 30000` to `testTimeout: 6000
 ## Scope
 
 - No code changes to `src/` — this is a test infrastructure issue only.
-- No logic bugs or assertion failures were found across the full test matrix.
+- No logic bugs or assertion failures were found across the full test matrix (4748 passed, 22 skipped in the full suite).
 - CI is unaffected (tests run sequentially there).
+- The affected tests span `tests/scribe-data/` and `tests/pglite/` — any test that runs PGlite WASM with complex SQL workloads is susceptible.
