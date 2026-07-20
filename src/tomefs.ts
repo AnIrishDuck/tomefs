@@ -535,8 +535,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
     if (attr.atime != null) node.atime = attr.atime;
     if (attr.mtime != null) node.mtime = attr.mtime;
     if (attr.ctime != null) node.ctime = attr.ctime;
-    if (attr.size !== undefined) resizeFileStorage(node, attr.size);
-    markMetaDirty(node);
+    try {
+      if (attr.size !== undefined) resizeFileStorage(node, attr.size);
+    } finally {
+      markMetaDirty(node);
+    }
   }
 
   function lookup(parent: any, name: string) {
@@ -1240,9 +1243,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
    */
   function restoreTree(root: any): void {
     _restoring = true;
+    try {
     const paths = backend.listFiles();
     if (paths.length === 0) {
-      _restoring = false;
       return;
     }
 
@@ -1467,7 +1470,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
       markMetaDirty(node);
     }
 
-    _restoring = false;
+    } finally {
+      _restoring = false;
+    }
   }
 
   // ---------------------------------------------------------------
