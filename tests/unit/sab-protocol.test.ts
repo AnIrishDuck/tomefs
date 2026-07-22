@@ -14,6 +14,7 @@ import {
   DEFAULT_BUFFER_SIZE,
   OpCode,
   opcodeName,
+  SabBufferOverflowError,
 } from "../../src/sab-protocol.js";
 
 /** Create buffer views matching the SAB protocol layout. */
@@ -165,23 +166,22 @@ describe("sab-protocol", () => {
       expect(writtenLen).toBe(jsonBytes.length);
     });
 
-    it("throws on buffer overflow", () => {
-      // Create a tiny buffer: control region + minimal data space
+    it("throws SabBufferOverflowError on buffer overflow", () => {
       const { dataView, uint8View } = createViews(CONTROL_BYTES + 20);
       const json = { longKey: "x".repeat(100) };
 
       expect(() => encodeMessage(dataView, uint8View, json)).toThrow(
-        /SAB buffer overflow/,
+        SabBufferOverflowError,
       );
     });
 
-    it("throws on buffer overflow from binary chunks", () => {
+    it("throws SabBufferOverflowError on buffer overflow from binary chunks", () => {
       const { dataView, uint8View } = createViews(CONTROL_BYTES + 50);
       const json = {};
       const chunk = new Uint8Array(100);
 
       expect(() => encodeMessage(dataView, uint8View, json, [chunk])).toThrow(
-        /SAB buffer overflow/,
+        SabBufferOverflowError,
       );
     });
 
