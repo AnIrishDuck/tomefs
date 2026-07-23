@@ -568,6 +568,45 @@ describe("IdbBackend", () => {
       expect(page).toBeNull();
       await b2.destroy();
     });
+
+    it("destroy rejects when another connection blocks deletion @fast", async () => {
+      const dbName = `tomefs-destroy-blocked-${dbCounter++}`;
+      const b = new IdbBackend({ dbName });
+      await b.writePage("/test", 0, filledPage(0x01));
+
+      const holdingConn = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(dbName, 1);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+
+      try {
+        await expect(b.destroy()).rejects.toThrow(/blocked/i);
+      } finally {
+        holdingConn.close();
+        await new Promise<void>((resolve, reject) => {
+          const req = indexedDB.deleteDatabase(dbName);
+          req.onsuccess = () => resolve();
+          req.onerror = () => reject(req.error);
+        });
+      }
+    });
+
+    it("destroy succeeds after blocking connection closes @fast", async () => {
+      const dbName = `tomefs-destroy-unblocked-${dbCounter++}`;
+      const b = new IdbBackend({ dbName });
+      await b.writePage("/test", 0, filledPage(0x01));
+
+      const b2 = new IdbBackend({ dbName });
+      await b2.readPage("/test", 0);
+      b2.close();
+
+      await b.destroy();
+
+      const b3 = new IdbBackend({ dbName });
+      expect(await b3.readPage("/test", 0)).toBeNull();
+      await b3.destroy();
+    });
   });
 
   // -------------------------------------------------------------------
