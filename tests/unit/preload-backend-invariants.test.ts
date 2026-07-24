@@ -51,6 +51,11 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
   });
 
   function internals(): any {
+    const b = backend as any;
+    return b.store;
+  }
+
+  function dirtyInternals(): any {
     return backend as any;
   }
 
@@ -225,7 +230,7 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
   it("detects dirty page key not in pages", () => {
     setupValidState();
     const ghostKey = pageKeyStr("/gone", 0);
-    internals().dirtyPages.add(ghostKey);
+    dirtyInternals().dirtyPages.add(ghostKey);
     expect(() => backend.assertInvariants()).toThrow(
       /dirtyPages contains.*not in pages/,
     );
@@ -246,7 +251,7 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("detects dirty meta path not in meta", () => {
     setupValidState();
-    internals().dirtyMeta.add("/vanished");
+    dirtyInternals().dirtyMeta.add("/vanished");
     expect(() => backend.assertInvariants()).toThrow(
       /dirtyMeta contains.*not in meta/,
     );
@@ -266,8 +271,8 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("detects non-dirty page in deleted file", () => {
     setupValidState();
-    internals().deletedFiles.add("/fileB");
-    internals().dirtyPages.delete(pageKeyStr("/fileB", 0));
+    dirtyInternals().deletedFiles.add("/fileB");
+    dirtyInternals().dirtyPages.delete(pageKeyStr("/fileB", 0));
     expect(() => backend.assertInvariants()).toThrow(
       /deletedFiles contains.*which has non-dirty page/,
     );
@@ -275,7 +280,7 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("allows dirty pages in deleted file (delete-then-recreate)", () => {
     setupValidState();
-    internals().deletedFiles.add("/fileB");
+    dirtyInternals().deletedFiles.add("/fileB");
     expect(() => backend.assertInvariants()).not.toThrow();
   });
 
@@ -285,7 +290,7 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("detects deleted meta path still in meta", () => {
     setupValidState();
-    internals().deletedMeta.add("/fileA");
+    dirtyInternals().deletedMeta.add("/fileA");
     expect(() => backend.assertInvariants()).toThrow(
       /deletedMeta contains.*which still exists in meta/,
     );
@@ -293,7 +298,7 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("allows deleted meta path not in meta (normal delete)", () => {
     setupValidState();
-    internals().deletedMeta.add("/gone");
+    dirtyInternals().deletedMeta.add("/gone");
     expect(() => backend.assertInvariants()).not.toThrow();
   });
 
@@ -303,8 +308,8 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("detects non-dirty page beyond truncation point", () => {
     setupValidState();
-    internals().truncations.set("/fileA", 1);
-    internals().dirtyPages.delete(pageKeyStr("/fileA", 1));
+    dirtyInternals().truncations.set("/fileA", 1);
+    dirtyInternals().dirtyPages.delete(pageKeyStr("/fileA", 1));
     expect(() => backend.assertInvariants()).toThrow(
       /truncations.*but non-dirty page 1 still exists/,
     );
@@ -312,13 +317,13 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("allows dirty page beyond truncation point", () => {
     setupValidState();
-    internals().truncations.set("/fileA", 1);
+    dirtyInternals().truncations.set("/fileA", 1);
     expect(() => backend.assertInvariants()).not.toThrow();
   });
 
   it("allows truncation with no pages beyond point", () => {
     setupValidState();
-    internals().truncations.set("/fileB", 5);
+    dirtyInternals().truncations.set("/fileB", 5);
     expect(() => backend.assertInvariants()).not.toThrow();
   });
 
@@ -328,9 +333,9 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
 
   it("detects multiple simultaneous violations", () => {
     setupValidState();
-    internals().dirtyPages.add(pageKeyStr("/gone", 0));
-    internals().dirtyMeta.add("/vanished");
-    internals().deletedMeta.add("/fileA");
+    dirtyInternals().dirtyPages.add(pageKeyStr("/gone", 0));
+    dirtyInternals().dirtyMeta.add("/vanished");
+    dirtyInternals().deletedMeta.add("/fileA");
     expect(() => backend.assertInvariants()).toThrow(
       /PreloadBackend invariant violations \(3\)/,
     );
@@ -387,7 +392,7 @@ describe("PreloadBackend.assertInvariants() violation detection @fast", () => {
   it("survives after cleanupOrphanedPages", () => {
     setupValidState();
     internals().meta.delete("/fileB");
-    internals().dirtyMeta.delete("/fileB");
+    dirtyInternals().dirtyMeta.delete("/fileB");
     backend.cleanupOrphanedPages();
     expect(() => backend.assertInvariants()).not.toThrow();
   });

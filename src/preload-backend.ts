@@ -31,23 +31,11 @@ import type { StorageBackend } from "./storage-backend.js";
 import type { SyncStorageBackend } from "./sync-storage-backend.js";
 import type { FileMeta } from "./types.js";
 import { pageKeyStr } from "./types.js";
+import { InMemoryPageStore } from "./in-memory-page-store.js";
 
 export class PreloadBackend implements SyncStorageBackend {
   private readonly remote: StorageBackend;
-  private pages = new Map<string, Uint8Array>();
-  private meta = new Map<string, FileMeta>();
-
-  /** Secondary index: file path → set of page keys belonging to that file.
-   *  Avoids O(total-pages) full-map scans in deleteFile, renameFile, deletePagesFrom. */
-  private filePageKeys = new Map<string, Set<string>>();
-
-  /** Secondary index: file path → Map<pageIndex, key>.
-   *  Avoids string parsing (indexOf + parseInt) in maxPageIndex and deletePagesFrom. */
-  private filePageIndices = new Map<string, Map<number, string>>();
-
-  /** Cached max page index per file for O(1) maxPageIndex lookups.
-   *  Updated on write/delete; -1 means no pages exist. */
-  private fileMaxIdx = new Map<string, number>();
+  private readonly store = new InMemoryPageStore();
 
   /** Pages that have been written locally but not yet flushed. */
   private dirtyPages = new Set<string>();
@@ -87,16 +75,7 @@ export class PreloadBackend implements SyncStorageBackend {
   }
 
   private async doInit(): Promise<void> {
-    // Clear state from any previous failed attempt. Without this, a retry
-    // after partial failure leaves stale pages and secondary indices for
-    // files that loaded successfully before the failure. If the remote
-    // state changed between attempts (e.g., another tab deleted a file),
-    // the stale entries persist with no metadata referencing them.
-    this.pages.clear();
-    this.meta.clear();
-    this.filePageKeys.clear();
-    this.filePageIndices.clear();
-    this.fileMaxIdx.clear();
+    this.store.clear();
     this.dirtyPages.clear();
     this.dirtyMeta.clear();
     this.deletedFiles.clear();
@@ -105,11 +84,6 @@ export class PreloadBackend implements SyncStorageBackend {
 
     const files = await this.remote.listFiles();
 
-    // Batch-read all metadata and true page extents in parallel.
-    // maxPageIndexBatch discovers pages beyond metadata.size that may exist
-    // from a prior crash (pages flushed but metadata not yet synced).
-    // This replaces a per-file O(log n) exponential probe with one batch call
-    // and also finds non-contiguous pages the probe would miss.
     const [allMeta, allMaxIdx] = await Promise.all([
       this.remote.readMetas(files),
       this.remote.maxPageIndexBatch(files),
@@ -117,14 +91,10 @@ export class PreloadBackend implements SyncStorageBackend {
 
     for (let i = 0; i < files.length; i++) {
       if (allMeta[i]) {
-        this.meta.set(files[i], allMeta[i]!);
+        this.store.meta.set(files[i], allMeta[i]!);
       }
     }
 
-    // Load pages for all files in parallel. Each file's page loading is
-    // independent, so we can overlap the I/O across files. For IDB/OPFS
-    // backends, this overlaps transaction/file-read latency; for memory
-    // backends it's equivalent to sequential (no real I/O).
     await Promise.all(
       files.map((path, i) => this.loadFilePages(path, allMaxIdx[i])),
     );
@@ -132,12 +102,6 @@ export class PreloadBackend implements SyncStorageBackend {
     this.initialized = true;
   }
 
-  /**
-   * Load all pages for a single file from the remote backend.
-   * Called during init() — loads pages from 0 through maxPageIdx
-   * (the true extent from the backend, which may exceed metadata.size
-   * if a crash occurred between page flush and metadata sync).
-   */
   private async loadFilePages(
     path: string,
     maxPageIdx: number,
@@ -150,31 +114,9 @@ export class PreloadBackend implements SyncStorageBackend {
     for (let i = 0; i < pages.length; i++) {
       if (pages[i]) {
         const key = pageKeyStr(path, i);
-        this.pages.set(key, new Uint8Array(pages[i]!));
-        this.trackPage(path, key, i);
+        this.store.pages.set(key, new Uint8Array(pages[i]!));
+        this.store.trackPage(path, key, i);
       }
-    }
-  }
-
-  /** Add a page key to the secondary indexes. */
-  private trackPage(path: string, key: string, pageIndex: number): void {
-    let keys = this.filePageKeys.get(path);
-    if (!keys) {
-      keys = new Set();
-      this.filePageKeys.set(path, keys);
-    }
-    keys.add(key);
-
-    let indices = this.filePageIndices.get(path);
-    if (!indices) {
-      indices = new Map();
-      this.filePageIndices.set(path, indices);
-    }
-    indices.set(pageIndex, key);
-
-    const cur = this.fileMaxIdx.get(path) ?? -1;
-    if (pageIndex > cur) {
-      this.fileMaxIdx.set(path, pageIndex);
     }
   }
 
@@ -188,133 +130,68 @@ export class PreloadBackend implements SyncStorageBackend {
 
   readPage(path: string, pageIndex: number): Uint8Array | null {
     this.assertInitialized();
-    const data = this.pages.get(pageKeyStr(path, pageIndex));
-    return data ? new Uint8Array(data) : null;
+    return this.store.readPage(path, pageIndex);
   }
 
   readPages(path: string, pageIndices: number[]): Array<Uint8Array | null> {
     this.assertInitialized();
-    if (pageIndices.length === 0) return [];
-    const prefix = path + "\0";
-    return pageIndices.map((i) => {
-      const data = this.pages.get(prefix + i);
-      return data ? new Uint8Array(data) : null;
-    });
+    return this.store.readPages(path, pageIndices);
   }
 
   readPageBatch(
     entries: Array<{ path: string; pageIndex: number }>,
   ): Array<Uint8Array | null> {
     this.assertInitialized();
-    if (entries.length === 0) return [];
-    return entries.map(({ path, pageIndex }) => this.readPage(path, pageIndex));
+    return this.store.readPageBatch(entries);
   }
 
   writePage(path: string, pageIndex: number, data: Uint8Array): void {
     this.assertInitialized();
-    const key = pageKeyStr(path, pageIndex);
-    this.pages.set(key, new Uint8Array(data));
-    this.trackPage(path, key, pageIndex);
-    this.dirtyPages.add(key);
+    this.store.writePage(path, pageIndex, data);
+    this.dirtyPages.add(pageKeyStr(path, pageIndex));
   }
 
   writePages(
     pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
   ): void {
     this.assertInitialized();
-    if (pages.length === 0) return;
-    if (pages.length === 1) {
-      const { path, pageIndex, data } = pages[0];
-      const key = pageKeyStr(path, pageIndex);
-      this.pages.set(key, new Uint8Array(data));
-      this.trackPage(path, key, pageIndex);
-      this.dirtyPages.add(key);
-      return;
-    }
-
-    // Batch by file path to amortize secondary index lookups.
-    // syncAll passes dirty pages from the cache — commonly multiple pages
-    // from the same file. Grouping avoids repeated Map.get calls for
-    // filePageKeys/filePageIndices/fileMaxIdx per page.
-    let prevPath = "";
-    let keys: Set<string> | undefined;
-    let indices: Map<number, string> | undefined;
-    let maxIdx = -1;
-
-    for (const { path, pageIndex, data } of pages) {
-      const key = pageKeyStr(path, pageIndex);
-      this.pages.set(key, new Uint8Array(data));
-      this.dirtyPages.add(key);
-
-      if (path !== prevPath) {
-        // Flush maxIdx for previous file
-        if (prevPath !== "" && maxIdx >= 0) {
-          const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
-          if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
-        }
-
-        prevPath = path;
-        keys = this.filePageKeys.get(path);
-        if (!keys) {
-          keys = new Set();
-          this.filePageKeys.set(path, keys);
-        }
-        indices = this.filePageIndices.get(path);
-        if (!indices) {
-          indices = new Map();
-          this.filePageIndices.set(path, indices);
-        }
-        maxIdx = this.fileMaxIdx.get(path) ?? -1;
-      }
-
-      keys!.add(key);
-      indices!.set(pageIndex, key);
-      if (pageIndex > maxIdx) maxIdx = pageIndex;
-    }
-
-    // Flush maxIdx for the last file
-    if (prevPath !== "" && maxIdx >= 0) {
-      const curMax = this.fileMaxIdx.get(prevPath) ?? -1;
-      if (maxIdx > curMax) this.fileMaxIdx.set(prevPath, maxIdx);
+    this.store.writePages(pages);
+    for (const { path, pageIndex } of pages) {
+      this.dirtyPages.add(pageKeyStr(path, pageIndex));
     }
   }
 
   deleteFile(path: string): void {
     this.assertInitialized();
-    const keys = this.filePageKeys.get(path);
+    const keys = this.store.filePageKeys.get(path);
     if (keys) {
       for (const key of keys) {
-        this.pages.delete(key);
         this.dirtyPages.delete(key);
       }
-      this.filePageKeys.delete(path);
     }
-    this.filePageIndices.delete(path);
-    this.fileMaxIdx.delete(path);
+    this.store.deleteFile(path);
     this.deletedFiles.add(path);
-    // Clear any pending truncation for this file
     this.truncations.delete(path);
   }
 
   countPages(path: string): number {
     this.assertInitialized();
-    const keys = this.filePageKeys.get(path);
-    return keys ? keys.size : 0;
+    return this.store.countPages(path);
   }
 
   countPagesBatch(paths: string[]): number[] {
     this.assertInitialized();
-    return paths.map((path) => this.filePageKeys.get(path)?.size ?? 0);
+    return this.store.countPagesBatch(paths);
   }
 
   maxPageIndex(path: string): number {
     this.assertInitialized();
-    return this.fileMaxIdx.get(path) ?? -1;
+    return this.store.maxPageIndex(path);
   }
 
   maxPageIndexBatch(paths: string[]): number[] {
     this.assertInitialized();
-    return paths.map((path) => this.maxPageIndex(path));
+    return this.store.maxPageIndexBatch(paths);
   }
 
   deleteFiles(paths: string[]): void {
@@ -328,88 +205,50 @@ export class PreloadBackend implements SyncStorageBackend {
     this.assertInitialized();
     if (oldPath === newPath) return;
 
-    // Clear any pre-existing destination pages to prevent orphans when the
-    // destination has more pages than the source (matches IDB/OPFS behavior).
-    // This must happen BEFORE the source-empty check: renaming an empty file
-    // over a file with data must still clear the destination's pages.
-    const destKeys = this.filePageKeys.get(newPath);
+    // Clean destination dirty tracking before the store removes dest pages
+    const destKeys = this.store.filePageKeys.get(newPath);
     if (destKeys) {
       for (const key of destKeys) {
-        this.pages.delete(key);
         this.dirtyPages.delete(key);
       }
-      this.filePageKeys.delete(newPath);
-      this.filePageIndices.delete(newPath);
-      this.fileMaxIdx.delete(newPath);
       this.deletedFiles.add(newPath);
       this.truncations.delete(newPath);
     }
 
-    const oldIndices = this.filePageIndices.get(oldPath);
-    if (!oldIndices) {
-      // No pages to move — still track the deletion for flush
-      this.deletedFiles.add(oldPath);
-      this.truncations.delete(oldPath);
-      return;
-    }
-
-    const oldMax = this.fileMaxIdx.get(oldPath) ?? -1;
-    const toAdd: Array<[number, string, Uint8Array]> = [];
-    for (const [pageIndex, key] of oldIndices) {
-      const data = this.pages.get(key)!;
-      const newKey = pageKeyStr(newPath, pageIndex);
-      toAdd.push([pageIndex, newKey, data]);
-      if (this.dirtyPages.has(key)) {
+    // Clean source dirty tracking before the store moves pages
+    const oldIndices = this.store.filePageIndices.get(oldPath);
+    if (oldIndices) {
+      for (const [, key] of oldIndices) {
         this.dirtyPages.delete(key);
       }
-      this.pages.delete(key);
     }
-    this.filePageKeys.delete(oldPath);
-    this.filePageIndices.delete(oldPath);
-    this.fileMaxIdx.delete(oldPath);
 
-    for (const [pageIndex, key, data] of toAdd) {
-      this.pages.set(key, data);
-      this.trackPage(newPath, key, pageIndex);
-      this.dirtyPages.add(key);
+    this.store.renameFile(oldPath, newPath);
+
+    // Mark all new-path keys as dirty
+    const newIndices = this.store.filePageIndices.get(newPath);
+    if (newIndices) {
+      for (const [, key] of newIndices) {
+        this.dirtyPages.add(key);
+      }
     }
-    if (oldMax >= 0) {
-      this.fileMaxIdx.set(newPath, oldMax);
-    }
-    // Track as: delete old file + dirty-write all new pages
+
     this.deletedFiles.add(oldPath);
     this.truncations.delete(oldPath);
   }
 
   deletePagesFrom(path: string, fromPageIndex: number): void {
     this.assertInitialized();
-    const indices = this.filePageIndices.get(path);
+    // Clean dirty tracking for pages being deleted
+    const indices = this.store.filePageIndices.get(path);
     if (indices) {
-      const keys = this.filePageKeys.get(path);
       for (const [idx, key] of indices) {
         if (idx >= fromPageIndex) {
-          this.pages.delete(key);
           this.dirtyPages.delete(key);
-          keys?.delete(key);
-          indices.delete(idx);
-        }
-      }
-      if (indices.size === 0) {
-        this.filePageIndices.delete(path);
-        this.filePageKeys.delete(path);
-        this.fileMaxIdx.delete(path);
-      } else {
-        const prevMax = this.fileMaxIdx.get(path) ?? -1;
-        if (prevMax >= fromPageIndex) {
-          let newMax = -1;
-          for (const idx of indices.keys()) {
-            if (idx > newMax) newMax = idx;
-          }
-          this.fileMaxIdx.set(path, newMax);
         }
       }
     }
-    // Track the lowest truncation point
+    this.store.deletePagesFrom(path, fromPageIndex);
     const existing = this.truncations.get(path);
     if (existing === undefined || fromPageIndex < existing) {
       this.truncations.set(path, fromPageIndex);
@@ -418,29 +257,25 @@ export class PreloadBackend implements SyncStorageBackend {
 
   readMeta(path: string): FileMeta | null {
     this.assertInitialized();
-    const m = this.meta.get(path);
-    return m ? { ...m } : null;
+    return this.store.readMeta(path);
   }
 
   readMetas(paths: string[]): Array<FileMeta | null> {
     this.assertInitialized();
-    return paths.map((path) => {
-      const m = this.meta.get(path);
-      return m ? { ...m } : null;
-    });
+    return this.store.readMetas(paths);
   }
 
   writeMeta(path: string, meta: FileMeta): void {
     this.assertInitialized();
-    this.meta.set(path, { ...meta });
+    this.store.writeMeta(path, meta);
     this.dirtyMeta.add(path);
     this.deletedMeta.delete(path);
   }
 
   writeMetas(entries: Array<{ path: string; meta: FileMeta }>): void {
     this.assertInitialized();
-    for (const { path, meta } of entries) {
-      this.meta.set(path, { ...meta });
+    this.store.writeMetas(entries);
+    for (const { path } of entries) {
       this.dirtyMeta.add(path);
       this.deletedMeta.delete(path);
     }
@@ -448,15 +283,15 @@ export class PreloadBackend implements SyncStorageBackend {
 
   deleteMeta(path: string): void {
     this.assertInitialized();
-    this.meta.delete(path);
+    this.store.deleteMeta(path);
     this.dirtyMeta.delete(path);
     this.deletedMeta.add(path);
   }
 
   deleteMetas(paths: string[]): void {
     this.assertInitialized();
+    this.store.deleteMetas(paths);
     for (const path of paths) {
-      this.meta.delete(path);
       this.dirtyMeta.delete(path);
       this.deletedMeta.add(path);
     }
@@ -464,7 +299,7 @@ export class PreloadBackend implements SyncStorageBackend {
 
   listFiles(): string[] {
     this.assertInitialized();
-    return [...this.meta.keys()];
+    return this.store.listFiles();
   }
 
   syncAll(
@@ -481,11 +316,10 @@ export class PreloadBackend implements SyncStorageBackend {
   }
 
   cleanupOrphanedPages(): number {
-    const metaPaths = new Set(this.meta.keys());
-    const pagePaths = [...this.filePageKeys.keys()];
+    const pagePaths = [...this.store.filePageKeys.keys()];
     let removed = 0;
     for (const path of pagePaths) {
-      if (!metaPaths.has(path)) {
+      if (!this.store.meta.has(path)) {
         this.deleteFile(path);
         removed++;
       }
@@ -539,10 +373,6 @@ export class PreloadBackend implements SyncStorageBackend {
   async flush(): Promise<void> {
     this.assertInitialized();
 
-    // Fast path: no deletes, truncations, or metadata removals pending.
-    // This is the common steady-state case (normal writes without rename
-    // or unlink). Skip the O(dirty) early/late partitioning and write all
-    // dirty pages + metadata in a single syncAll call.
     if (
       this.deletedFiles.size === 0 &&
       this.deletedMeta.size === 0 &&
@@ -550,12 +380,6 @@ export class PreloadBackend implements SyncStorageBackend {
     ) {
       if (this.dirtyPages.size === 0 && this.dirtyMeta.size === 0) return;
 
-      // Take ownership of the dirty sets. New writes during the async
-      // syncAll go to the fresh empty sets and survive the flush. On
-      // failure, merge the flushed entries back so retry includes them.
-      // This fixes a subtle bug where writePage() to the same key during
-      // flush was silently lost: Set.add(existingKey) is a no-op, so the
-      // post-flush delete(key) cleared the re-dirtied entry.
       const flushedPageKeys = this.dirtyPages;
       const flushedMetaPaths = this.dirtyMeta;
       this.dirtyPages = new Set();
@@ -567,7 +391,7 @@ export class PreloadBackend implements SyncStorageBackend {
         data: Uint8Array;
       }> = [];
       for (const key of flushedPageKeys) {
-        const data = this.pages.get(key);
+        const data = this.store.pages.get(key);
         if (data) {
           const nullIdx = key.indexOf("\0");
           const path = key.substring(0, nullIdx);
@@ -578,7 +402,7 @@ export class PreloadBackend implements SyncStorageBackend {
 
       const metaBatch: Array<{ path: string; meta: FileMeta }> = [];
       for (const path of flushedMetaPaths) {
-        const m = this.meta.get(path);
+        const m = this.store.meta.get(path);
         if (m) metaBatch.push({ path, meta: m });
       }
 
@@ -594,19 +418,6 @@ export class PreloadBackend implements SyncStorageBackend {
       return;
     }
 
-    // Complex path: deletes or truncations are pending. Partition dirty
-    // pages into early (pre-delete) and late (post-delete) batches to
-    // handle delete-then-recreate at the same path.
-    //
-    // Take ownership of dirty page/meta sets: swap them out so new writes
-    // during the async phases below go to fresh empty sets. On success the
-    // old sets are discarded (their contents were flushed). On failure they
-    // are merged back so retry includes them. See fast path comment above.
-    //
-    // Truncations, deletedFiles, and deletedMeta are still snapshot-copied
-    // because their intermediate cleanups already handle re-addition
-    // correctly (truncations check the value before deleting; delete sets
-    // tolerate idempotent re-deletion).
     const flushedPageKeys = this.dirtyPages;
     const flushedMetaPaths = this.dirtyMeta;
     this.dirtyPages = new Set();
@@ -626,7 +437,7 @@ export class PreloadBackend implements SyncStorageBackend {
       data: Uint8Array;
     }> = [];
     for (const key of flushedPageKeys) {
-      const data = this.pages.get(key);
+      const data = this.store.pages.get(key);
       if (data) {
         const nullIdx = key.indexOf("\0");
         const path = key.substring(0, nullIdx);
@@ -640,18 +451,10 @@ export class PreloadBackend implements SyncStorageBackend {
       }
     }
 
-    // Partition dirty metadata the same way as pages.
-    // A path needs late-writing if it appears in EITHER deletedMeta or
-    // deletedFiles. The deletedFiles check is critical: when a file is
-    // deleted and then metadata is re-written at the same path (e.g.,
-    // rename-overwrite), writeMeta() clears the path from deletedMeta.
-    // Without also checking deletedFiles, the new metadata would be
-    // written early (before the delete), creating a crash-safety window
-    // where metadata points to stale or nonexistent pages.
     const earlyMeta: Array<{ path: string; meta: FileMeta }> = [];
     const lateMeta: Array<{ path: string; meta: FileMeta }> = [];
     for (const path of flushedMetaPaths) {
-      const m = this.meta.get(path);
+      const m = this.store.meta.get(path);
       if (m) {
         if (flushedDeletedMeta.has(path) || flushedDeletedFiles.has(path)) {
           lateMeta.push({ path, meta: m });
@@ -662,12 +465,6 @@ export class PreloadBackend implements SyncStorageBackend {
     }
 
     try {
-      // 1. Apply truncations FIRST — before page writes.
-      // Truncations delete stale tail pages from the remote. If a file was
-      // truncated and then extended (e.g., truncate to 100 bytes then write
-      // at offset 8192), the new page at the truncation point is dirty and
-      // will be written in step 2. Without this ordering, page writes would
-      // go to the remote first, then the truncation would delete them.
       if (flushedTruncations.size > 0) {
         await Promise.all(
           [...flushedTruncations].map(([path, fromIndex]) =>
@@ -681,15 +478,10 @@ export class PreloadBackend implements SyncStorageBackend {
         }
       }
 
-      // 2. Atomically write pages + metadata for non-deleted paths.
-      // Uses syncAll so IDB backends commit both in a single transaction,
-      // eliminating the crash window between separate writePages + writeMetas
-      // calls. This matches the SAB bridge path's atomicity guarantee.
       if (earlyBatch.length > 0 || earlyMeta.length > 0) {
         await this.remote.syncAll(earlyBatch, earlyMeta);
       }
 
-      // 3. Batch-delete files from remote (single call instead of O(n))
       if (flushedDeletedFiles.size > 0) {
         await this.remote.deleteFiles([...flushedDeletedFiles]);
       }
@@ -697,7 +489,6 @@ export class PreloadBackend implements SyncStorageBackend {
         this.deletedFiles.delete(path);
       }
 
-      // 4. Batch-delete metadata
       if (flushedDeletedMeta.size > 0) {
         await this.remote.deleteMetas([...flushedDeletedMeta]);
       }
@@ -705,18 +496,10 @@ export class PreloadBackend implements SyncStorageBackend {
         this.deletedMeta.delete(path);
       }
 
-      // 5. Atomically write pages + metadata for delete-then-recreate paths.
-      // Same syncAll guarantee as step 2 — IDB commits both in one transaction.
       if (lateBatch.length > 0 || lateMeta.length > 0) {
         await this.remote.syncAll(lateBatch, lateMeta);
       }
-
-      // Success: flushedPageKeys/flushedMetaPaths are discarded — their
-      // contents were flushed. Any entries added to this.dirtyPages or
-      // this.dirtyMeta during the async work above survive automatically.
     } catch (e) {
-      // Merge flushed dirty entries back so retry includes them.
-      // Entries added during the failed flush are already in the live sets.
       for (const key of flushedPageKeys) this.dirtyPages.add(key);
       for (const path of flushedMetaPaths) this.dirtyMeta.add(path);
       throw e;
@@ -724,125 +507,23 @@ export class PreloadBackend implements SyncStorageBackend {
   }
 
   assertInvariants(): void {
-    const errors: string[] = [];
+    const errors = this.store.assertInvariants();
 
-    // 1. Every key in pages must appear in exactly one filePageKeys set
-    const allTrackedKeys = new Set<string>();
-    for (const [path, keys] of this.filePageKeys) {
-      if (keys.size === 0) {
-        errors.push(`filePageKeys[${path}] is empty (should be deleted)`);
-      }
-      for (const key of keys) {
-        if (allTrackedKeys.has(key)) {
-          errors.push(`filePageKeys: key ${key} appears under multiple paths`);
-        }
-        allTrackedKeys.add(key);
-        if (!this.pages.has(key)) {
-          errors.push(`filePageKeys[${path}] contains ${key} not in pages`);
-        }
-        const nullIdx = key.indexOf("\0");
-        const keyPath = key.substring(0, nullIdx);
-        if (keyPath !== path) {
-          errors.push(
-            `filePageKeys[${path}] contains key with path=${keyPath}`,
-          );
-        }
-      }
-    }
-    for (const key of this.pages.keys()) {
-      if (!allTrackedKeys.has(key)) {
-        errors.push(`pages contains ${key} not tracked in filePageKeys`);
-      }
-    }
-
-    // 2. filePageIndices consistent with filePageKeys
-    for (const [path, indices] of this.filePageIndices) {
-      if (indices.size === 0) {
-        errors.push(`filePageIndices[${path}] is empty (should be deleted)`);
-      }
-      const keys = this.filePageKeys.get(path);
-      if (!keys) {
-        errors.push(
-          `filePageIndices has path ${path} not in filePageKeys`,
-        );
-        continue;
-      }
-      if (indices.size !== keys.size) {
-        errors.push(
-          `filePageIndices[${path}] size ${indices.size} !== filePageKeys[${path}] size ${keys.size}`,
-        );
-      }
-      for (const [pageIndex, key] of indices) {
-        if (!keys.has(key)) {
-          errors.push(
-            `filePageIndices[${path}][${pageIndex}] = ${key} not in filePageKeys[${path}]`,
-          );
-        }
-        const expected = pageKeyStr(path, pageIndex);
-        if (key !== expected) {
-          errors.push(
-            `filePageIndices[${path}][${pageIndex}] = ${key} but expected ${expected}`,
-          );
-        }
-      }
-    }
-    for (const path of this.filePageKeys.keys()) {
-      if (!this.filePageIndices.has(path)) {
-        errors.push(
-          `filePageKeys has path ${path} not in filePageIndices`,
-        );
-      }
-    }
-
-    // 3. fileMaxIdx correct for each file
-    for (const [path, cachedMax] of this.fileMaxIdx) {
-      const indices = this.filePageIndices.get(path);
-      if (!indices || indices.size === 0) {
-        errors.push(
-          `fileMaxIdx[${path}] = ${cachedMax} but no pages exist`,
-        );
-        continue;
-      }
-      let actualMax = -1;
-      for (const idx of indices.keys()) {
-        if (idx > actualMax) actualMax = idx;
-      }
-      if (cachedMax !== actualMax) {
-        errors.push(
-          `fileMaxIdx[${path}] = ${cachedMax} but actual max is ${actualMax}`,
-        );
-      }
-    }
-    for (const path of this.filePageIndices.keys()) {
-      if (!this.fileMaxIdx.has(path)) {
-        errors.push(
-          `filePageIndices has path ${path} not in fileMaxIdx`,
-        );
-      }
-    }
-
-    // 4. Every dirty page key must exist in pages
     for (const key of this.dirtyPages) {
-      if (!this.pages.has(key)) {
+      if (!this.store.pages.has(key)) {
         errors.push(`dirtyPages contains ${key} not in pages`);
       }
     }
 
-    // 5. Every dirty meta path must exist in meta
     for (const path of this.dirtyMeta) {
-      if (!this.meta.has(path)) {
+      if (!this.store.meta.has(path)) {
         errors.push(`dirtyMeta contains ${path} not in meta`);
       }
     }
 
-    // 6. Deleted files should not have pages in local state
     for (const path of this.deletedFiles) {
-      if (this.filePageKeys.has(path)) {
-        // Pages can exist if the file was deleted then recreated at the same path
-        // (rename-overwrite). In that case the path appears in both deletedFiles
-        // (to clean up the old remote pages) and filePageKeys (new local pages).
-        // This is a valid state — check that all such pages are dirty.
-        const keys = this.filePageKeys.get(path)!;
+      if (this.store.filePageKeys.has(path)) {
+        const keys = this.store.filePageKeys.get(path)!;
         for (const key of keys) {
           if (!this.dirtyPages.has(key)) {
             errors.push(
@@ -853,20 +534,14 @@ export class PreloadBackend implements SyncStorageBackend {
       }
     }
 
-    // 7. Deleted meta paths should not exist in meta
     for (const path of this.deletedMeta) {
-      if (this.meta.has(path)) {
+      if (this.store.meta.has(path)) {
         errors.push(`deletedMeta contains ${path} which still exists in meta`);
       }
     }
 
-    // 8. Truncation points: pages beyond the truncation point are only
-    // valid if they're dirty (written after the truncation). The truncation
-    // marker is a flush-time instruction to delete remote pages — locally,
-    // new dirty pages at higher indices are expected when a file is
-    // truncated then extended.
     for (const [path, fromIndex] of this.truncations) {
-      const indices = this.filePageIndices.get(path);
+      const indices = this.store.filePageIndices.get(path);
       if (indices) {
         for (const [idx, key] of indices) {
           if (idx >= fromIndex && !this.dirtyPages.has(key)) {

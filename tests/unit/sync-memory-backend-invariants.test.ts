@@ -53,7 +53,7 @@ describe("SyncMemoryBackend.assertInvariants() violation detection @fast", () =>
   });
 
   function internals(): any {
-    return backend as any;
+    return (backend as any).store;
   }
 
   function setupValidState() {
