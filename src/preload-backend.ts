@@ -723,6 +723,41 @@ export class PreloadBackend implements SyncStorageBackend {
     }
   }
 
+  /**
+   * Release resources held by this backend and its underlying remote.
+   *
+   * Flushes any dirty state first (so pending writes are not lost),
+   * then clears all in-memory state and closes the remote backend
+   * if it supports closing.
+   *
+   * After close(), the backend must not be used until init() is called
+   * again. Idempotent — safe to call multiple times.
+   */
+  async close(): Promise<void> {
+    if (!this.initialized) return;
+
+    if (this.isDirty) {
+      await this.flush();
+    }
+
+    this.pages.clear();
+    this.meta.clear();
+    this.filePageKeys.clear();
+    this.filePageIndices.clear();
+    this.fileMaxIdx.clear();
+    this.dirtyPages.clear();
+    this.dirtyMeta.clear();
+    this.deletedFiles.clear();
+    this.truncations.clear();
+    this.deletedMeta.clear();
+    this.initialized = false;
+    this.initPromise = null;
+
+    if (typeof (this.remote as any).close === "function") {
+      await (this.remote as any).close();
+    }
+  }
+
   assertInvariants(): void {
     const errors: string[] = [];
 
