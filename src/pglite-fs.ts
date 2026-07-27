@@ -145,10 +145,6 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
       if (syncError) throw syncError;
       throw closeError;
     }
-    // Release page cache buffers now that the Emscripten module is shut
-    // down. Without this, up to maxPages * 8 KB of cached page data stays
-    // allocated until the adapter is garbage collected.
-    tomefs?.pageCache.clear();
     if (syncError) throw syncError;
   };
 
