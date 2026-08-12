@@ -282,13 +282,16 @@ export class OpfsSahBackend implements StorageBackend {
     }
 
     const oldSah = await oldHandle.createSyncAccessHandle();
-    const size = oldSah.getSize();
     let data: Uint8Array | null = null;
-    if (size > 0) {
-      data = new Uint8Array(size);
-      oldSah.read(data, { at: 0 });
+    try {
+      const size = oldSah.getSize();
+      if (size > 0) {
+        data = new Uint8Array(size);
+        oldSah.read(data, { at: 0 });
+      }
+    } finally {
+      oldSah.close();
     }
-    oldSah.close();
 
     // Write to new file — wrap in try/catch so we can clean up the
     // partial new file on failure. The old file is still intact at this
@@ -302,7 +305,6 @@ export class OpfsSahBackend implements StorageBackend {
         newSah.write(data, { at: 0 });
         newSah.flush();
       } catch (err) {
-        newSah.close();
         try {
           await this.pagesDir!.removeEntry(newEncoded);
         } catch (cleanupErr) {
@@ -314,8 +316,9 @@ export class OpfsSahBackend implements StorageBackend {
           }
         }
         throw err;
+      } finally {
+        newSah.close();
       }
-      newSah.close();
     } else {
       await this.pagesDir!.getFileHandle(newEncoded, { create: true });
     }
