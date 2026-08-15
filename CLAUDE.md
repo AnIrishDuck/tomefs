@@ -9,7 +9,7 @@ tomefs is a bounded, page-cached Emscripten filesystem for PGlite. It replaces I
 ```bash
 npm install
 npm run build          # TypeScript compilation (tsconfig.build.json)
-npm test               # Full test suite (2300+ tests)
+npm test               # Full test suite (4700+ tests)
 npm run test:fast      # Smoke tests tagged @fast (~15s)
 npm run bench          # Performance benchmarks
 ```
@@ -21,20 +21,26 @@ The `TOMEFS_BACKEND=tomefs` env var switches conformance tests to run against to
 ## Architecture
 
 ```
-src/tomefs.ts          — Emscripten FS implementation (node_ops, stream_ops)
-src/sync-page-cache.ts — Bounded LRU page cache with dirty tracking
-src/page-cache.ts      — Async page cache variant
-src/idb-backend.ts     — IndexedDB storage backend
-src/opfs-backend.ts    — OPFS storage backend
-src/preload-backend.ts — Graceful degradation without SharedArrayBuffer
-src/sab-client.ts      — SAB+Atomics sync bridge (worker side)
-src/sab-worker.ts      — SAB+Atomics sync bridge (storage worker side)
-src/sab-protocol.ts    — Shared protocol constants
-src/pglite-fs.ts       — PGlite adapter (extends MemoryFS)
-src/pglite.ts          — Public re-export for tomefs/pglite entry point
-src/worker.ts          — Public re-export for tomefs/worker entry point
-src/index.ts           — Main public API
-src/types.ts           — PAGE_SIZE (8192), FileMeta, PageKey, constants
+src/tomefs.ts              — Emscripten FS implementation (node_ops, stream_ops)
+src/sync-page-cache.ts     — Bounded LRU page cache with dirty tracking
+src/page-cache.ts          — Async page cache variant
+src/idb-backend.ts         — IndexedDB storage backend
+src/opfs-backend.ts        — OPFS storage backend (directory-per-file model)
+src/opfs-sah-backend.ts    — OPFS SyncAccessHandle backend
+src/opfs-utils.ts          — Shared OPFS utility functions
+src/preload-backend.ts     — Graceful degradation without SharedArrayBuffer
+src/sab-client.ts          — SAB+Atomics sync bridge (worker side)
+src/sab-worker.ts          — SAB+Atomics sync bridge (storage worker side)
+src/sab-protocol.ts        — Shared protocol constants
+src/storage-backend.ts     — StorageBackend interface (async)
+src/sync-storage-backend.ts — SyncStorageBackend interface
+src/memory-backend.ts      — Async in-memory storage backend
+src/sync-memory-backend.ts — Sync in-memory storage backend (default for testing)
+src/pglite-fs.ts           — PGlite adapter (extends MemoryFS)
+src/pglite.ts              — Public re-export for tomefs/pglite entry point
+src/worker.ts              — Public re-export for tomefs/worker entry point
+src/index.ts               — Main public API
+src/types.ts               — PAGE_SIZE (8192), FileMeta, PageKey, constants
 ```
 
 Three package entry points: `.` (main), `./worker`, `./pglite`.
