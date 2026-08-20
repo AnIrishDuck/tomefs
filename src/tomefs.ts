@@ -787,6 +787,36 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
   }
 
   /**
+   * Move a mount-relative path out of the reserved backend namespace.
+   *
+   * tomefs reserves backend keys whose first path component starts with
+   * exactly two underscores: CLEAN_MARKER_PATH, the /__deleted_* tombstones
+   * minted by rename and unlink-with-open-fds, and the /__root_* keys given
+   * to parentless nodes. Those are all legal POSIX filenames too, so a user
+   * file at the mount root can claim one of them — after which restoreTree
+   * classifies it as an internal marker and drops it, losing the file.
+   *
+   * Escaping prepends one underscore to any first component that already
+   * starts with two, so encoded user paths carry either fewer than two or
+   * more than two leading underscores — never the reserved shape of exactly
+   * two. Paths whose first component starts with anything else are returned
+   * unchanged, keeping the encoding backward compatible with data written
+   * before it existed.
+   */
+  function escapeStoragePath(path: string): string {
+    return path.startsWith("/__") ? "/_" + path.substring(1) : path;
+  }
+
+  /**
+   * Inverse of escapeStoragePath for a first-component name. Applied when
+   * restoreTree splits a stored path back into parent and name — only the
+   * first component is ever escaped, so deeper names decode as themselves.
+   */
+  function unescapeStorageName(name: string): string {
+    return name.startsWith("___") ? name.substring(1) : name;
+  }
+
+  /**
    * Compute a mount-relative storage path for a node given its parent and name.
    *
    * For nodes in the tomefs mount tree, the parent chain terminates at the
@@ -806,9 +836,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
     }
     const raw = "/" + parts.join("/");
     if (mountPrefix && raw.startsWith(mountPrefix + "/")) {
-      return raw.substring(mountPrefix.length);
+      return escapeStoragePath(raw.substring(mountPrefix.length));
     }
-    return raw;
+    return escapeStoragePath(raw);
   }
 
   /**
@@ -1152,9 +1182,9 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
   function nodeStoragePath(node: any, mountPrefix: string): string {
     const full = nodePath(node);
     if (mountPrefix && full.startsWith(mountPrefix + "/")) {
-      return full.substring(mountPrefix.length);
+      return escapeStoragePath(full.substring(mountPrefix.length));
     }
-    return full;
+    return escapeStoragePath(full);
   }
 
   /**
@@ -1223,7 +1253,10 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
         }
         // Recurse into children
         for (const name of Object.keys(node.contents)) {
-          const childPath = path === "/" ? `/${name}` : `${path}/${name}`;
+          const childPath =
+            path === "/"
+              ? escapeStoragePath(`/${name}`)
+              : `${path}/${name}`;
           walk(node.contents[name], childPath);
         }
       }
@@ -1307,7 +1340,11 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
       // Split path into parent + name
       const lastSlash = path.lastIndexOf("/");
       const parentPath = path.substring(0, lastSlash) || "/";
-      const name = path.substring(lastSlash + 1);
+      const rawName = path.substring(lastSlash + 1);
+      // Only the first path component is escaped, so a name is decoded
+      // exactly when it sits directly under the mount root.
+      const name =
+        parentPath === "/" ? unescapeStorageName(rawName) : rawName;
       if (!name) continue; // skip root
 
       // O(1) parent lookup via map instead of O(depth) tree walk
