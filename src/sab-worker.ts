@@ -188,12 +188,23 @@ export class SabWorker {
       Atomics.store(this.controlView, SLOT_STATUS, STATUS_RESPONSE);
       Atomics.notify(this.controlView, SLOT_STATUS);
     } catch (err: unknown) {
-      const errMsg =
-        err instanceof Error ? err.message : "Unknown bridge error";
-      const errLen = encodeMessage(this.dataView, this.uint8View, {
-        error: errMsg,
-      });
-      Atomics.store(this.controlView, SLOT_DATA_LEN, errLen);
+      try {
+        const errMsg =
+          err instanceof Error ? err.message : "Unknown bridge error";
+        const errLen = encodeMessage(this.dataView, this.uint8View, {
+          error: errMsg,
+        });
+        Atomics.store(this.controlView, SLOT_DATA_LEN, errLen);
+      } catch {
+        try {
+          const errLen = encodeMessage(this.dataView, this.uint8View, {
+            error: "internal error",
+          });
+          Atomics.store(this.controlView, SLOT_DATA_LEN, errLen);
+        } catch {
+          Atomics.store(this.controlView, SLOT_DATA_LEN, 0);
+        }
+      }
       Atomics.store(this.controlView, SLOT_STATUS, STATUS_ERROR);
       Atomics.notify(this.controlView, SLOT_STATUS);
     }

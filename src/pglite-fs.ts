@@ -92,9 +92,10 @@ export function createTomeFSPGlite(options: TomeFSPGliteOptions): any {
           (mod: any) => {
             if (tomefs) return; // Already mounted
             moduleFS = mod.FS;
-            tomefs = createTomeFS(mod.FS, { backend, maxPages });
+            const fs = createTomeFS(mod.FS, { backend, maxPages });
             mod.FS.mkdir(PGLITE_DATA);
-            mod.FS.mount(tomefs, {}, PGLITE_DATA);
+            mod.FS.mount(fs, {}, PGLITE_DATA);
+            tomefs = fs;
           },
         ],
       },

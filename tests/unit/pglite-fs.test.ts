@@ -213,6 +213,75 @@ describe("pglite-fs adapter @fast", () => {
 
       expect(adapter.tomefsInstance).not.toBeNull();
     });
+
+    it("allows retry when mkdir throws", async () => {
+      const adapter = createTomeFSPGlite({
+        MemoryFS: FakeMemoryFS as any,
+        backend,
+      });
+
+      const result = await adapter.init({}, {});
+
+      let mkdirShouldThrow = true;
+      const mountCalls: Array<{ fs: any; mountpoint: string }> = [];
+      const fakeModule = {
+        FS: {
+          filesystems: {},
+          mkdir(_path: string) {
+            if (mkdirShouldThrow) throw new Error("EEXIST");
+          },
+          mount(fs: any, _opts: any, mountpoint: string) {
+            mountCalls.push({ fs, mountpoint });
+          },
+          syncfs(_populate: boolean, callback: (err: Error | null) => void) {
+            callback(null);
+          },
+        },
+      };
+
+      // First invocation: mkdir throws — tomefs should NOT be set
+      expect(() => runPreRunHooks(result, fakeModule)).toThrow("EEXIST");
+      expect(adapter.tomefsInstance).toBeNull();
+      expect(mountCalls.length).toBe(0);
+
+      // Second invocation: mkdir succeeds — should retry successfully
+      mkdirShouldThrow = false;
+      runPreRunHooks(result, fakeModule);
+      expect(adapter.tomefsInstance).not.toBeNull();
+      expect(mountCalls.length).toBe(1);
+    });
+
+    it("allows retry when mount throws", async () => {
+      const adapter = createTomeFSPGlite({
+        MemoryFS: FakeMemoryFS as any,
+        backend,
+      });
+
+      const result = await adapter.init({}, {});
+
+      let mountShouldThrow = true;
+      const fakeModule = {
+        FS: {
+          filesystems: {},
+          mkdir() {},
+          mount(_fs: any, _opts: any, _mountpoint: string) {
+            if (mountShouldThrow) throw new Error("mount failed");
+          },
+          syncfs(_populate: boolean, callback: (err: Error | null) => void) {
+            callback(null);
+          },
+        },
+      };
+
+      // First invocation: mount throws — tomefs should NOT be set
+      expect(() => runPreRunHooks(result, fakeModule)).toThrow("mount failed");
+      expect(adapter.tomefsInstance).toBeNull();
+
+      // Second invocation: mount succeeds — should retry successfully
+      mountShouldThrow = false;
+      runPreRunHooks(result, fakeModule);
+      expect(adapter.tomefsInstance).not.toBeNull();
+    });
   });
 
   describe("syncToFs", () => {
