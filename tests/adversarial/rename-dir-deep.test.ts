@@ -17,54 +17,11 @@
  * Ethos §9: "Write tests designed to break tomefs specifically — things
  * that pass against MEMFS but expose real bugs in the page cache layer."
  */
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
-import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const O = {
-  RDONLY: 0,
-  WRONLY: 1,
-  RDWR: 2,
-  CREAT: 64,
-  TRUNC: 512,
-  APPEND: 1024,
-} as const;
-
-const MOUNT = "/tome";
-
-function encode(s: string): Uint8Array {
-  return new TextEncoder().encode(s);
-}
-
-function decode(buf: Uint8Array, length?: number): string {
-  return new TextDecoder().decode(
-    length !== undefined ? buf.subarray(0, length) : buf,
-  );
-}
-
-async function mountTome(backend: SyncMemoryBackend, maxPages?: number) {
-  const { default: createModule } = await import(
-    join(__dirname, "../harness/emscripten_fs.mjs")
-  );
-  const Module = await createModule();
-  const FS = Module.FS;
-  const tomefs = createTomeFS(FS, { backend, maxPages });
-  FS.mkdir(MOUNT);
-  FS.mount(tomefs, {}, MOUNT);
-  return { FS, tomefs, Module };
-}
-
-function syncAndUnmount(FS: any, tomefs: any) {
-  tomefs.syncfs(FS.lookupPath(MOUNT).node.mount, false, (err: any) => {
-    if (err) throw err;
-  });
-  FS.unmount(MOUNT);
-}
+import { mountTome, syncAndUnmount, MOUNT } from "../harness/tome-mount.js";
+import { encode, decode, O } from "../harness/emscripten-fs.js";
 
 /** Write a file with deterministic content derived from its path. */
 function writeFile(FS: any, path: string, content: string) {
