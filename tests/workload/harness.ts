@@ -13,21 +13,13 @@ import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { PAGE_SIZE } from "../../src/types.js";
 import type { EmscriptenFS, EmscriptenStream } from "../harness/emscripten-fs.js";
 import { O, SEEK_SET, SEEK_END } from "../harness/emscripten-fs.js";
+import { CACHE_CONFIGS } from "../harness/cache-configs.js";
+import type { CacheSize } from "../harness/cache-configs.js";
 
-export { O, SEEK_SET, SEEK_END, PAGE_SIZE };
-export type { EmscriptenFS, EmscriptenStream };
+export { O, SEEK_SET, SEEK_END, PAGE_SIZE, CACHE_CONFIGS };
+export type { EmscriptenFS, EmscriptenStream, CacheSize };
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-/** Cache size configurations for the pressure matrix. */
-export const CACHE_CONFIGS = {
-  tiny: 4,      // 32 KB — maximum eviction pressure
-  small: 16,    // 128 KB — moderate eviction
-  medium: 64,   // 512 KB — working set partially fits
-  large: 4096,  // 32 MB — working set fits, baseline
-} as const;
-
-export type CacheSize = keyof typeof CACHE_CONFIGS;
 
 /** The mount point for tomefs inside the Emscripten FS. */
 const TOME_MOUNT = "/tome";
