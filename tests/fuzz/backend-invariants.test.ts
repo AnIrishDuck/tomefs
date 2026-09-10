@@ -23,54 +23,7 @@ import { PreloadBackend } from "../../src/preload-backend.js";
 import { MemoryBackend } from "../../src/memory-backend.js";
 import { PAGE_SIZE, pageKeyStr } from "../../src/types.js";
 import type { FileMeta } from "../../src/types.js";
-
-// ---------------------------------------------------------------
-// Seeded PRNG (xorshift128+)
-// ---------------------------------------------------------------
-
-class Rng {
-  private s0: number;
-  private s1: number;
-
-  constructor(seed: number) {
-    this.s0 = this.splitmix32(seed);
-    this.s1 = this.splitmix32(this.s0);
-    if (this.s0 === 0 && this.s1 === 0) this.s1 = 1;
-  }
-
-  private splitmix32(x: number): number {
-    x = (x + 0x9e3779b9) | 0;
-    x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
-    x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
-    return (x ^ (x >>> 16)) >>> 0;
-  }
-
-  next(): number {
-    let s0 = this.s0;
-    let s1 = this.s1;
-    const result = (s0 + s1) >>> 0;
-    s1 ^= s0;
-    this.s0 = ((s0 << 26) | (s0 >>> 6)) ^ s1 ^ (s1 << 9);
-    this.s1 = (s1 << 13) | (s1 >>> 19);
-    return result;
-  }
-
-  int(min: number, max: number): number {
-    return min + (this.next() % (max - min + 1));
-  }
-
-  pick<T>(arr: T[]): T {
-    return arr[this.next() % arr.length];
-  }
-
-  bytes(len: number): Uint8Array {
-    const buf = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-      buf[i] = this.next() & 0xff;
-    }
-    return buf;
-  }
-}
+import { Rng } from "../harness/rng.js";
 
 // ---------------------------------------------------------------
 // Naive reference model (no secondary indexes)
@@ -230,23 +183,23 @@ type Op =
 const FILE_PATHS = ["/a", "/b", "/c", "/d", "/e"];
 
 function generateOp(rng: Rng): Op {
-  const opType = rng.int(0, 12);
+  const opType = rng.int(13);
   switch (opType) {
     case 0: {
       return {
         type: "writePage",
         path: rng.pick(FILE_PATHS),
-        pageIndex: rng.int(0, 7),
+        pageIndex: rng.int(8),
         data: rng.bytes(PAGE_SIZE),
       };
     }
     case 1: {
-      const count = rng.int(1, 4);
+      const count = rng.int(4) + 1;
       const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
       for (let i = 0; i < count; i++) {
         pages.push({
           path: rng.pick(FILE_PATHS),
-          pageIndex: rng.int(0, 7),
+          pageIndex: rng.int(8),
           data: rng.bytes(PAGE_SIZE),
         });
       }
@@ -259,7 +212,7 @@ function generateOp(rng: Rng): Op {
       return {
         type: "deletePagesFrom",
         path: rng.pick(FILE_PATHS),
-        fromPageIndex: rng.int(0, 5),
+        fromPageIndex: rng.int(6),
       };
     }
     case 4: {
@@ -273,33 +226,33 @@ function generateOp(rng: Rng): Op {
       return {
         type: "writeMeta",
         path: rng.pick(FILE_PATHS),
-        meta: { size: rng.int(0, PAGE_SIZE * 8), mode: 0o100644, ctime: Date.now(), mtime: Date.now() },
+        meta: { size: rng.int(PAGE_SIZE * 8 + 1), mode: 0o100644, ctime: Date.now(), mtime: Date.now() },
       };
     }
     case 6: {
       return { type: "deleteMeta", path: rng.pick(FILE_PATHS) };
     }
     case 7: {
-      const count = rng.int(1, 3);
+      const count = rng.int(3) + 1;
       const pages: Array<{ path: string; pageIndex: number; data: Uint8Array }> = [];
       const metas: Array<{ path: string; meta: FileMeta }> = [];
       for (let i = 0; i < count; i++) {
         pages.push({
           path: rng.pick(FILE_PATHS),
-          pageIndex: rng.int(0, 7),
+          pageIndex: rng.int(8),
           data: rng.bytes(PAGE_SIZE),
         });
       }
-      for (let i = 0; i < rng.int(0, 2); i++) {
+      for (let i = 0; i < rng.int(3); i++) {
         metas.push({
           path: rng.pick(FILE_PATHS),
-          meta: { size: rng.int(0, PAGE_SIZE * 8), mode: 0o100644, ctime: Date.now(), mtime: Date.now() },
+          meta: { size: rng.int(PAGE_SIZE * 8 + 1), mode: 0o100644, ctime: Date.now(), mtime: Date.now() },
         });
       }
       return { type: "syncAll", pages, metas };
     }
     case 8: {
-      const count = rng.int(1, 3);
+      const count = rng.int(3) + 1;
       const paths = new Set<string>();
       for (let i = 0; i < count; i++) {
         paths.add(rng.pick(FILE_PATHS));
@@ -307,7 +260,7 @@ function generateOp(rng: Rng): Op {
       return { type: "deleteAll", paths: [...paths] };
     }
     case 9: {
-      const count = rng.int(1, 3);
+      const count = rng.int(3) + 1;
       const paths = new Set<string>();
       for (let i = 0; i < count; i++) {
         paths.add(rng.pick(FILE_PATHS));
@@ -315,18 +268,18 @@ function generateOp(rng: Rng): Op {
       return { type: "deleteFiles", paths: [...paths] };
     }
     case 10: {
-      const count = rng.int(1, 3);
+      const count = rng.int(3) + 1;
       const metas: Array<{ path: string; meta: FileMeta }> = [];
       for (let i = 0; i < count; i++) {
         metas.push({
           path: rng.pick(FILE_PATHS),
-          meta: { size: rng.int(0, PAGE_SIZE * 8), mode: 0o100644, ctime: Date.now(), mtime: Date.now() },
+          meta: { size: rng.int(PAGE_SIZE * 8 + 1), mode: 0o100644, ctime: Date.now(), mtime: Date.now() },
         });
       }
       return { type: "writeMetas", metas };
     }
     case 11: {
-      const count = rng.int(1, 3);
+      const count = rng.int(3) + 1;
       const paths = new Set<string>();
       for (let i = 0; i < count; i++) {
         paths.add(rng.pick(FILE_PATHS));
