@@ -1,5 +1,3 @@
-import type { StorageBackend } from "./storage-backend.js";
-import type { FileMeta } from "./types.js";
 import { PAGE_SIZE } from "./types.js";
 import {
   type IterableDirectoryHandle,
@@ -7,8 +5,8 @@ import {
   PAGES_DIR,
   META_DIR,
   encodePath,
-  decodePath,
 } from "./opfs-utils.js";
+import { OpfsBackendBase } from "./opfs-backend-base.js";
 
 // FileSystemSyncAccessHandle is declared in src/opfs-augments.d.ts
 // (the Web API lives in lib.webworker.d.ts but this project only
@@ -33,41 +31,15 @@ export interface OpfsSahBackendOptions {
  *
  * Metadata is stored as separate JSON files (same as OpfsBackend).
  */
-export class OpfsSahBackend implements StorageBackend {
-  private root: FileSystemDirectoryHandle | null;
-  private pagesDir: FileSystemDirectoryHandle | null = null;
-  private metaDir: FileSystemDirectoryHandle | null = null;
-  private initPromise: Promise<void> | null = null;
+export class OpfsSahBackend extends OpfsBackendBase {
   private readonly maxOpenHandles: number;
 
   private handleCache = new Map<string, SyncAccessHandle>();
   private handleLru: string[] = [];
 
   constructor(options?: OpfsSahBackendOptions) {
-    this.root = options?.root ?? null;
+    super(options?.root);
     this.maxOpenHandles = options?.maxOpenHandles ?? 64;
-  }
-
-  private async init(): Promise<void> {
-    if (this.pagesDir && this.metaDir) return;
-    if (this.initPromise) return this.initPromise;
-
-    this.initPromise = (async () => {
-      if (!this.root) {
-        this.root = await navigator.storage.getDirectory();
-      }
-      this.pagesDir = await this.root.getDirectoryHandle(PAGES_DIR, {
-        create: true,
-      });
-      this.metaDir = await this.root.getDirectoryHandle(META_DIR, {
-        create: true,
-      });
-    })().catch((err) => {
-      this.initPromise = null;
-      throw err;
-    });
-
-    return this.initPromise;
   }
 
   private async getHandle(
@@ -357,100 +329,6 @@ export class OpfsSahBackend implements StorageBackend {
     return results;
   }
 
-  async readMeta(path: string): Promise<FileMeta | null> {
-    await this.init();
-    const encoded = encodePath(path);
-
-    let handle: FileSystemFileHandle;
-    try {
-      handle = await this.metaDir!.getFileHandle(encoded);
-    } catch (err) {
-      if (isNotFoundError(err)) return null;
-      throw err;
-    }
-
-    const file = await handle.getFile();
-    const text = await file.text();
-    try {
-      return JSON.parse(text) as FileMeta;
-    } catch {
-      return null;
-    }
-  }
-
-  async readMetas(paths: string[]): Promise<Array<FileMeta | null>> {
-    if (paths.length === 0) return [];
-    if (paths.length === 1) return [await this.readMeta(paths[0])];
-    return Promise.all(paths.map((path) => this.readMeta(path)));
-  }
-
-  async writeMeta(path: string, meta: FileMeta): Promise<void> {
-    await this.init();
-    const encoded = encodePath(path);
-    const handle = await this.metaDir!.getFileHandle(encoded, {
-      create: true,
-    });
-    const writable = await handle.createWritable();
-    try {
-      await writable.write(JSON.stringify(meta));
-    } finally {
-      await writable.close();
-    }
-  }
-
-  async writeMetas(
-    entries: Array<{ path: string; meta: FileMeta }>,
-  ): Promise<void> {
-    if (entries.length === 0) return;
-    if (entries.length === 1) {
-      await this.writeMeta(entries[0].path, entries[0].meta);
-      return;
-    }
-    await Promise.all(
-      entries.map(({ path, meta }) => this.writeMeta(path, meta)),
-    );
-  }
-
-  async deleteMeta(path: string): Promise<void> {
-    await this.init();
-    const encoded = encodePath(path);
-    try {
-      await this.metaDir!.removeEntry(encoded);
-    } catch (err) {
-      if (!isNotFoundError(err)) throw err;
-    }
-  }
-
-  async deleteMetas(paths: string[]): Promise<void> {
-    if (paths.length === 0) return;
-    if (paths.length === 1) {
-      await this.deleteMeta(paths[0]);
-      return;
-    }
-    await Promise.all(paths.map((path) => this.deleteMeta(path)));
-  }
-
-  async listFiles(): Promise<string[]> {
-    await this.init();
-    const paths: string[] = [];
-    for await (const name of (this.metaDir as IterableDirectoryHandle).keys()) {
-      paths.push(decodePath(name));
-    }
-    return paths;
-  }
-
-  async syncAll(
-    pages: Array<{ path: string; pageIndex: number; data: Uint8Array }>,
-    metas: Array<{ path: string; meta: FileMeta }>,
-  ): Promise<void> {
-    // Write pages BEFORE metadata: a crash after pages but before metadata
-    // leaves orphaned pages (cleaned up by cleanupOrphanedPages on next
-    // mount). The reverse would persist the clean-shutdown marker (part of
-    // the metadata batch) with stale page data — silent data corruption.
-    await this.writePages(pages);
-    await this.writeMetas(metas);
-  }
-
   async cleanupOrphanedPages(): Promise<number> {
     await this.init();
 
@@ -476,16 +354,6 @@ export class OpfsSahBackend implements StorageBackend {
     }
 
     return orphans.length;
-  }
-
-  async deleteAll(paths: string[]): Promise<void> {
-    if (paths.length === 0) return;
-    // Delete metadata BEFORE pages. OPFS has no multi-operation transactions,
-    // so a crash between the two phases is possible. Metadata-first ensures a
-    // crash leaves orphaned pages (cleaned up by cleanupOrphanedPages) rather
-    // than ghost metadata entries (files visible in listFiles with no data).
-    await this.deleteMetas(paths);
-    await this.deleteFiles(paths);
   }
 
   async destroy(): Promise<void> {
