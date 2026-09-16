@@ -13,46 +13,11 @@
  * 3. The orphansDeleted counter in TomeFSStats reflects page orphans
  * 4. Page orphans from simulated crash scenarios are cleaned up on remount
  */
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
-import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const O = {
-  RDONLY: 0,
-  WRONLY: 1,
-  RDWR: 2,
-  CREAT: 64,
-  TRUNC: 512,
-} as const;
-
-const MOUNT = "/tome";
-
-async function mountTome(backend: SyncMemoryBackend, maxPages?: number) {
-  const { default: createModule } = await import(
-    join(__dirname, "../harness/emscripten_fs.mjs")
-  );
-  const Module = await createModule();
-  const FS = Module.FS;
-  const tomefs = createTomeFS(FS, { backend, maxPages });
-  FS.mkdir(MOUNT);
-  FS.mount(tomefs, {}, MOUNT);
-  return { FS, tomefs };
-}
-
-function syncfs(FS: any, tomefs: any, populate = false) {
-  tomefs.syncfs(
-    FS.lookupPath(MOUNT).node.mount,
-    populate,
-    (err: any) => {
-      if (err) throw err;
-    },
-  );
-}
+import { mountTome, syncfs, MOUNT } from "../harness/tome-mount.js";
+import { O } from "../harness/emscripten-fs.js";
 
 describe("SyncMemoryBackend.cleanupOrphanedPages", () => {
   let backend: SyncMemoryBackend;
