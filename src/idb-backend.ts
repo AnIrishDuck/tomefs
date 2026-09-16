@@ -708,6 +708,11 @@ export class IdbBackend implements StorageBackend {
       const request = indexedDB.deleteDatabase(this.dbName);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
+      request.onblocked = () => {
+        reject(new Error(
+          `IndexedDB delete blocked: database "${this.dbName}" is held by another connection`,
+        ));
+      };
     });
   }
 }
