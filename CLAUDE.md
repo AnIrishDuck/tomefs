@@ -9,7 +9,7 @@ tomefs is a bounded, page-cached Emscripten filesystem for PGlite. It replaces I
 ```bash
 npm install
 npm run build          # TypeScript compilation (tsconfig.build.json)
-npm test               # Full test suite (2300+ tests)
+npm test               # Full test suite (4700+ tests)
 npm run test:fast      # Smoke tests tagged @fast (~15s)
 npm run bench          # Performance benchmarks
 ```
