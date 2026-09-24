@@ -26,6 +26,7 @@ import {
   encodeMessage,
   decodeMessage,
   opcodeName,
+  SabBufferOverflowError,
 } from "./sab-protocol.js";
 
 /**
@@ -588,7 +589,7 @@ export class SabClient implements SyncStorageBackend {
         // the chunked path. encodeMessage throws before signaling the
         // worker, so the bridge is still in IDLE state and safe to reuse.
         // Re-throw non-overflow errors (e.g., worker timeout, decode errors).
-        if (!(e instanceof Error && e.message.includes("SAB buffer overflow"))) {
+        if (!(e instanceof SabBufferOverflowError)) {
           throw e;
         }
       }
@@ -702,7 +703,7 @@ export class SabClient implements SyncStorageBackend {
       const chunks = pages.map((p) => p.data);
       this.call(OpCode.SYNC_ALL, { pages: pageMeta, metas }, chunks);
     } catch (e) {
-      if (!(e instanceof Error && e.message.includes("SAB buffer overflow"))) {
+      if (!(e instanceof SabBufferOverflowError)) {
         throw e;
       }
       if (pages.length > 0) this.writePages(pages);
