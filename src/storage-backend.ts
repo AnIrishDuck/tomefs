@@ -108,4 +108,13 @@ export interface StorageBackend {
    * Optional — backends that don't support persistence may omit this.
    */
   cleanupOrphanedPages?(): Promise<number>;
+
+  /**
+   * Release resources held by this backend (database connections, file
+   * handles) without deleting stored data.
+   *
+   * After close(), the backend must not be used until re-initialized.
+   * Optional — only needed by backends that hold persistent resources.
+   */
+  close?(): void | Promise<void>;
 }
