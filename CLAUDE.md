@@ -9,7 +9,7 @@ tomefs is a bounded, page-cached Emscripten filesystem for PGlite. It replaces I
 ```bash
 npm install
 npm run build          # TypeScript compilation (tsconfig.build.json)
-npm test               # Full test suite (2300+ tests)
+npm test               # Full test suite (4700+ tests)
 npm run test:fast      # Smoke tests tagged @fast (~15s)
 npm run bench          # Performance benchmarks
 ```
@@ -42,7 +42,7 @@ Three package entry points: `.` (main), `./worker`, `./pglite`.
 ## Test Structure
 
 ```
-tests/conformance/     — POSIX conformance (22 files, ported from Emscripten C tests)
+tests/conformance/     — POSIX conformance (35 files, ported from Emscripten C tests)
 tests/unit/            — Component-level tests (page cache, backends, SAB bridge)
 tests/integration/     — Full-stack integration (tomefs + SAB + backend)
 tests/adversarial/     — Edge cases targeting page cache seams
