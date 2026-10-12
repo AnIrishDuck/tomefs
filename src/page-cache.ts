@@ -866,6 +866,32 @@ export class PageCache {
   }
 
   /**
+   * Release all cached pages and internal state.
+   *
+   * Drops all cached pages, clears secondary indexes, releases pooled
+   * buffers, and resets performance counters. Does NOT flush dirty pages
+   * — the caller must flush before calling clear() if persistence is
+   * needed (e.g., call flushAll() before clear).
+   *
+   * Use after closing to release the cache's memory (up to
+   * maxPages * PAGE_SIZE bytes of page buffers plus the buffer pool).
+   * Without clear(), these buffers stay allocated until the PageCache
+   * object itself is garbage collected.
+   */
+  clear(): void {
+    this.cache.clear();
+    this.mruPage = null;
+    this.filePages.clear();
+    this.dirtyKeys.clear();
+    this.dirtyFileKeys.clear();
+    this.bufferPool.length = 0;
+    this._hits = 0;
+    this._misses = 0;
+    this._evictions = 0;
+    this._flushes = 0;
+  }
+
+  /**
    * Add a cache key to the filePages index for the given path.
    */
   private trackPage(path: string, key: string): void {
