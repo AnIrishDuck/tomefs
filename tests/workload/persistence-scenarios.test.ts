@@ -15,19 +15,9 @@ import { describe, it, expect } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
+import { O, SEEK_END } from "../harness/emscripten-fs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const O = {
-  RDONLY: 0,
-  WRONLY: 1,
-  RDWR: 2,
-  CREAT: 64,
-  TRUNC: 512,
-  APPEND: 1024,
-} as const;
-
-const SEEK_END = 2;
 
 const MOUNT = "/tome";
 
