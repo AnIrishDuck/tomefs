@@ -9,65 +9,11 @@
  * A shared SyncMemoryBackend instance survives across mount/unmount,
  * simulating the role IDB will play in production.
  */
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
-import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-/** Open flag constants (Linux/WASM values). */
-const O = {
-  RDONLY: 0,
-  WRONLY: 1,
-  RDWR: 2,
-  CREAT: 64,
-  TRUNC: 512,
-  APPEND: 1024,
-} as const;
-
-const MOUNT = "/tome";
-
-/** Encode a string to Uint8Array. */
-function encode(s: string): Uint8Array {
-  return new TextEncoder().encode(s);
-}
-
-/** Decode a Uint8Array to string. */
-function decode(buf: Uint8Array, length?: number): string {
-  return new TextDecoder().decode(
-    length !== undefined ? buf.subarray(0, length) : buf,
-  );
-}
-
-/**
- * Create a fresh Emscripten module, mount tomefs at MOUNT with the given
- * backend, and return FS + tomefs instance.
- */
-async function mountTome(backend: SyncMemoryBackend, maxPages?: number) {
-  const { default: createModule } = await import(
-    join(__dirname, "../harness/emscripten_fs.mjs")
-  );
-  const Module = await createModule();
-  const FS = Module.FS;
-  const tomefs = createTomeFS(FS, { backend, maxPages });
-  FS.mkdir(MOUNT);
-  FS.mount(tomefs, {}, MOUNT);
-  return { FS, tomefs, Module };
-}
-
-/**
- * Sync (persist metadata) then unmount tomefs.
- */
-function syncAndUnmount(FS: any, tomefs: any) {
-  // Trigger syncfs to persist directory tree metadata
-  tomefs.syncfs(FS.lookupPath(MOUNT).node.mount, false, (err: any) => {
-    if (err) throw err;
-  });
-  FS.unmount(MOUNT);
-}
+import { mountTome, syncAndUnmount, MOUNT } from "../harness/tome-mount.js";
+import { encode, decode, O } from "../harness/emscripten-fs.js";
 
 describe("persistence (Batch 6)", () => {
   let backend: SyncMemoryBackend;

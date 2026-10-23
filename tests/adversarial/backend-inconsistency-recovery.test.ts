@@ -15,51 +15,11 @@
  * Ethos §9: "Write tests designed to break tomefs specifically — target the
  * seams: metadata updates after flush, dirty flush ordering"
  */
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
-import { createTomeFS } from "../../src/tomefs.js";
 import { PAGE_SIZE } from "../../src/types.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const O = {
-  RDONLY: 0,
-  WRONLY: 1,
-  RDWR: 2,
-  CREAT: 64,
-  TRUNC: 512,
-} as const;
-
-const S_IFDIR = 0o040000;
-const S_IFREG = 0o100000;
-const S_IFLNK = 0o120000;
-
-const MOUNT = "/tome";
-
-async function mountTome(backend: SyncMemoryBackend, maxPages?: number) {
-  const { default: createModule } = await import(
-    join(__dirname, "../harness/emscripten_fs.mjs")
-  );
-  const Module = await createModule();
-  const FS = Module.FS;
-  const tomefs = createTomeFS(FS, { backend, maxPages });
-  FS.mkdir(MOUNT);
-  FS.mount(tomefs, {}, MOUNT);
-  return { FS, tomefs, Module };
-}
-
-function syncfs(FS: any, tomefs: any) {
-  tomefs.syncfs(FS.lookupPath(MOUNT).node.mount, false, (err: any) => {
-    if (err) throw err;
-  });
-}
-
-function syncAndUnmount(FS: any, tomefs: any) {
-  syncfs(FS, tomefs);
-  FS.unmount(MOUNT);
-}
+import { mountTome, syncfs, syncAndUnmount, MOUNT } from "../harness/tome-mount.js";
+import { O, S_IFDIR, S_IFREG, S_IFLNK } from "../harness/emscripten-fs.js";
 
 describe("restoreTree: metadata without pages (phantom files)", () => {
   let backend: SyncMemoryBackend;
