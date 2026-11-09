@@ -57,6 +57,18 @@ export function opcodeName(opcode: number): string {
   return OPCODE_NAMES[opcode] ?? `UNKNOWN(${opcode})`;
 }
 
+/**
+ * Typed error for SAB buffer overflow conditions. Used by encodeMessage when
+ * the encoded payload exceeds the SharedArrayBuffer capacity. SabClient catches
+ * this by type to fall back to chunked calls without masking unrelated errors.
+ */
+export class SabBufferOverflowError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SabBufferOverflowError";
+  }
+}
+
 /** Byte offsets in the SharedArrayBuffer. */
 export const CONTROL_BYTES = 12; // 3 x Int32
 export const JSON_REGION_OFFSET = CONTROL_BYTES;
@@ -103,7 +115,7 @@ export function encodeMessage(
   // If encodeInto couldn't write all characters, the buffer is too small
   if (read !== jsonStr.length) {
     const bufferSize = uint8View.byteLength;
-    throw new Error(
+    throw new SabBufferOverflowError(
       `SAB buffer overflow: JSON requires more than ${bufferSize - jsonWriteStart} bytes but buffer is ${bufferSize} bytes. ` +
         `Increase buffer size or reduce batch size.`,
     );
@@ -119,7 +131,7 @@ export function encodeMessage(
 
   const bufferSize = uint8View.byteLength;
   if (totalNeeded > bufferSize) {
-    throw new Error(
+    throw new SabBufferOverflowError(
       `SAB buffer overflow: message requires ${totalNeeded} bytes but buffer is ${bufferSize} bytes. ` +
         `Increase buffer size or reduce batch size.`,
     );
