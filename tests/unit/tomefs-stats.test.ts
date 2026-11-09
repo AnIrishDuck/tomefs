@@ -6,49 +6,11 @@
  *   - Orphan cleanup operations
  *   - Live tracking set sizes (trackedFiles, dirtyMetaCount)
  */
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncMemoryBackend } from "../../src/sync-memory-backend.js";
 import { createTomeFS } from "../../src/tomefs.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const O = {
-  RDONLY: 0,
-  WRONLY: 1,
-  RDWR: 2,
-  CREAT: 64,
-  TRUNC: 512,
-} as const;
-
-const MOUNT = "/tome";
-
-function encode(s: string): Uint8Array {
-  return new TextEncoder().encode(s);
-}
-
-async function mountTome(backend: SyncMemoryBackend, maxPages?: number) {
-  const { default: createModule } = await import(
-    join(__dirname, "../harness/emscripten_fs.mjs")
-  );
-  const Module = await createModule();
-  const FS = Module.FS;
-  const tomefs = createTomeFS(FS, { backend, maxPages });
-  FS.mkdir(MOUNT);
-  FS.mount(tomefs, {}, MOUNT);
-  return { FS, tomefs };
-}
-
-function syncfs(FS: any, tomefs: any, populate = false) {
-  tomefs.syncfs(
-    FS.lookupPath(MOUNT).node.mount,
-    populate,
-    (err: any) => {
-      if (err) throw err;
-    },
-  );
-}
+import { mountTome, syncfs, MOUNT } from "../harness/tome-mount.js";
+import { encode, O } from "../harness/emscripten-fs.js";
 
 describe("tomefs stats", () => {
   let backend: SyncMemoryBackend;
