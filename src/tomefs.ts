@@ -558,8 +558,8 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
     let new_node: any;
     try {
       new_node = FS.lookupNode(new_dir, new_name);
-    } catch (_e) {
-      // Target doesn't exist — that's fine
+    } catch (e: any) {
+      if (e?.errno !== 44) throw e;
     }
 
     // POSIX: "If the old argument and the new argument both refer to links
