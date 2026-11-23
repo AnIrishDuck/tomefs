@@ -183,6 +183,20 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
     }
   }
 
+  function nodeToMeta(node: any): FileMeta {
+    const meta: FileMeta = {
+      size: FS.isFile(node.mode) ? node.usedBytes : 0,
+      mode: node.mode,
+      ctime: node.ctime,
+      mtime: node.mtime,
+      atime: node.atime,
+    };
+    if (FS.isLink(node.mode)) {
+      meta.link = node.link;
+    }
+    return meta;
+  }
+
   // ---------------------------------------------------------------
   // Filesystem-level performance counters
   // ---------------------------------------------------------------
@@ -596,13 +610,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
           // marker write, orphan cleanup can still discover the pages via
           // listFiles() (which returns paths with metadata). Without this
           // ordering, pages at tempPath would be permanently leaked.
-          backend.writeMeta(tempPath, {
-            size: new_node.usedBytes,
-            mode: new_node.mode,
-            ctime: new_node.ctime,
-            mtime: new_node.mtime,
-            atime: new_node.atime,
-          });
+          backend.writeMeta(tempPath, nodeToMeta(new_node));
           pageCache.renameFile(targetStoragePath, tempPath);
           new_node.storagePath = tempPath;
           new_node._pages = [];
@@ -643,13 +651,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
       // data is never lost: worst case is a stale duplicate entry at the
       // old path that orphan cleanup removes on the next syncfs.
       // This matches the ordering used in unlink() for the same reason.
-      backend.writeMeta(newStoragePath, {
-        size: old_node.usedBytes,
-        mode: old_node.mode,
-        ctime: old_node.ctime,
-        mtime: old_node.mtime,
-        atime: old_node.atime,
-      });
+      backend.writeMeta(newStoragePath, nodeToMeta(old_node));
       pageCache.renameFile(oldStoragePath, newStoragePath);
       old_node.storagePath = newStoragePath;
       old_node._pages = [];
@@ -659,13 +661,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
       // children. Construct from node state (no backend read needed) —
       // the node tree is the source of truth for current metadata.
       const newDirPath = computeStoragePath(new_dir, new_name);
-      backend.writeMeta(newDirPath, {
-        size: 0,
-        mode: old_node.mode,
-        ctime: old_node.ctime,
-        mtime: old_node.mtime,
-        atime: old_node.atime,
-      });
+      backend.writeMeta(newDirPath, nodeToMeta(old_node));
       // Recursively update storagePaths for all file descendants.
       // Without this, pages remain keyed by old paths in the cache/backend,
       // causing data loss on syncfs → remount when metadata is persisted
@@ -682,14 +678,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
       // rename and the next syncfs would lose the rename: metadata stays
       // at the old path while the node tree has it at the new path.
       const newLinkPath = computeStoragePath(new_dir, new_name);
-      backend.writeMeta(newLinkPath, {
-        size: 0,
-        mode: old_node.mode,
-        ctime: old_node.ctime,
-        mtime: old_node.mtime,
-        atime: old_node.atime,
-        link: old_node.link,
-      });
+      backend.writeMeta(newLinkPath, nodeToMeta(old_node));
       backend.deleteMeta(oldStoragePath);
     }
 
@@ -727,13 +716,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
         // crash between renameFile and writeMeta leaves pages at tempPath
         // with no metadata — permanently leaked since listFiles() only
         // returns paths with metadata.
-        backend.writeMeta(tempPath, {
-          size: node.usedBytes,
-          mode: node.mode,
-          ctime: node.ctime,
-          mtime: node.mtime,
-          atime: node.atime,
-        });
+        backend.writeMeta(tempPath, nodeToMeta(node));
         pageCache.renameFile(originalPath, tempPath);
         node.storagePath = tempPath;
         node._pages = [];
@@ -847,45 +830,17 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
           // is written. This ensures metadata at the new path exists before
           // pages are moved, preventing data loss on mid-operation crashes.
           pageRenames.push({ child, oldPath, newPath });
-          metaWrites.push({
-            path: newPath,
-            meta: {
-              size: child.usedBytes,
-              mode: child.mode,
-              ctime: child.ctime,
-              mtime: child.mtime,
-              atime: child.atime,
-            },
-          });
+          metaWrites.push({ path: newPath, meta: nodeToMeta(child) });
           metaDeletes.push(oldPath);
         } else if (FS.isLink(child.mode)) {
           const oldPath = oldBase + "/" + childName;
           const newPath = newBase + "/" + childName;
-          metaWrites.push({
-            path: newPath,
-            meta: {
-              size: 0,
-              mode: child.mode,
-              ctime: child.ctime,
-              mtime: child.mtime,
-              atime: child.atime,
-              link: child.link,
-            },
-          });
+          metaWrites.push({ path: newPath, meta: nodeToMeta(child) });
           metaDeletes.push(oldPath);
         } else if (FS.isDir(child.mode)) {
           const oldChildPath = oldBase + "/" + childName;
           const newChildPath = newBase + "/" + childName;
-          metaWrites.push({
-            path: newChildPath,
-            meta: {
-              size: 0,
-              mode: child.mode,
-              ctime: child.ctime,
-              mtime: child.mtime,
-              atime: child.atime,
-            },
-          });
+          metaWrites.push({ path: newChildPath, meta: nodeToMeta(child) });
           metaDeletes.push(oldChildPath);
           collect(child, oldChildPath, newChildPath);
         }
@@ -1115,14 +1070,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
       const node = stream.node;
       if (FS.isFile(node.mode)) {
         const dirtyPages = pageCache.collectDirtyPagesForFile(node.storagePath);
-        const meta = {
-          size: node.usedBytes,
-          mode: node.mode,
-          ctime: node.ctime,
-          mtime: node.mtime,
-          atime: node.atime,
-        };
-        backend.syncAll(dirtyPages, [{ path: node.storagePath, meta }]);
+        backend.syncAll(dirtyPages, [{ path: node.storagePath, meta: nodeToMeta(node) }]);
         pageCache.commitDirtyPages(dirtyPages);
         if (node._metaDirty) {
           node._metaDirty = false;
@@ -1172,53 +1120,17 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
 
     function walk(node: any, path: string): void {
       visited.add(node);
-      if (FS.isFile(node.mode)) {
-        currentPaths.add(path);
-        // Only write metadata if it changed since last sync (or first sync).
-        // Page data is collected via collectDirtyPages() and written
-        // atomically with metadata via syncAll() after persistTree().
-        if (node._metaDirty) {
-          metaBatch.push({
-            path,
-            meta: {
-              size: node.usedBytes,
-              mode: node.mode,
-              ctime: node.ctime,
-              mtime: node.mtime,
-              atime: node.atime,
-            },
-          });
-        }
-      } else if (FS.isLink(node.mode)) {
+      if (FS.isFile(node.mode) || FS.isLink(node.mode)) {
         currentPaths.add(path);
         if (node._metaDirty) {
-          metaBatch.push({
-            path,
-            meta: {
-              size: 0,
-              mode: node.mode,
-              ctime: node.ctime,
-              mtime: node.mtime,
-              atime: node.atime,
-              link: node.link,
-            },
-          });
+          metaBatch.push({ path, meta: nodeToMeta(node) });
         }
       } else if (FS.isDir(node.mode)) {
         // Persist directory metadata (skip root — it's recreated on mount)
         if (path !== "/") {
           currentPaths.add(path);
           if (node._metaDirty) {
-            metaBatch.push({
-              path,
-              meta: {
-                size: 0,
-                mode: node.mode,
-                ctime: node.ctime,
-                mtime: node.mtime,
-                atime: node.atime,
-              },
-            });
+            metaBatch.push({ path, meta: nodeToMeta(node) });
           }
         }
         // Recurse into children
@@ -1567,41 +1479,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
                 path = nodeStoragePath(node, mountPrefix);
               }
 
-              if (FS.isFile(node.mode)) {
-                metaBatch.push({
-                  path,
-                  meta: {
-                    size: node.usedBytes,
-                    mode: node.mode,
-                    ctime: node.ctime,
-                    mtime: node.mtime,
-                    atime: node.atime,
-                  },
-                });
-              } else if (FS.isLink(node.mode)) {
-                metaBatch.push({
-                  path,
-                  meta: {
-                    size: 0,
-                    mode: node.mode,
-                    ctime: node.ctime,
-                    mtime: node.mtime,
-                    atime: node.atime,
-                    link: node.link,
-                  },
-                });
-              } else if (FS.isDir(node.mode)) {
-                metaBatch.push({
-                  path,
-                  meta: {
-                    size: 0,
-                    mode: node.mode,
-                    ctime: node.ctime,
-                    mtime: node.mtime,
-                    atime: node.atime,
-                  },
-                });
-              }
+              metaBatch.push({ path, meta: nodeToMeta(node) });
             }
 
             // Include clean-shutdown marker in the same batch so it's
@@ -1657,16 +1535,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
               // Only persist metadata when dirty — avoids redundant backend
               // writes for detached nodes that haven't changed since last sync.
               if (node._metaDirty) {
-                metaBatch.push({
-                  path,
-                  meta: {
-                    size: node.usedBytes,
-                    mode: node.mode,
-                    ctime: node.ctime,
-                    mtime: node.mtime,
-                    atime: node.atime,
-                  },
-                });
+                metaBatch.push({ path, meta: nodeToMeta(node) });
               }
             }
 
@@ -1687,16 +1556,7 @@ export function createTomeFS(FS: any, options?: TomeFSOptions): TomeFS {
                 if (currentPaths.has(dirPath)) break; // already collected
                 currentPaths.add(dirPath);
                 if (FS.isDir(dir.mode)) {
-                  metaBatch.push({
-                    path: dirPath,
-                    meta: {
-                      size: 0,
-                      mode: dir.mode,
-                      ctime: dir.ctime,
-                      mtime: dir.mtime,
-                      atime: dir.atime,
-                    },
-                  });
+                  metaBatch.push({ path: dirPath, meta: nodeToMeta(dir) });
                 }
                 dir = dir.parent;
               }
