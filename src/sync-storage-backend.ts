@@ -120,4 +120,18 @@ export interface SyncStorageBackend {
    * to its underlying async backend on flush).
    */
   flush?(): Promise<void>;
+
+  /**
+   * Release resources held by this backend (database connections, file
+   * handles, worker threads) without deleting stored data.
+   *
+   * After close(), the backend must not be used until re-initialized.
+   * Callers that want to delete data should use destroy() on the
+   * concrete backend instead.
+   *
+   * Optional — only needed by backends that hold resources beyond
+   * garbage collection (e.g., PreloadBackend wrapping an IdbBackend
+   * whose IDB connection should be closed on shutdown).
+   */
+  close?(): void | Promise<void>;
 }
